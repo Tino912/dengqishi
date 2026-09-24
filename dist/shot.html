@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LightKnight 灯骑士 · V1 MVP</title>
+    <script type="module" crossorigin src="/assets/index-C0RpJypf.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DhZy2eO7.css">
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game"></canvas>
+      <div id="vignette"></div>
+
+      <!-- ================= HUD ================= -->
+      <div id="hud" class="hidden">
+        <div class="hud-corner tl">
+          <div class="bar hp">
+            <i id="hpFill"></i>
+            <span id="hpText">100 / 100</span>
+          </div>
+          <div class="bar light">
+            <i id="lightFill"></i>
+            <span>亮度</span>
+          </div>
+          <div class="wicks-line"><em>灯芯</em><b id="wicks">0</b><em class="sep">·</em><em>灯芯升级</em><b id="upgSummary">—</b></div>
+        </div>
+
+        <div class="hud-corner tr">
+          <div class="coin"><span class="flame">🔥</span><b id="coins">0</b><em>灯火</em></div>
+          <div class="objective" id="objective">—</div>
+        </div>
+
+        <div class="bossbar hidden" id="bossbar">
+          <div class="bossname" id="bossname">噬灯者</div>
+          <div class="bar big"><i id="bossFill"></i></div>
+          <div class="bossphase" id="bossphase"></div>
+        </div>
+
+        <div class="combo hidden" id="combo">
+          <b id="comboNum">0</b>
+          <span>连击</span>
+          <em id="comboHint"></em>
+        </div>
+
+        <div class="skills" id="skills"></div>
+        <div class="prompt hidden" id="prompt"></div>
+        <div class="toastwrap" id="toastwrap"></div>
+      </div>
+
+      <!-- ================= Dialogue ================= -->
+      <div id="dialogue" class="hidden">
+        <div class="dbox">
+          <div class="dspeaker" id="dSpeaker">灯骑士</div>
+          <div class="dtext" id="dText"></div>
+          <div class="dhint" id="dHint">按 <kbd>空格</kbd> / <kbd>E</kbd> 继续 ▾</div>
+        </div>
+      </div>
+
+      <!-- ================= Overlay screens ================= -->
+      <div id="overlay"></div>
+      <div id="fade"></div>
+      <div id="cutscene" class="hidden"><div class="ctext" id="cutText"></div></div>
+    </div>
+  
+    <script type="module">
+    const g = window.__lightknight;
+    const q = new URLSearchParams(location.search);
+    const lv = parseInt(q.get('lv') || '0', 10);
+    const spawn = q.get('spawn') === '1';
+    const frames = parseInt(q.get('frames') || '200', 10);
+    const kind = q.get('kind') || 'play';
+    const nodlg = q.get('nodlg') === '1';
+    const DT = 1 / 60;
+    const key = c => window.dispatchEvent(new KeyboardEvent('keydown', { code: c }));
+    // 边推进边按空格，把 Boss 出场对白翻完，留下干净的战斗画面
+    const pump = n => {
+      for (let i = 0; i < n; i++) {
+        if (nodlg && i % 12 === 0) key('Space');
+        try { g.update(DT); } catch (e) {}
+      }
+    };
+
+    if (kind === 'menu') {
+      g.startLevel(lv, false); pump(90);
+      try { g.showMenu(q.get('menu') || 'lighthouse'); } catch (e) {}
+      pump(20);
+    } else if (kind === 'dialogue') {
+      g.startLevel(lv, true); pump(120);
+    } else if (kind === 'shop') {
+      // 走到掌灯人身边并打开商店
+      g.startLevel(lv, false); pump(90);
+      const m = g.world.merchantProp;
+      if (m) { g.world.player.x = m.x + 20; g.world.player.y = m.y + 10; }
+      pump(6); key('KeyE'); pump(30);
+    } else if (kind === 'shopback') {      // 打开商店后点「返回」，看会落到哪里
+      g.startLevel(lv, false); pump(90);
+      const m2 = g.world.merchantProp;
+      if (m2) { g.world.player.x = m2.x + 20; g.world.player.y = m2.y + 10; }
+      pump(6); key('KeyE'); pump(24);
+      g.handleAction('back'); pump(60);
+    } else if (kind === 'totitle') {
+      // 战斗中「回到标题」，用于确认黑幕已撤掉
+      g.startLevel(lv, false); pump(90);
+      g.handleAction('totitle'); pump(200);
+    } else if (kind === 'death') {
+      // 真实死亡流程，作为对照
+      g.startLevel(lv, false); pump(90);
+      g.world.hurtPlayer(9999, 0); pump(150);
+    } else {
+      g.devSpawnAll = spawn;
+      g.startLevel(lv, false);
+      pump(90);
+      // 打一套：移动 + 攻击，制造连击、刀光与特效
+      key('KeyD'); pump(26); window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyD' }));
+      key('Space'); pump(8);
+      key('KeyW'); pump(18); window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW' }));
+      key('Space'); pump(6);
+      pump(Math.max(0, frames - 148));
+    }
+    // 隐藏自检标记，避免出现在截图里
+    const r = document.getElementById('report'); if (r) r.style.display = 'none';
+    </script>
+
+  </body>
+</html>

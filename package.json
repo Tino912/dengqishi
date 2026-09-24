@@ -1,0 +1,20 @@
+{
+  "name": "lightknight",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "LightKnight 灯骑士 V1 MVP - 2.5D top-down action RPG about bringing light into the dark",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5183",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 5183",
+    "check": "tsc --noEmit",
+    "sim": "rolldown tools/sim.ts --format esm --platform node -o node_modules/.sim/sim.mjs && node node_modules/.sim/sim.mjs",
+    "verify": "bash tools/browser-verify.sh",
+    "verify:fast": "bash tools/browser-verify.sh --no-shot"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

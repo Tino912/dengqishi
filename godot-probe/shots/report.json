@@ -1,0 +1,204 @@
+{
+  "cases": {
+    "energy_high": {
+      "blend": "ADD",
+      "bright_pct": 39.19,
+      "energy": 2.6,
+      "mean_lum": 0.3805,
+      "occluder_inset": 0.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/energy_high.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 1.0,
+        "B_lit_side": 1.0,
+        "C_behind": 0.0482,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.9346,
+        "F_on_wall": 0.0241,
+        "G_wall_top": 0.0241,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.3212,
+        "W2_in_566": 0.0241,
+        "W3_mid_580": 0.0241,
+        "W4_far_597": 0.0315
+      },
+      "shadow_enabled": true
+    },
+    "inset_10": {
+      "blend": "ADD",
+      "bright_pct": 39.03,
+      "energy": 1.2,
+      "mean_lum": 0.2401,
+      "occluder_inset": 10.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/inset_10.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 0.8961,
+        "B_lit_side": 0.7644,
+        "C_behind": 0.0482,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.4707,
+        "F_on_wall": 0.0241,
+        "G_wall_top": 0.0241,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.4086,
+        "W2_in_566": 0.2394,
+        "W3_mid_580": 0.0241,
+        "W4_far_597": 0.0315
+      },
+      "shadow_enabled": true
+    },
+    "inset_24": {
+      "blend": "ADD",
+      "bright_pct": 39.67,
+      "energy": 1.2,
+      "mean_lum": 0.2425,
+      "occluder_inset": 24.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/inset_24.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 0.8961,
+        "B_lit_side": 0.7644,
+        "C_behind": 0.0482,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.4707,
+        "F_on_wall": 0.2737,
+        "G_wall_top": 0.1963,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.4086,
+        "W2_in_566": 0.3029,
+        "W3_mid_580": 0.2315,
+        "W4_far_597": 0.0315
+      },
+      "shadow_enabled": true
+    },
+    "shadow_off_add": {
+      "blend": "ADD",
+      "bright_pct": 52.18,
+      "energy": 1.2,
+      "mean_lum": 0.3011,
+      "occluder_inset": 0.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/shadow_off_add.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 0.8961,
+        "B_lit_side": 0.7644,
+        "C_behind": 0.3308,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.4707,
+        "F_on_wall": 0.2941,
+        "G_wall_top": 0.2104,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.4086,
+        "W2_in_566": 0.3029,
+        "W3_mid_580": 0.2928,
+        "W4_far_597": 0.3721
+      },
+      "shadow_enabled": false
+    },
+    "shadow_on_add": {
+      "blend": "ADD",
+      "bright_pct": 38.43,
+      "energy": 1.2,
+      "mean_lum": 0.2379,
+      "occluder_inset": 0.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/shadow_on_add.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 0.8961,
+        "B_lit_side": 0.7644,
+        "C_behind": 0.0482,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.4707,
+        "F_on_wall": 0.0241,
+        "G_wall_top": 0.0241,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.2146,
+        "W2_in_566": 0.0241,
+        "W3_mid_580": 0.0241,
+        "W4_far_597": 0.0315
+      },
+      "shadow_enabled": true
+    },
+    "shadow_on_mix": {
+      "blend": "MIX",
+      "bright_pct": 38.24,
+      "energy": 1.2,
+      "mean_lum": 0.2268,
+      "occluder_inset": 0.0,
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots/shadow_on_mix.png",
+      "readback_size": [
+        1280,
+        720
+      ],
+      "samples": {
+        "A_at_light": 0.8546,
+        "B_lit_side": 0.7228,
+        "C_behind": 0.0482,
+        "D_corner": 0.0482,
+        "E_same_side_far": 0.4458,
+        "F_on_wall": 0.0241,
+        "G_wall_top": 0.0241,
+        "H_beyond_shadow": 0.0482,
+        "W1_face_562": 0.2048,
+        "W2_in_566": 0.0241,
+        "W3_mid_580": 0.0241,
+        "W4_far_597": 0.0315
+      },
+      "shadow_enabled": true
+    }
+  },
+  "errors": [],
+  "godot": "4.7.2-stable (arch_linux)",
+  "renderer": "llvmpipe (LLVM 22.1.8, 256 bits)",
+  "verdict": {
+    "add_mean_lum": 0.2379,
+    "behind_drop_pct": 85.43,
+    "behind_off": 0.3308,
+    "behind_on": 0.0482,
+    "energy_modulates": true,
+    "falloff_works": true,
+    "far_corner_dark": true,
+    "inset10_lights_d2_d6_only": true,
+    "inset24_lights_d20_not_d37": true,
+    "inset_keeps_behind_dark": true,
+    "mix_mean_lum": 0.2268,
+    "occlusion_works": true,
+    "shadow_holds_at_high_energy": true,
+    "unlit_wall_baseline": 0.0315,
+    "wall_off": 0.2941,
+    "wall_on": 0.0241,
+    "wall_profile_inset_10": {
+      "d2": 0.4086,
+      "d20": 0.0241,
+      "d37": 0.0315,
+      "d6": 0.2394
+    },
+    "wall_profile_inset_24": {
+      "d2": 0.4086,
+      "d20": 0.2315,
+      "d37": 0.0315,
+      "d6": 0.3029
+    },
+    "wall_self_shadowed": true
+  },
+  "viewport": [
+    1280,
+    720
+  ]
+}

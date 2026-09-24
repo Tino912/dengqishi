@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LightKnight 灯骑士 · V1 MVP</title>
+    <script type="module" crossorigin src="/assets/index-C0RpJypf.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DhZy2eO7.css">
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game"></canvas>
+      <div id="vignette"></div>
+
+      <!-- ================= HUD ================= -->
+      <div id="hud" class="hidden">
+        <div class="hud-corner tl">
+          <div class="bar hp">
+            <i id="hpFill"></i>
+            <span id="hpText">100 / 100</span>
+          </div>
+          <div class="bar light">
+            <i id="lightFill"></i>
+            <span>亮度</span>
+          </div>
+          <div class="wicks-line"><em>灯芯</em><b id="wicks">0</b><em class="sep">·</em><em>灯芯升级</em><b id="upgSummary">—</b></div>
+        </div>
+
+        <div class="hud-corner tr">
+          <div class="coin"><span class="flame">🔥</span><b id="coins">0</b><em>灯火</em></div>
+          <div class="objective" id="objective">—</div>
+        </div>
+
+        <div class="bossbar hidden" id="bossbar">
+          <div class="bossname" id="bossname">噬灯者</div>
+          <div class="bar big"><i id="bossFill"></i></div>
+          <div class="bossphase" id="bossphase"></div>
+        </div>
+
+        <div class="combo hidden" id="combo">
+          <b id="comboNum">0</b>
+          <span>连击</span>
+          <em id="comboHint"></em>
+        </div>
+
+        <div class="skills" id="skills"></div>
+        <div class="prompt hidden" id="prompt"></div>
+        <div class="toastwrap" id="toastwrap"></div>
+      </div>
+
+      <!-- ================= Dialogue ================= -->
+      <div id="dialogue" class="hidden">
+        <div class="dbox">
+          <div class="dspeaker" id="dSpeaker">灯骑士</div>
+          <div class="dtext" id="dText"></div>
+          <div class="dhint" id="dHint">按 <kbd>空格</kbd> / <kbd>E</kbd> 继续 ▾</div>
+        </div>
+      </div>
+
+      <!-- ================= Overlay screens ================= -->
+      <div id="overlay"></div>
+      <div id="fade"></div>
+      <div id="cutscene" class="hidden"><div class="ctext" id="cutText"></div></div>
+    </div>
+  
+    <pre id="report" style="position:fixed;left:0;top:0;z-index:99999;background:#000;color:#0f0;font:11px monospace;padding:6px;margin:0">PENDING</pre>
+    <script>
+    window.__errs = [];
+    window.addEventListener('error', e => window.__errs.push('err:' + e.message));
+    (function () { const oe = console.error; console.error = function () { window.__errs.push('console:' + Array.prototype.join.call(arguments, ' ')); oe.apply(console, arguments); }; })();
+    </script>
+    <script type="module">
+    const g = window.__lightknight;
+    const out = { trace: [], errors: [] };
+    const DT = 1 / 60;
+    const pump = n => { for (let i = 0; i < n; i++) { try { g.update(DT); } catch (e) { out.errors.push('update: ' + e.message); } } };
+    const key = c => window.dispatchEvent(new KeyboardEvent('keydown', { code: c }));
+    const fadeEl = () => document.getElementById('fade');
+
+    function snap(tag) {
+      const w = g.world;
+      const fe = fadeEl();
+      out.trace.push({
+        tag,
+        mode: g.mode, menu: g.menuKind, stack: (g.menuStack || []).slice(),
+        hasWorld: !!w,
+        worldLevel: w ? w.level.index : null,
+        hp: w ? Math.round(w.player.hp) + '/' + Math.round(w.player.maxHp) : null,
+        playerDead: w ? !!w.player.dead : null,
+        deaths: g.prog ? g.prog.deaths : null,
+        fadeClass: fe ? fe.className : null,
+        fadeOpacity: fe ? getComputedStyle(fe).opacity : null,
+        overlayLen: (document.getElementById('overlay').innerHTML || '').length,
+        hudVisible: !document.getElementById('hud').classList.contains('hidden'),
+        prompt: w ? w.prompt : null,
+      });
+    }
+
+    /* ---- 场景 A：与掌灯人交互 ---- */
+    g.devSpawnAll = false;
+    g.startLevel(0, false);
+    pump(90);
+    const m = g.world.merchantProp;
+    out.merchantPos = m ? [m.x, m.y] : null;
+    // 站到掌灯人身边
+    if (m) { g.world.player.x = m.x + 20; g.world.player.y = m.y + 10; }
+    pump(4);
+    snap('A1-站到掌灯人旁');
+    key('KeyE'); pump(2);
+    snap('A2-按E交互');
+    pump(30);
+    snap('A3-商店停留');
+    // 点「返回」
+    g.handleAction('back'); pump(30);
+    snap('A4-商店返回');
+
+    /* ---- 场景 B：返回标题 ---- */
+    g.startLevel(0, false); pump(90);
+    snap('B1-进入关卡');
+    g.handleAction('totitle'); pump(160);
+    snap('B2-返回标题后');
+    pump(120);
+    snap('B3-标题再等2秒');
+    // 标题画面下画布是否有内容（黑屏检测）
+    const c = document.getElementById('game');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    let lum = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) { lum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; n++; }
+    out.titleCanvasMeanLum = +(lum / n).toFixed(2);
+
+    /* ---- 场景 C：暂停菜单里的「回到标题」（另一条入口）---- */
+    g.startLevel(0, false); pump(90);
+    g.handleAction('totitle'); pump(200);
+    snap('C1-再回标题');
+    const fe = fadeEl();
+    out.fadeRect = fe ? JSON.stringify(fe.getBoundingClientRect()) : null;
+
+    out.errors = out.errors.concat(window.__errs || []);
+    document.getElementById('report').textContent = 'LKREPORT' + JSON.stringify(out) + 'ENDLKREPORT';
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,109 @@
+# 灯骑士（dengqishi）· 项目长期记忆
+
+## 项目是什么
+「灯骑士 / LightKnight」——地图全黑、只有灯骑士周围些许亮光的小游戏。
+**同一游戏有两份实现，故意的**：
+- **Web 版**：Vite + TypeScript + Canvas，`src/`，入口 `index.html`。
+  只有 **3 把武器**，有一到三关的数值、商店/升级/存档。
+- **Godot 版**（`godot-lightknight/`）：Godot 4.7.2。起步于「光能不能被墙挡住」的
+  迁移实验（结论：**能**，Web 版 Canvas 合成光照没有遮挡关系），
+  **现在已经跑在前面**：8 把武器 / 19 技能 / 14 恩赐 / 肉鸽三选一 / 精英词缀 /
+  第二关「无芯之暗」，这些 **Web 版都没有**。
+
+### ⚠️ 权威归属（2026-09-24 起改了）
+旧约定「跨版本改玩法以 Web `src/game/*.ts` 为准，Godot 照抄」**已作废**。
+- Web 独占：商店/升级/存档、一到三关的数值基准。
+- **Godot 独占（唯一实现）**：8 武器/19 技能、恩赐三选一、精英词缀、
+  种子随机波次、第二关及其火盆再生/盲女/分阶段 Boss、敌人「扑灯蛾」。
+- 动这些内容前先决定以哪边为准，**别默认 Web 是权威**。
+
+## 硬约定
+1. **`README.md` 是用户给的原稿，不要覆盖**。实现说明另开文件
+   （`IMPLEMENTATION.md`、`godot-lightknight/README.md`），原稿最多加一行指引。
+2. **交付物必须能被验证**：写完代码要真跑起来，用真实引擎/真实浏览器证明，
+   不接受「应该可以」。每个验证都固化成 `tools/*.sh` 一键脚本。
+3. **多界面切换的缺陷测不到**：类型检查、构建、纯逻辑仿真覆盖不了
+   「返回栈错乱 / 遮罩残留 / 结算被菜单吃掉」。这类必须真浏览器跑完整交互流程。
+4. 断言针对真实状态，别假设理想位置；累计计数用基线增量，别硬编码。
+
+## 一键验证脚本（tools/）
+- `tools/godot-lightknight.sh` — Godot 版完整自检（**153/153 断言**，rc=0，
+  连跑两遍 `shots/report.json` **逐字节相同**）
+- `tools/godot-probe25d.sh` / `godot-probe.sh` — 迁移前的遮挡体探针
+- `tools/browser-verify.sh` + `make-verify.py` / `make-regress.py` / `make-hunt.py` — Web 版浏览器验证
+
+## 本机环境坑（会反复遇到）
+- 沙箱预置了 `HTTP_PROXY/HTTPS_PROXY` → **本地回环会 502**，命令前必须 unset。
+- **`/tmp` 是 10MB tmpfs**。`TMPDIR` / `--user-data-dir` / 截图输出一律放 `~/.cache/` 下，
+  否则进程写满就崩（症状是「同样命令时好时坏」，极难排查）。
+- 无头浏览器只有 `/usr/bin/google-chrome-stable`（无 firefox/playwright/puppeteer）。
+  用 `--headless=new`；**`--virtual-time-budget` 在本机必崩，不要用**；
+  `--dump-dom` 比 `--screenshot` 稳。
+- Godot：`/usr/bin/godot` 4.7.2 标准版（非 mono），`gl_compatibility` + llvmpipe 软渲染，
+  `DISPLAY=:1`（XWayland）。
+- **Godot 自检不能 `--headless`**：dummy 渲染器读不出 SubViewport 像素，
+  而判定「黑不黑、光有没有被挡」全靠读像素。
+- 本机无声卡（ALSA 打不开）→ Godot 回落 dummy 驱动，音频代码正确但**听不到声音**。
+
+## Godot 版关键设计（改之前先读）
+- 固定步长 `Main.advance(1/60)`，**游戏 `_process` 累加器和自检直接调用走同一条代码路径**。
+- 输入自己实现边沿检测（`GameInput.just()`，靠每步 `sample()` 比较），
+  **不用 `Input.is_action_just_pressed()`**（固定步长 + 脚本驱动下语义不可靠）；
+  `set_override()` 供自检注入。
+- **有两种界面会让世界停住**：`main.state == "dialogue"`（对白）和 `"draft"`（三选一），
+  两者都不调 `world.step()`。自检的 `_pump(n, hold, auto_draft, auto_dialogue)`
+  默认两种都自己点掉；专门要验它们的那几段把 `auto_*` 关掉。
+  **少点一种 → 后面所有段落成片变红**（敌人不动/镜头不跟/盲女不跟人走），极难反查。
+- **参与仿真的随机数必须来自种子**。`EnemyState.wob` 曾经用全局 `randf()`，
+  而它直接进 `vx/vy`（`sin(e.t*1.6+e.wob)`）→ 每趟世界都不同。
+  现在按 id 铺黄金角 `fmod(float(eid)*2.39996323, TAU)`。
+- **多推一步都会挪动 RNG 流**。为了加截图多走 6 步，撞掉了几十条断言之后的一条；
+  要补回来（`_pump(6)`+截图+`_pump(74)`，总数仍是 80）。
+  **但 `_shot()` 本身不推世界**（只 await 两帧 `frame_post_draw`，不调 `main.advance`），
+  所以插截图是安全的 —— 危险的是"为了取景多 `_pump`"。另注：`_write_png` **自己补 `.png`**，
+  传 `"12-draft.png"` 会落盘成 `12-draft.png.png`。
+- **三选一输入是"两段式"**：只有 `Q`/`E` 移高亮（`draft_prev`/`draft_next`），
+  只有 `空格`/`回车` 拿走，`Esc` 放弃。`1`/`2`/`3`、`A`/`D`、`J`/左键**全部无效**
+  （用户明确要求"别的键无效，不然容易误选"）。另有 **0.35 秒装填窗口** `Main.DRAFT_ARM`：
+  面板刚弹出的 0.35 秒内按确认无效，防"清波瞬间正在连打空格"的误触。
+  这几条在自检里是**逐条可失败**的断言，别删。
+- **"对比前 vs 对比后"必须把其它变量冻住**：光照半径里有 `combo`、`glow`，
+  而 `glow` 一旦被写成 1.0 就**不再衰减**（只有 Boss 倒下时才写成 1.0）。
+  盲女 +52 那条最初测出 `248 -> 248`，是基准值本身已含 +52，不是逻辑错。
+- 玩家脚下的烘焙光池 `_draw` 画的、**不认遮挡**，故意保持很小（`0.26×`/`0.15×`），
+  真正的照明交给会被墙挡住的 `PointLight2D`。
+- 叠加层（`Bloom`）必须显式 `queue_redraw()`，Godot 不会因为子节点父级标脏就自动重绘。
+- 遮挡体 = **屏幕上画出的整体轮廓（顶面 ∪ 南立面），只削底边 16px**（`LightRig.OCC_TRIM`）。
+- 灯贴图必须**竖向压 0.62**（= 投影 `YSQUASH`），否则地面上南北比东西多照 70%。
+- **Boss 招式池分阶段**：满血 phase 1 只有 `dash/dash/slam/summon`，
+  **放不出 `beam`**；掉到 1/3 进 phase 3 才有 `drain`/`sweep`（都放 beam）。
+- 自检确定性靠 `level["seed"]`（第一关 10711、第二关 20422）。
+
+## 美术 / 素材层（2026-09-24 新增）
+- 素材**运行时加载**，故意绕开 Godot 导入管线：
+  `Image.load_from_file(ProjectSettings.globalize_path(...))` → `ImageTexture.create_from_image`。
+  好处：裸仓库跑一键自检**不需要** `.import` 文件、也不依赖 `.godot/imported`。
+  代价：无 mipmap/压缩 → 贴图**预先手动降采样到 256×256**（不降采样会有采样噪点）。
+  入口在 `art.gd`：`ensure_assets()` / `tex()` / `tex_rot()` / `soft_dot`。
+- **程序化为主、贴图只做点缀**。几何（地形/角色/灯）仍全用 `draw_*`；
+  贴图只用在渐变与粒子这类手画不好看的地方（挥击弧/火花/拖尾/火焰/余烬）。
+- **光晕是生成的渐变贴图**（`soft_dot`，smootherstep 衰减），不再是几十个同心圆
+  （同心圆近看是一圈圈环）。
+- **HUD 用自绘控件**，不用 `StyleBoxFlat`（做不到渐变条 / 辉光 / 扇形冷却）：
+  `RBar`（血条/灯条/Boss 条 + 滞后残影 + 冷却刻度）、`SkillChip`、`DraftCard`、
+  `ArmBar`、`PanelLamp`。卡片按 `_boon_sig` 签名缓存，内容没变就不重建。
+- HUD 上叠了**暗角后处理层**。做像素采样断言前必须 `hud.set_post_enabled(false)`，
+  否则暗角会污染「黑不黑 / 光有没有被挡」的判定。
+- 素材许可（都已进仓，可整包复制）：Kenney Particle Pack **CC0 1.0**、
+  霞鹜文楷 LXGW WenKai **OFL-1.1**（`assets/`下）。展示字体取不到时回退系统 noto-cjk。
+- Godot 4 三个易错点：`content_margin_*` 属于 `StyleBoxFlat` 而**不是** `PanelContainer`；
+  内部类引用外层常量必须写 `Hud.C_XXX`；`var _ready := false` 会撞 `func _ready()`。
+- **rc=1 不等于断言红**：`skill_cd_max` 那次是 152/152 全绿但每帧打
+  "Invalid access to property or key"（还级联出空技能名）。**必须单独看 `report.json.errors`。**
+
+## 已知待办（未做）
+- Godot 版只有**两关**；设计稿的第三关（盲女被吃→化为力量）未做。
+- Godot 版无商店/升级/存档/传送；三选一是唯一局内成长。无手柄触屏。
+- 敌人弹道只做了 leech；`spitter` 手感未与 Web 逐帧比对。
+- **Web 版 `render.ts` 的 `applyLighting` 用 `createRadialGradient` 画屏幕正圆**，
+  在 2.5D 地面上是椭圆 → 南北多照 60%。**与换引擎无关，可独立先修**（竖向压 YSQUASH）。

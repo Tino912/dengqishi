@@ -1,0 +1,8 @@
+res://src/art.gd
+res://src/enemy_state.gd
+res://src/hud.gd
+res://src/main.gd
+res://src/player_state.gd
+res://src/world.gd
+res://src/autoload/content.gd
+res://src/autoload/game_input.gd

@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LightKnight 灯骑士 · V1 MVP</title>
+    <script type="module" crossorigin src="/assets/index-C0RpJypf.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DhZy2eO7.css">
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game"></canvas>
+      <div id="vignette"></div>
+
+      <!-- ================= HUD ================= -->
+      <div id="hud" class="hidden">
+        <div class="hud-corner tl">
+          <div class="bar hp">
+            <i id="hpFill"></i>
+            <span id="hpText">100 / 100</span>
+          </div>
+          <div class="bar light">
+            <i id="lightFill"></i>
+            <span>亮度</span>
+          </div>
+          <div class="wicks-line"><em>灯芯</em><b id="wicks">0</b><em class="sep">·</em><em>灯芯升级</em><b id="upgSummary">—</b></div>
+        </div>
+
+        <div class="hud-corner tr">
+          <div class="coin"><span class="flame">🔥</span><b id="coins">0</b><em>灯火</em></div>
+          <div class="objective" id="objective">—</div>
+        </div>
+
+        <div class="bossbar hidden" id="bossbar">
+          <div class="bossname" id="bossname">噬灯者</div>
+          <div class="bar big"><i id="bossFill"></i></div>
+          <div class="bossphase" id="bossphase"></div>
+        </div>
+
+        <div class="combo hidden" id="combo">
+          <b id="comboNum">0</b>
+          <span>连击</span>
+          <em id="comboHint"></em>
+        </div>
+
+        <div class="skills" id="skills"></div>
+        <div class="prompt hidden" id="prompt"></div>
+        <div class="toastwrap" id="toastwrap"></div>
+      </div>
+
+      <!-- ================= Dialogue ================= -->
+      <div id="dialogue" class="hidden">
+        <div class="dbox">
+          <div class="dspeaker" id="dSpeaker">灯骑士</div>
+          <div class="dtext" id="dText"></div>
+          <div class="dhint" id="dHint">按 <kbd>空格</kbd> / <kbd>E</kbd> 继续 ▾</div>
+        </div>
+      </div>
+
+      <!-- ================= Overlay screens ================= -->
+      <div id="overlay"></div>
+      <div id="fade"></div>
+      <div id="cutscene" class="hidden"><div class="ctext" id="cutText"></div></div>
+    </div>
+  
+    <pre id="report" style="position:fixed;left:0;top:0;z-index:99999;background:#000;color:#0f0;font:11px monospace;padding:6px;margin:0">PENDING</pre>
+    <script>
+    window.__errs = [];
+    window.addEventListener('error', e => window.__errs.push('err:' + e.message));
+    window.addEventListener('unhandledrejection', e => window.__errs.push('rej:' + String(e.reason)));
+    (function () {
+      const oe = console.error;
+      console.error = function () { window.__errs.push('console:' + Array.prototype.join.call(arguments, ' ')); oe.apply(console, arguments); };
+    })();
+    </script>
+    <script type="module">
+    const errs = [];
+    const rep = document.getElementById('report');
+
+    /* ---------- 像素采样 ---------- */
+    function sample() {
+      const c = document.getElementById('game');
+      if (!c || !c.width) return { err: 'canvas 无尺寸' };
+      const ctx = c.getContext('2d');
+      const w = c.width, h = c.height;
+      let d;
+      try { d = ctx.getImageData(0, 0, w, h).data; }
+      catch (e) { return { err: 'getImageData 失败: ' + e.message }; }
+
+      let opaque = 0, lum = 0, warm = 0, bright = 0, minL = 999, maxL = -1;
+      const buckets = new Set();
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] > 8) {
+          opaque++;
+          const r = d[i], g = d[i + 1], b = d[i + 2];
+          const l = r * 0.299 + g * 0.587 + b * 0.114;
+          lum += l; if (l < minL) minL = l; if (l > maxL) maxL = l;
+          if (l > 90) bright++;
+          if (r > g + 12 && r > b + 24) warm++;
+          buckets.add(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+        }
+      }
+      // 分区亮度：中心（玩家灯下）vs 四角（应更暗）
+      const lumOf = (x0, y0, x1, y1) => {
+        let s = 0, n = 0;
+        for (let y = y0; y < y1; y += 2) for (let x = x0; x < x1; x += 2) {
+          const i = (y * w + x) * 4;
+          s += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; n++;
+        }
+        return +(s / Math.max(1, n)).toFixed(1);
+      };
+      const cx = w >> 1, cy = h >> 1, bw = w >> 3, bh = h >> 3;
+      return {
+        size: w + 'x' + h,
+        opaquePct: +(100 * opaque / (w * h)).toFixed(2),
+        meanLum: +(lum / Math.max(1, opaque)).toFixed(1),
+        minLum: minL === 999 ? -1 : +minL.toFixed(1),
+        maxLum: +maxL.toFixed(1),
+        brightPct: +(100 * bright / Math.max(1, opaque)).toFixed(2),
+        warmPct: +(100 * warm / Math.max(1, opaque)).toFixed(2),
+        colors: buckets.size,
+        lumCenter: lumOf(cx - bw, cy - bh, cx + bw, cy + bh),
+        lumTL: lumOf(0, 0, bw * 2, bh * 2),
+        lumBR: lumOf(w - bw * 2, h - bh * 2, w, h),
+      };
+    }
+
+    /* ---------- 光照诊断 ---------- */
+    function diag() {
+      const r = g.renderer, w = g.world;
+      if (!w) return { err: 'no world' };
+      const c = document.getElementById('game');
+      const ctx = c.getContext('2d');
+      const ww = c.width, hh = c.height;
+      const d = ctx.getImageData(0, 0, ww, hh).data;
+      const block = (cx, cy, n) => {
+        let s = 0, k = 0;
+        for (let y = Math.max(0, cy - n); y < Math.min(hh, cy + n); y++)
+          for (let x = Math.max(0, cx - n); x < Math.min(ww, cx + n); x++) {
+            const i = (y * ww + x) * 4;
+            s += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; k++;
+          }
+        return +(s / Math.max(1, k)).toFixed(1);
+      };
+      const SXf = r.SX.bind(r), SYf = r.SY.bind(r);
+      const lights = (r.lights || []).map(l => ({
+        r: Math.round(l.r), p: +l.power.toFixed(2),
+        sx: Math.round(SXf(l.x)), sy: Math.round(SYf(l.y, 0)),
+      }));
+      const psx = Math.round(SXf(w.player.x)), psy = Math.round(SYf(w.player.y, 0));
+      return {
+        ambient: +w.ambient.toFixed(3), lightCount: lights.length,
+        lights: lights.slice(0, 4),
+        playerScreen: [psx, psy], canvasMid: [ww >> 1, hh >> 1],
+        atPlayer: block(psx, psy, 14),
+        atCenter: block(ww >> 1, hh >> 1, 14),
+        centerWide: block(ww >> 1, hh >> 1, 40),
+        farTL: block(40, 40, 14), farTR: block(ww - 40, 40, 14),
+        farBL: block(40, hh - 40, 14), farBR: block(ww - 40, hh - 40, 14),
+      };
+    }
+
+    /* ---------- DOM / 世界状态 ---------- */
+    function hud() {
+      const g = window.__lightknight, w = g && g.world;
+      const T = id => { const e = document.getElementById(id); return e ? (e.textContent || '').trim().slice(0, 30) : null; };
+      return {
+        mode: g && g.mode, menu: g && g.menuKind,
+        level: w ? (w.level.name + ' #' + w.level.index) : null,
+        enemies: w ? w.enemies.filter(e => !e.dead).length : -1,
+        drops: w ? (w.drops || []).length : -1,
+        effects: w ? (w.effects || []).length : -1,
+        hp: w ? Math.round(w.player.hp) + '/' + Math.round(w.player.maxHp) : null,
+        combo: w ? (w.player.combo | 0) : null,
+        lightR: w ? Math.round(w.lightRadius) : null,
+        brightness01: w ? +(w.brightness01 || 0).toFixed(2) : null,
+        weapon: w && w.player.weapon ? w.player.weapon.name : null,
+        hudHpText: T('hpText'), hudCoins: T('coins'), hudObj: T('objective'), hudWicks: T('wicks'),
+        hudVisible: !document.getElementById('hud').classList.contains('hidden'),
+        skillSlots: document.querySelectorAll('#skills > *').length,
+        overlayLen: (document.getElementById('overlay').innerHTML || '').length,
+        promptShown: !document.getElementById('prompt').classList.contains('hidden'),
+      };
+    }
+
+    /* ---------- 同步推进游戏循环 ---------- */
+    const g = window.__lightknight;
+    const DT = 1 / 60;
+    function pump(frames) {
+      for (let i = 0; i < frames; i++) {
+        try { g.update(DT); } catch (e) { errs.push('update: ' + e.message); if (errs.length > 6) break; }
+      }
+    }
+    function key(code) { window.dispatchEvent(new KeyboardEvent('keydown', { code })); }
+    function keyUp(code) { window.dispatchEvent(new KeyboardEvent('keyup', { code })); }
+
+    const out = { steps: [], menus: [], errors: [], checks: {} };
+
+    try {
+      out.booted = !!g;
+      if (!g) { errs.push('window.__lightknight 不存在（bundle 未执行）'); throw new Error('no game'); }
+
+      /* 1. 标题画面 */
+      pump(30);
+      out.steps.push({ name: 'title', hud: hud(), px: sample() });
+
+      /* 2. 逐关：普通 + 全刷（压测渲染） */
+      for (let lv = 0; lv < 3; lv++) {
+        g.devSpawnAll = false;
+        g.startLevel(lv, false);
+        pump(90);                                  // 淡入 0.62s + 世界装载
+        // 让玩家动起来并攻击，制造连击/特效
+        key('KeyW'); pump(20); keyUp('KeyW');
+        key('Space'); pump(6);
+        pump(150);
+        out.steps.push({ name: 'L' + lv + '-normal', hud: hud(), px: sample() });
+        out['diag' + lv] = diag();
+
+        // 全刷压测：所有波次 + Boss 同屏
+        g.devSpawnAll = true;
+        g.startLevel(lv, false);
+        pump(120);
+        key('Space'); pump(4);
+        pump(240);
+        out.steps.push({ name: 'L' + lv + '-spawnAll', hud: hud(), px: sample() });
+      }
+
+      /* 3. 菜单渲染 */
+      for (const act of ['help', 'about', 'shop', 'upgrade', 'pause', 'lighthouse']) {
+        try {
+          if (typeof g.showMenu === 'function') g.showMenu(act);
+          else g.handleAction(act);
+          pump(12);
+          out.menus.push({ act, menu: g.menuKind, overlayLen: (document.getElementById('overlay').innerHTML || '').length, px: sample() });
+        } catch (e) { errs.push('menu ' + act + ': ' + e.message); }
+      }
+
+      /* 4. 死亡 → 复活链路 */
+      try {
+        g.closeMenu ? g.closeMenu() : g.handleAction('resume');
+        g.startLevel(0, false); pump(90);
+        if (g.world) { g.world.player.hp = 0.01; g.world.hurtPlayer(999, 0); }
+        pump(150);
+        out.deathMode = g.mode; out.deathMenu = g.menuKind;
+        g.handleAction('respawn'); pump(80);
+        out.respawn = { mode: g.mode, hp: g.world ? Math.round(g.world.player.hp) : null };
+      } catch (e) { errs.push('death/respawn: ' + e.message); }
+
+      /* 5. 汇总判定 */
+      const ok = s => s.px && !s.px.err;
+      const worlds = out.steps.filter(s => s.hud.level);
+      out.checks = {
+        渲染有输出: out.steps.every(s => ok(s) && s.px.opaquePct > 50),
+        有丰富色彩: out.steps.every(s => s.px.colors >= 24),
+        三关均成像: worlds.length >= 6,
+        三关有敌人: ['L0', 'L1', 'L2'].every(p => {
+          const s = out.steps.find(x => x.name === p + '-spawnAll');
+          return s && s.hud.enemies > 0;
+        }),
+        黑暗光照系统: [0, 1, 2].every(i => {
+          const dg = out['diag' + i];
+          if (!dg || dg.err) return false;
+          const corners = [dg.farTL, dg.farTR, dg.farBL, dg.farBR];
+          const darkest = Math.min(...corners);
+          // 玩家身边必须显著亮于任何角落（相机受关卡边界钳制，玩家不一定在画布正中）
+          return dg.atPlayer > Math.max(...corners) * 1.8 && dg.atPlayer > darkest * 4;
+        }),
+        有暖色灯光: out.steps.filter(s => s.hud.level).some(s => s.px.warmPct > 0.5),
+        HUD已挂载: out.steps.some(s => s.hud.hudHpText && s.hud.hudCoins !== null),
+        技能槽渲染: out.steps.some(s => s.hud.skillSlots >= 1),
+        菜单可渲染: out.menus.every(m => m.overlayLen > 200),
+      };
+      out.checksAllPass = Object.values(out.checks).every(Boolean);
+    } catch (e) {
+      errs.push('fatal: ' + e.message);
+    }
+
+    out.errors = errs.concat(window.__errs || []);
+    rep.textContent = 'LKREPORT' + JSON.stringify(out) + 'ENDLKREPORT';
+    </script>
+
+  </body>
+</html>

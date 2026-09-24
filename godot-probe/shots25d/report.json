@@ -1,0 +1,852 @@
+{
+  "cases": {
+    "E_fence_b16": {
+      "base_depth": 13.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "E",
+      "light_pos": [
+        850.0,
+        341.0
+      ],
+      "mean_lum": 0.2099,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.082,
+        "base": 0.2036,
+        "behind": 0.0482,
+        "far": 0.3177,
+        "front": 0.5113,
+        "left": 0.1051,
+        "right": 0.8067,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/E_fence_b16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "E_fence_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "E",
+      "light_pos": [
+        850.0,
+        341.0
+      ],
+      "mean_lum": 0.2153,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.4816,
+        "far": 0.4212,
+        "front": 0.3463,
+        "left": 0.0482,
+        "right": 0.8067,
+        "topface": 0.2202
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/E_fence_foot.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "N_fence_b16": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "N",
+      "light_pos": [
+        660.0,
+        156.4
+      ],
+      "mean_lum": 0.1633,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.693,
+        "far": 0.7955,
+        "front": 0.0482,
+        "left": 0.2491,
+        "right": 0.2441,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/N_fence_b16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "N_fence_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "N",
+      "light_pos": [
+        660.0,
+        156.4
+      ],
+      "mean_lum": 0.172,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.693,
+        "far": 0.7955,
+        "front": 0.0482,
+        "left": 0.4238,
+        "right": 0.4248,
+        "topface": 0.324
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/N_fence_foot.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "S_block_b16": {
+      "base_depth": 16.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        140.0,
+        248.0
+      ],
+      "light": "S",
+      "light_pos": [
+        630.0,
+        690.4
+      ],
+      "mean_lum": 0.128,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.0356,
+        "base": 0.2503,
+        "behind": 0.0482,
+        "far": 0.0482,
+        "front": 0.6939,
+        "left": 0.1984,
+        "right": 0.1935,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/S_block_b16.png",
+      "sil_screen": [
+        560.0,
+        268.4,
+        140.0,
+        302.0
+      ],
+      "wall": "block"
+    },
+    "S_fence_b16": {
+      "base_depth": 15.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "S",
+      "light_pos": [
+        660.0,
+        479.6
+      ],
+      "mean_lum": 0.1862,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.105,
+        "base": 0.2486,
+        "behind": 0.0482,
+        "far": 0.0482,
+        "front": 0.6894,
+        "left": 0.4845,
+        "right": 0.4859,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/S_fence_b16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "S_fence_b8": {
+      "base_depth": 7.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "S",
+      "light_pos": [
+        660.0,
+        479.6
+      ],
+      "mean_lum": 0.1846,
+      "occ": "sil_b8",
+      "patches": {
+        "band": 0.0487,
+        "base": 0.192,
+        "behind": 0.0482,
+        "far": 0.0482,
+        "front": 0.6894,
+        "left": 0.4839,
+        "right": 0.4847,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/S_fence_b8.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "S_fence_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "S",
+      "light_pos": [
+        660.0,
+        479.6
+      ],
+      "mean_lum": 0.183,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.0482,
+        "far": 0.0482,
+        "front": 0.6894,
+        "left": 0.4744,
+        "right": 0.4741,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/S_fence_foot.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "S_fence_sil": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "S",
+      "light_pos": [
+        660.0,
+        479.6
+      ],
+      "mean_lum": 0.183,
+      "occ": "sil",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.0482,
+        "far": 0.0482,
+        "front": 0.6894,
+        "left": 0.4744,
+        "right": 0.4741,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/S_fence_sil.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_block_b16": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        140.0,
+        248.0
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        446.4
+      ],
+      "mean_lum": 0.1714,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.0244,
+        "base": 0.0199,
+        "behind": 0.0482,
+        "far": 0.0811,
+        "front": 0.056,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_block_b16.png",
+      "sil_screen": [
+        560.0,
+        268.4,
+        140.0,
+        302.0
+      ],
+      "wall": "block"
+    },
+    "W_block_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        140.0,
+        248.0
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        446.4
+      ],
+      "mean_lum": 0.173,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0244,
+        "base": 0.0199,
+        "behind": 0.1702,
+        "far": 0.2869,
+        "front": 0.0482,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_block_foot.png",
+      "sil_screen": [
+        560.0,
+        268.4,
+        140.0,
+        302.0
+      ],
+      "wall": "block"
+    },
+    "W_fence_b16": {
+      "base_depth": 13.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2097,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.0825,
+        "base": 0.2044,
+        "behind": 0.0482,
+        "far": 0.3215,
+        "front": 0.5132,
+        "left": 0.8083,
+        "right": 0.1058,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_fence_b16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_fence_b8": {
+      "base_depth": 0.33,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2081,
+      "occ": "sil_b8",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.0482,
+        "far": 0.3215,
+        "front": 0.5132,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_fence_b8.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_fence_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2152,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.4834,
+        "far": 0.4226,
+        "front": 0.3508,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.2222
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_fence_foot.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_fence_in16": {
+      "base_depth": 14.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2147,
+      "occ": "sil_in16",
+      "patches": {
+        "band": 0.0861,
+        "base": 0.2044,
+        "behind": 0.3153,
+        "far": 0.4226,
+        "front": 0.5132,
+        "left": 0.8083,
+        "right": 0.1104,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_fence_in16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_fence_sil": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2059,
+      "occ": "sil",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.0482,
+        "far": 0.3215,
+        "front": 0.3508,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_fence_sil.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "wall": "fence"
+    },
+    "W_pillar_b16": {
+      "base_depth": 15.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        60.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2105,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.1084,
+        "base": 0.2556,
+        "behind": 0.4169,
+        "far": 0.5183,
+        "front": 0.6415,
+        "left": 0.8083,
+        "right": 0.2211,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_pillar_b16.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        60.0,
+        83.2
+      ],
+      "wall": "pillar"
+    },
+    "W_pillar_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        60.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.2162,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.5984,
+        "far": 0.5183,
+        "front": 0.6415,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.3367
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_pillar_foot.png",
+      "sil_screen": [
+        560.0,
+        276.4,
+        60.0,
+        83.2
+      ],
+      "wall": "pillar"
+    },
+    "W_tall_b16": {
+      "base_depth": 13.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.199,
+      "occ": "sil_b16",
+      "patches": {
+        "band": 0.0825,
+        "base": 0.2044,
+        "behind": 0.0482,
+        "far": 0.0487,
+        "front": 0.5132,
+        "left": 0.8083,
+        "right": 0.1058,
+        "topface": 0.0255
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_tall_b16.png",
+      "sil_screen": [
+        560.0,
+        172.4,
+        200.0,
+        187.2
+      ],
+      "wall": "tall"
+    },
+    "W_tall_foot": {
+      "base_depth": 0.0,
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "light": "W",
+      "light_pos": [
+        470.0,
+        341.0
+      ],
+      "mean_lum": 0.209,
+      "occ": "foot",
+      "patches": {
+        "band": 0.0199,
+        "base": 0.0199,
+        "behind": 0.3671,
+        "far": 0.2809,
+        "front": 0.3508,
+        "left": 0.8083,
+        "right": 0.0482,
+        "topface": 0.2226
+      },
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/W_tall_foot.png",
+      "sil_screen": [
+        560.0,
+        172.4,
+        200.0,
+        187.2
+      ],
+      "wall": "tall"
+    },
+    "shape_circle": {
+      "floor_dist_probed": 300.0,
+      "light": "C",
+      "lum_east_300": 0.3123,
+      "lum_north_300": 0.5299,
+      "mean_lum": 0.2279,
+      "occ": "none",
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/shape_circle.png",
+      "radius_ew_screen": 410.0,
+      "ratio_north_over_east": 1.6968,
+      "shape": "circle",
+      "wall": "none"
+    },
+    "shape_floor": {
+      "floor_dist_probed": 300.0,
+      "light": "C",
+      "lum_east_300": 0.3123,
+      "lum_north_300": 0.3145,
+      "mean_lum": 0.1619,
+      "occ": "none",
+      "png": "/home/tino12/WorkBuddy/dengqishi/godot-probe/shots25d/shape_floor.png",
+      "radius_ew_screen": 410.0,
+      "ratio_north_over_east": 1.007,
+      "shape": "floor",
+      "wall": "none"
+    }
+  },
+  "errors": [],
+  "geometry": {
+    "block": {
+      "foot_screen": [
+        560.0,
+        322.4,
+        140.0,
+        248.0
+      ],
+      "sil_screen": [
+        560.0,
+        268.4,
+        140.0,
+        302.0
+      ],
+      "world": {
+        "d": 400.0,
+        "h": 54.0,
+        "w": 140.0,
+        "x": 560.0,
+        "y": 520.0
+      }
+    },
+    "fence": {
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "sil_screen": [
+        560.0,
+        276.4,
+        200.0,
+        83.2
+      ],
+      "world": {
+        "d": 60.0,
+        "h": 46.0,
+        "w": 200.0,
+        "x": 560.0,
+        "y": 520.0
+      }
+    },
+    "pillar": {
+      "foot_screen": [
+        560.0,
+        322.4,
+        60.0,
+        37.2
+      ],
+      "sil_screen": [
+        560.0,
+        276.4,
+        60.0,
+        83.2
+      ],
+      "world": {
+        "d": 60.0,
+        "h": 46.0,
+        "w": 60.0,
+        "x": 560.0,
+        "y": 520.0
+      }
+    },
+    "tall": {
+      "foot_screen": [
+        560.0,
+        322.4,
+        200.0,
+        37.2
+      ],
+      "sil_screen": [
+        560.0,
+        172.4,
+        200.0,
+        187.2
+      ],
+      "world": {
+        "d": 60.0,
+        "h": 150.0,
+        "w": 200.0,
+        "x": 560.0,
+        "y": 520.0
+      }
+    }
+  },
+  "godot": "4.7.2-stable (arch_linux)",
+  "renderer": "llvmpipe (LLVM 22.1.8, 256 bits)",
+  "verdict": {
+    "D1_脚印模型_侧光翻过墙顶照到墙后": true,
+    "D2_脚印模型_照亮墙身并用影子横切它": true,
+    "D3_脚印模型_背光时墙面反被照亮": true,
+    "D4_均匀内缩_改为从墙顶漏光": true,
+    "D5_脚印模型_厚墙与厚块都会漏": true,
+    "D6_屏幕正圆灯_纵向多照七成": true,
+    "P10_地面正圆灯_各向光距一致": true,
+    "P11_东西侧光对称": true,
+    "P1_正面光_墙后地面全黑": true,
+    "P2_削底16_墙脚受光_不削则不受光": true,
+    "P3_侧光_墙后不漏光": true,
+    "P4_侧光_墙脚同样受光": true,
+    "P5_背光_墙后不漏光": true,
+    "P6_背光_墙面保持剪影": true,
+    "P7_四种墙型_侧光下墙面都保持剪影": true,
+    "P8_正面光下细墙与厚块墙脚都受光": true,
+    "P9_侧光下浅墙墙脚受光": true,
+    "num_侧光_厚块墙脚受光高度_b16": 0.0,
+    "num_侧光_墙前地面": 0.8083,
+    "num_侧光_墙后地面_b16": 0.0482,
+    "num_侧光_墙后地面_b8": 0.0482,
+    "num_侧光_墙后地面_foot": 0.4834,
+    "num_侧光_墙后地面_in16": 0.3153,
+    "num_侧光_墙后地面_sil": 0.0482,
+    "num_侧光_墙脚受光高度_b16": 13.0,
+    "num_侧光_墙脚受光高度_b8": 0.33,
+    "num_侧光_墙脚受光高度_sil": 0.0,
+    "num_侧光_墙面暗带_b16": 0.0825,
+    "num_侧光_墙面暗带_foot": 0.0199,
+    "num_侧光_墙面顶面_b16": 0.0255,
+    "num_侧光_墙面顶面_foot": 0.2222,
+    "num_侧光_窄柱墙脚受光高度_b16": 15.0,
+    "num_侧光_高墙墙脚受光高度_b16": 13.0,
+    "num_地圆灯_地面等距北东亮度比": 1.007,
+    "num_正圆灯_地面等距北东亮度比": 1.6968,
+    "num_正面_厚块墙脚受光高度_b16": 16.0,
+    "num_正面_墙前地面": 0.6894,
+    "num_正面_墙后地面_b16": 0.0482,
+    "num_正面_墙后地面_foot": 0.0482,
+    "num_正面_墙脚受光高度_b16": 15.0,
+    "num_正面_墙脚受光高度_b8": 7.0,
+    "num_背光_墙面_b16": 0.0255,
+    "num_背光_墙面_foot": 0.324,
+    "num_额外_削底带来的底座溢光_b16": 0.1058,
+    "num_额外_削底带来的底座溢光_b8": 0.0482,
+    "num_额外_无削底时_墙侧": 0.0482
+  },
+  "viewport": [
+    1280,
+    720
+  ],
+  "ysquash": 0.62
+}
