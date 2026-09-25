@@ -23,6 +23,11 @@ const OCC_TRIM := 16.0
 const TEX_N := 256
 const TEX_HALF := TEX_N / 2.0
 
+## 攻击类短命灯的上限（挥击 1 盏 + 弹丸/留场物共用剩下的）。
+## 软渲染（llvmpipe）下每盏投影灯都要重算一遍遮挡，弹丸雨能一次开几十盏 —— 
+## 所以宁可不点，也不能让帧率掉下去。
+const FX_LIGHT_MAX := 6
+
 var cm: CanvasModulate
 var player_light: PointLight2D
 var goal_light: PointLight2D
@@ -30,6 +35,10 @@ var goal_light: PointLight2D
 var _occluders: Array[LightOccluder2D] = []
 var _brazier_lights := {}     # prop index -> PointLight2D
 var _enemy_lights := {}       # enemy id -> PointLight2D
+## 「攻击类」的短命灯：挥击、飞行中的弹丸、留场的光球/光柱。
+## key 是**稳定字符串**（`"swing"` / `"proj:<pid>"` / `"fx:<id>"`）——
+## 这样每一帧只是改已有灯的属性，而不是 new 一个（软渲染下每帧 new 灯会立刻拖垮帧率）。
+var _fx_lights := {}
 var _tex_floor: ImageTexture
 var _tex_circle: ImageTexture
 var _ready_done := false
@@ -173,6 +182,100 @@ func sync(world) -> void:
 	_sync_prop_lights(world)
 	# 敌人自光
 	_sync_enemy_lights(world)
+	# 攻击/弹丸的短命灯
+	_sync_fx_lights(world)
+
+
+## 挥击、飞行中的弹丸、留场的光球/光柱各自点一盏灯。
+##
+## 两点设计决定：
+##  ① **带遮挡**（`shadow_enabled = true`）。这盏灯就是"攻击在发光"这件事本身 ——
+##     如果它不认墙，就退化成画面上的一块亮斑，和叠加层的辉光没有区别，
+##     而这套工程的全部意义就是"光会被墙挡住"。
+##  ② **有上限**。软渲染下每盏投影灯都要重算一遍遮挡，一盏弹丸雨能开几十盏。
+##     超出上限的直接不点（画面损失很小，帧率损失很大）。
+func _sync_fx_lights(world) -> void:
+	var live := {}
+	var budget := FX_LIGHT_MAX
+
+	# ── ① 挥击 ──
+	# 灯落在**刀锋扫到的那一点**上，不是玩家脚下：脚下已经被玩家自己那盏灯照亮了，
+	# 放在那里看不出任何区别。半径取攻击距离的 0.9，所以长兵器（锁灯 132）
+	# 的光能伸出玩家自身光照半径之外 —— 这就是"挥击在发光"看得见的原因。
+	var p: PlayerState = world.player
+	if p.attack_t > 0.0 and not p.dead:
+		var w: Dictionary = p.weapon()
+		var t01 := clampf(p.attack_t / 0.2, 0.0, 1.0)
+		# 光跟着刀锋扫过去：收手时缩回身边，出手时甩到最远
+		var reach := float(w["range"]) * 0.9 * (0.30 + 0.70 * (1.0 - t01))
+		var sweep: float = p.facing + float(w["arc"]) * 0.25 * (1.0 - 2.0 * (1.0 - t01))
+		var key := "swing"
+		live[key] = true
+		budget -= 1
+		if not _fx_lights.has(key):
+			_fx_lights[key] = _make_light(80.0, 0.0, Color.WHITE, true)
+		var l: PointLight2D = _fx_lights[key]
+		var wx: float = p.x + cos(sweep) * reach
+		var wy: float = p.y + sin(sweep) * reach * 0.55
+		l.position = Vector2(wx, wy * Proj.YSQUASH - 16.0)
+		l.texture_scale = (reach * 0.95 + 46.0) / TEX_HALF
+		l.color = world.element_color_of()
+		l.energy = 1.05 * t01
+
+	# ── ② 玩家弹丸 ──
+	for q in world.projs:
+		if str(q.get("own", "")) != "player":
+			continue
+		if budget <= 0:
+			break
+		var key2 := "proj:%d" % int(q.get("pid", 0))
+		live[key2] = true
+		budget -= 1
+		if not _fx_lights.has(key2):
+			_fx_lights[key2] = _make_light(60.0, 0.0, Color.WHITE, true)
+		var l2: PointLight2D = _fx_lights[key2]
+		l2.position = Vector2(float(q["x"]), float(q["y"]) * Proj.YSQUASH - float(q["z"]))
+		l2.texture_scale = (float(q["r"]) * 7.5 + 26.0) / TEX_HALF
+		l2.color = Color.html(str(q["color"]))
+		l2.energy = 1.15
+
+	# ── ③ 留场物（灯球 / 光柱）──
+	# 这两个是"留在原地继续照亮"的东西，用不投影的柔光就够：
+	# 它们本来就是暖一团光，投不投影差别不大，但不投影省一半开销。
+	for f in world.effects:
+		var kind := str(f["kind"])
+		if kind != "zone" and kind != "pillar":
+			continue
+		if budget <= 0:
+			break
+		var key3 := "fx:%d" % int(f["id"])
+		live[key3] = true
+		budget -= 1
+		if not _fx_lights.has(key3):
+			_fx_lights[key3] = _make_glow(90.0, 0.0, Color.WHITE)
+		var l3: PointLight2D = _fx_lights[key3]
+		l3.position = Vector2(float(f["x"]), float(f["y"]) * Proj.YSQUASH - float(f["z"]))
+		var t03 := clampf(1.0 - float(f["life"]) / maxf(0.001, float(f["max_life"])), 0.0, 1.0)
+		var rr3 := lerpf(float(f["r0"]), float(f["r1"]), t03)
+		l3.texture_scale = (rr3 * 1.5 + 60.0) / TEX_HALF
+		l3.color = Color.html(str(f["color"]))
+		l3.energy = (0.9 if kind == "zone" else 0.7) * (1.0 - t03 * 0.35)
+
+	# 回收：这一帧没被点到的都熄掉
+	for k in _fx_lights.keys():
+		if not live.has(k):
+			_fx_lights[k].queue_free()
+			_fx_lights.erase(k)
+
+
+## 攻击类光源的盏数（自检用：验"挥击亮了、收手就灭"）
+func fx_light_count() -> int:
+	return _fx_lights.size()
+
+
+func fx_light_keys() -> Array:
+	return _fx_lights.keys()
+
 
 
 func _sync_prop_lights(world) -> void:

@@ -4,7 +4,9 @@
 # 在真实 Godot 引擎里跑 godot-lightknight 工程的自检场景：固定 1280x720 离屏渲染，
 # 走完整流程（标题 → 移动/碰撞 → 战斗/连击/技能/掉落 → 遮挡光照对照 →
 # 8 把武器 / 19 个技能 / 特效种类 → 敌人 AI → 三波 + Boss → 死亡重生/火盆 →
-# 机器人试玩 90 秒 → 第二关「无芯之暗」：三选一 / 火盆再生 / 盲女 / Boss），
+# 机器人试玩 90 秒 → 第二关「无芯之暗」：三选一 / 火盆再生 / 盲女 / Boss →
+# 宝箱/背包/守灯人 → 布局随机化 → 武器元素与状态效果 / 攻击发光 /
+# 第三关「灯河渡口」与三图风格 / 敌人样貌），
 # 全程由场景自己推进固定步长、自己采样 viewport 像素、自己给出判定，
 # 最后写 shots/report.json 并在这里汇总。
 #
@@ -12,7 +14,7 @@
 # 依赖：  godot 4.4+（标准版即可，无需 mono/C#）；需要可用的显示环境（X11 或 XWayland）
 #         —— 自检要读 SubViewport 的像素，--headless 的 dummy 渲染器读不出画面。
 #
-# 预期结果：232/232 断言通过，退出码 0。三个核心结论：
+# 预期结果：324/324 断言通过，退出码 0。五个核心结论：
 #   ① 光会被墙挡住：同一采样点，开阴影 0.005 ≈ 射程外的黑暗底噪（0.008），
 #      关阴影 0.083（亮 17 倍）。注意这两个数字的前提是**屏幕上没有残留的全屏闪光** ——
 #      flash_rect 不归 set_post_enabled 管，闪光一旦卡住会给每个采样点加一个常数，
@@ -21,6 +23,10 @@
 #      Boss 独占的 beam），不是只改伤害数字。
 #   ③ 宝箱与敌人（波次 + Boss）的落点是**每局重摇**的：换局种子整套换、同局种子逐点相同、
 #      撒出来的点都不在墙里、并且从出生点起链式走得通（走不通会静默卡关）。
+#   ④ 武器带**随机元素**，而且状态真的生效：火在掉血、冰一步不动、雷只连一跳且不穿墙、
+#      毒同时掉血与减速、光对暗影系是 100×1.85×1.30 而不是"大概 1.3 倍"。
+#   ⑤ 攻击真的在发光：挥击与飞行中的弹丸各自点一盏**带遮挡**的灯，
+#      同一像素「发着光 vs 收手/弹丸消失」实测 0.078 -> 0.207、0.092 -> 0.935。
 # 连跑两遍 shots/report.json 逐字节相同（随机数全部走种子播种）。
 #
 # 断言是否有牙齿，用 tools/godot-mutate.py 验证（故意改坏实现，看该红的红没红）。
@@ -129,6 +135,37 @@ if l2:
           f"ambient {l2['ambient']}（第一关 0.9）　敌人倍率 {l2['enemy_scale']}")
     print(f"    火盆 {l2['braziers_lit']}/{l2['braziers_required']}"
           f"　死亡再生 {l2['respawns']} 次　盲女同行 {l2['has_girl']}　Boss {l2['boss']}")
+    print()
+
+el = d["cases"].get("elements")
+if el:
+    print(f"  武器元素（每局摇一次，共 {el['count']} 种：{'/'.join(el['names'])}）")
+    print("    这一局的八把：" + "　".join(f"{k}={v}" for k, v in el["per_weapon"].items()))
+    print(f"    48 个种子的分布：" + "　".join(f"{k}={v}" for k, v in el["counts_over_48_seeds"].items())
+          + f"　（{el['seeds_with_duplicate']}/48 个种子有重复 —— 允许重复是故意的）")
+    print()
+
+al = d["cases"].get("attack_light")
+if al:
+    print("  攻击发光（同一像素：发着光 vs 收手 / 弹丸消失）")
+    print(f"    挥击的刀锋灯   {al['swing_px_dark']:.4f} -> {al['swing_px_lit']:.4f}"
+          f"　（{al['swing_px_lit'] / max(al['swing_px_dark'], 1e-4):.1f}×）")
+    print(f"    飞行中的弹丸灯 {al['proj_px_dark']:.4f} -> {al['proj_px_lit']:.4f}"
+          f"　（{al['proj_px_lit'] / max(al['proj_px_dark'], 1e-4):.1f}×）")
+    print(f"    攻击类灯上限 {al['fx_light_max']} 盏："
+          f"塞 24 颗弹丸时实际点了 {al['fx_lights_with_24_projs']} 盏")
+    print()
+
+l3 = d["cases"].get("level3")
+if l3:
+    print("  第三关「灯河渡口」（三图风格各异：court / quarry / river）")
+    print(f"    {l3['name']}　{l3['w']:.0f}×{l3['h']:.0f}　墙 {l3['walls']} 面　"
+          f"ambient {l3['ambient']}（第二关 0.955）　敌人倍率 {l3['enemy_scale']}　Boss {l3['boss']}")
+    ad = [(k, v) for k, v in d["samples"].items() if k.startswith("art_diff_")]
+    if ad:
+        print("    三张地图在出生点周围的画面差异：" +
+              "　".join(f"{k.replace('art_diff_', '').replace('_', ' vs ')}={v * 100:.1f}%" for k, v in ad)
+              + f"　（对照：同一关重建两次 = {d['samples'].get('同一关重建两次的画面差异', 0) * 100:.2f}%）")
     print()
 
 print(f"  肉鸽循环：整趟共发生三选一 {d['samples'].get('draft_taken')} 次")

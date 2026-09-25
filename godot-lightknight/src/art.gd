@@ -205,6 +205,32 @@ static func floor(ci: CanvasItem, level: Dictionary, pal: Dictionary, cam: Vecto
 	# 底色（同时也让 CanvasModulate 有东西可压暗 —— 空背景不会被照亮）
 	ci.draw_rect(Rect2(x0, y0, x1 - x0, y1 - y0), c1)
 
+	# 地面纹样按关卡的 `art_style` 分家。
+	# **三张地图风格各异**这件事主要落在这一处 + 墙体造型 + 道具种类上，
+	# 光靠 palette 换色是不够的：换色只是"同一张图换了个滤镜"，
+	# 纹样不同才是"这是另一个地方"。
+	match str(level.get("art_style", "court")):
+		"quarry":
+			_floor_quarry(ci, x0, y0, x1, y1, c1, c2)
+		"river":
+			_floor_river(ci, x0, y0, x1, y1, c1, c2, t)
+		_:
+			_floor_court(ci, x0, y0, x1, y1, c1, c2)
+
+	# 地面暗纹：裂缝/血痕（按固定种子，同一关每次一样）
+	var rng := Proj.make_rng(int(level["seed"]) + 99)
+	for i in 26:
+		var x := rng.randf() * lw
+		var y := rng.randf() * lh
+		var a := Color(0.0, 0.0, 0.0, 0.45)
+		ci.draw_line(Vector2(x, y), Vector2(x + (rng.randf() - 0.5) * 90.0, y + (rng.randf() - 0.5) * 90.0),
+			a, 1.0 + rng.randf() * 2.0, true)
+	end_xf(ci)
+
+
+## 第一关「灯堡外庭」的地面：**方庭石板** —— 96 的方格棋盘，工整、亮、有人住过。
+static func _floor_court(ci: CanvasItem, x0: float, y0: float, x1: float, y1: float,
+		c1: Color, c2: Color) -> void:
 	var tile := 96.0
 	var iy := floori(y0 / tile)
 	while float(iy) * tile < y1:
@@ -218,20 +244,63 @@ static func floor(ci: CanvasItem, level: Dictionary, pal: Dictionary, cam: Vecto
 			ix += 1
 		iy += 1
 
-	# 地面暗纹：裂缝/血痕（按固定种子，同一关每次一样）
-	var rng := Proj.make_rng(int(level["seed"]) + 99)
-	for i in 26:
-		var x := rng.randf() * lw
-		var y := rng.randf() * lh
-		var a := Color(0.0, 0.0, 0.0, 0.45)
-		ci.draw_line(Vector2(x, y), Vector2(x + (rng.randf() - 0.5) * 90.0, y + (rng.randf() - 0.5) * 90.0),
-			a, 1.0 + rng.randf() * 2.0, true)
-	end_xf(ci)
+
+## 第二关「无芯之暗」的地面：**蚀暗矿层** —— 78 的交错砌块（每行错开半格），
+## 明暗对比比第一关大得多，看起来像被凿开又塌回去的岩层。
+static func _floor_quarry(ci: CanvasItem, x0: float, y0: float, x1: float, y1: float,
+		c1: Color, c2: Color) -> void:
+	var tw := 78.0
+	var th := 52.0
+	var iy := floori(y0 / th)
+	while float(iy) * th < y1:
+		var odd_row := iy % 2 != 0
+		var off := tw * 0.5 if odd_row else 0.0
+		var ix := floori((x0 - off) / tw)
+		while float(ix) * tw + off < x1:
+			var tx := float(ix) * tw + off
+			var ty := float(iy) * th
+			# 用行列做一个确定性的深浅抖动（不用 RNG：floor 是每帧都跑的）
+			var j := float((ix * 7 + iy * 13) % 5) * 0.06
+			var c := c2.lerp(c1, 0.35 + j)
+			ci.draw_rect(Rect2(tx + 1.0, ty + 1.0, tw - 2.0, th - 2.0), c)
+			# 每块的石纹：一道斜凿痕
+			ci.draw_line(Vector2(tx + 6.0, ty + th - 7.0), Vector2(tx + tw - 10.0, ty + 7.0),
+				Color(0.0, 0.0, 0.0, 0.22), 1.0, true)
+			ix += 1
+		iy += 1
+
+
+## 第三关「灯河渡口」的地面：**水泽** —— 横向的波纹带，明暗随 `sin` 起伏，
+## 而且整片随 `t` 缓慢**向下游推移**（这就是"河在流"的全部来源）。
+## 再叠几条横向的碎光，水面的感觉就出来了。
+static func _floor_river(ci: CanvasItem, x0: float, y0: float, x1: float, y1: float,
+		c1: Color, c2: Color, t: float) -> void:
+	var band := 46.0
+	# 流动：把整个带的相位按时间平移，看起来就是水在往下游走
+	var flow := fmod(t * 26.0, band)
+	var iy := floori((y0 - flow) / band)
+	while float(iy) * band + flow < y1:
+		var wy := float(iy) * band + flow
+		var k := sin(wy * 0.021 + t * 0.8)
+		var c := c2.lerp(c1, clampf(0.5 + 0.5 * k, 0.0, 1.0))
+		ci.draw_rect(Rect2(x0, wy, x1 - x0, band + 1.0), c)
+		# 波峰的碎光：一条断续的浅色横线
+		if k > 0.55:
+			var seg := 140.0
+			var sx := floorf(x0 / seg) * seg
+			while sx < x1:
+				ci.draw_line(Vector2(sx + 18.0, wy + band * 0.42),
+					Vector2(sx + 96.0, wy + band * 0.42),
+					Color(0.62, 0.86, 0.86, (k - 0.55) * 0.42), 1.6, true)
+				sx += seg
+		iy += 1
 
 
 # ---------------------------------------------------------------- 墙
 
-static func wall(ci: CanvasItem, w: Array, pal: Dictionary, cam: Vector2) -> void:
+## 墙体。`style` 跟着关卡的 `art_style` 走 —— 三张图的墙**不是换色**：
+## court 是砌得整整齐齐的砖墙，quarry 是崩了口的凿岩，river 是打进水里的木桩。
+static func wall(ci: CanvasItem, w: Array, pal: Dictionary, cam: Vector2, style := "court") -> void:
 	var x0 := Proj.sx(w[0], cam.x)
 	var x1 := Proj.sx(w[0] + w[2], cam.x)
 	var yN := Proj.sy(w[1], 0.0, cam.y)
@@ -253,21 +322,91 @@ static func wall(ci: CanvasItem, w: Array, pal: Dictionary, cam: Vector2) -> voi
 
 	# 南立面（朝向镜头）：上亮下暗，用横向色带模拟渐变
 	var bands := 8
+	if style == "quarry":
+		bands = 5      # 岩层：层少而厚，明暗落差大
+	elif style == "river":
+		bands = 7
 	for i in bands:
 		var t0 := float(i) / float(bands)
 		var t1 := float(i + 1) / float(bands)
 		var c := c_top.lerp(c_wall, minf(1.0, t0 * 2.6)).lerp(Color(0.03, 0.04, 0.07), maxf(0.0, t0 - 0.35) / 0.65)
 		ci.draw_rect(Rect2(x0, tS + (yS - tS) * t0, x1 - x0, (yS - tS) * (t1 - t0) + 0.8), c)
-	# 砖缝
-	var yy := tS + 11.0
-	while yy < yS:
-		ci.draw_line(Vector2(x0, yy), Vector2(x1, yy), Color(0.0, 0.0, 0.0, 0.35), 1.0, true)
-		yy += 13.0
+
+	# 立面细节：三种风格各自一套
+	match style:
+		"quarry":
+			_wall_face_quarry(ci, x0, x1, tS, yS, c_rim)
+		"river":
+			_wall_face_river(ci, x0, x1, tS, yS)
+		_:
+			# 砖缝
+			var yy := tS + 11.0
+			while yy < yS:
+				ci.draw_line(Vector2(x0, yy), Vector2(x1, yy), Color(0.0, 0.0, 0.0, 0.35), 1.0, true)
+				yy += 13.0
 
 	# 顶面
-	ci.draw_rect(Rect2(x0, tN, x1 - x0, yS - yN), c_wall)
-	ci.draw_line(Vector2(x0, tN), Vector2(x1, tN), Color(c_rim.r, c_rim.g, c_rim.b, 0.28), 1.4, true)
+	var ct := c_wall
+	if style == "river":
+		# 木栈的顶面偏暖，和青绿的水面拉开
+		ct = c_wall.lerp(Color("#6b4a30"), 0.55)
+	ci.draw_rect(Rect2(x0, tN, x1 - x0, yS - yN), ct)
+	if style == "quarry":
+		# 崩掉的岩口：顶边一道断续的亮线，而不是一条通线
+		var bx := x0
+		while bx < x1:
+			ci.draw_line(Vector2(bx, tN + 1.0), Vector2(minf(bx + 26.0, x1), tN + 1.0),
+				Color(c_rim.r, c_rim.g, c_rim.b, 0.34), 1.3, true)
+			bx += 44.0
+	elif style == "river":
+		# 顶面木纹：横向的板缝
+		var top_h := yS - yN
+		var py := tN + 6.0
+		while py < tN + top_h:
+			ci.draw_line(Vector2(x0, py), Vector2(x1, py), Color(0.0, 0.0, 0.0, 0.30), 1.0, true)
+			py += 9.0
+		ci.draw_line(Vector2(x0, tN), Vector2(x1, tN), Color(c_rim.r, c_rim.g, c_rim.b, 0.30), 1.4, true)
+	else:
+		ci.draw_line(Vector2(x0, tN), Vector2(x1, tN), Color(c_rim.r, c_rim.g, c_rim.b, 0.28), 1.4, true)
 	ci.draw_line(Vector2(x0, yS), Vector2(x1, yS), Color(0.0, 0.0, 0.0, 0.5), 1.0, true)
+
+	if style == "river":
+		# 水线：木桩入水处的湿痕（这一条最能把"这是河"讲清楚）
+		ci.draw_rect(Rect2(x0, yS - 8.0, x1 - x0, 8.0), Color(0.04, 0.13, 0.15, 0.55))
+
+
+## 凿岩立面：层理宽度不规则（由位置确定性决定），再补一道竖直裂缝
+static func _wall_face_quarry(ci: CanvasItem, x0: float, x1: float, tS: float, yS: float,
+		c_rim: Color) -> void:
+	var yy := tS + 14.0
+	var i := 0
+	while yy < yS:
+		# 18~34 交替：不用 RNG（每帧都跑，且必须完全确定）
+		var step := 18.0 + float((i * 37) % 17)
+		ci.draw_line(Vector2(x0, yy), Vector2(x1, yy), Color(0.0, 0.0, 0.0, 0.38), 1.4, true)
+		# 层理上的短竖纹，像被凿开的面
+		var vx := x0 + 24.0 + float((i * 53) % 90)
+		while vx < x1:
+			ci.draw_line(Vector2(vx, yy), Vector2(vx, minf(yy + step * 0.8, yS)),
+				Color(c_rim.r, c_rim.g, c_rim.b, 0.10), 1.0, true)
+			vx += 120.0
+		yy += step
+		i += 1
+
+
+## 木桩立面：密集的竖直木纹 + 两道横向铁箍
+static func _wall_face_river(ci: CanvasItem, x0: float, x1: float, tS: float, yS: float) -> void:
+	var vx := x0 + 3.0
+	var i := 0
+	while vx < x1:
+		var dark := 0.26 + float((i * 29) % 13) * 0.030
+		ci.draw_line(Vector2(vx, tS), Vector2(vx, yS), Color(0.0, 0.0, 0.0, dark), 1.3, true)
+		vx += 7.0
+		i += 1
+	# 铁箍
+	for frac in [0.26, 0.72]:
+		var hy := tS + (yS - tS) * float(frac)
+		ci.draw_line(Vector2(x0, hy), Vector2(x1, hy), Color(0.30, 0.24, 0.18, 0.75), 3.0, true)
 
 
 # ---------------------------------------------------------------- 玩家
@@ -456,17 +595,27 @@ static func enemy(ci: CanvasItem, e: EnemyState, cam: Vector2, t: float) -> void
 	if flash:
 		body = body.lerp(Color.WHITE, 0.7)
 
-	var behavior := str(def["behavior"])
-	if behavior == "boss":
-		_boss_body(ci, e, px, py, gy, body, glowc, t, fade)
-	elif str(def["name"]).begins_with("灯烬卫"):
-		_guard_body(ci, e, px, py, body, glowc, t, fade)
-	elif str(def["name"]).begins_with("灯蛭"):
-		_leech_body(ci, e, px, py, body, glowc, t, fade)
-	elif str(def["name"]).begins_with("扑灯蛾"):
-		_moth_body(ci, e, px, py, body, glowc, t, fade)
-	else:
-		_shade_body(ci, e, px, py, body, glowc, t, fade)
+	match body_kind(def):
+		"moth":
+			_moth_body(ci, e, px, py, body, glowc, t, fade)
+		"guard":
+			_guard_body(ci, e, px, py, body, glowc, t, fade)
+		"leech":
+			_leech_body(ci, e, px, py, body, glowc, t, fade)
+		"ashling":
+			_ashling_body(ci, e, px, py, body, glowc, t, fade)
+		"tidehusk":
+			_tidehusk_body(ci, e, px, py, body, glowc, t, fade)
+		"lanternjaw":
+			_lanternjaw_body(ci, e, px, py, body, glowc, t, fade)
+		"boss_shadow":
+			_boss_shadow_body(ci, e, px, py, gy, body, glowc, t, fade)
+		"boss_devourer":
+			_boss_body(ci, e, px, py, gy, body, glowc, t, fade)
+		_:
+			_shade_body(ci, e, px, py, body, glowc, t, fade)
+
+	_enemy_status_marks(ci, e, px, py, glowc, t, fade)
 
 	# 精英词缀标记：头顶一个符字，一眼看出这只有什么花样
 	if not e.dead and e.affix != "":
@@ -485,6 +634,219 @@ static func enemy(ci: CanvasItem, e: EnemyState, cam: Vector2, t: float) -> void
 		var by := py - e.h - 12.0
 		ci.draw_rect(Rect2(bx, by, bw, 3.5), Color(0.0, 0.0, 0.0, 0.55))
 		ci.draw_rect(Rect2(bx, by, bw * e.hp01(), 3.5), Color("#ff6f52"))
+
+
+## 这个 def 会走哪一套身体几何。
+##
+## 抽成**独立函数**是为了让自检能断言"每个敌人都长得不一样" ——
+## 否则断言就得去解析绘制代码。⚠️ 加新敌人必须在这里登记：
+## 没登记的会静默落到 `_shade_body`（变成"又一只灯影"），而画面照常能跑。
+##
+## 注意「噬灯者·幼体」与「噬灯者」**故意共用** `boss_devourer`：
+## 它们是同一个东西的幼体与成体，只靠体型与配色区分。
+static func body_kind(def: Dictionary) -> String:
+	if str(def.get("behavior", "")) == "boss":
+		return "boss_" + str(def.get("boss_style", "devourer"))
+	var nm := str(def.get("name", ""))
+	if nm.begins_with("灯烬卫"):
+		return "guard"
+	if nm.begins_with("灯蛭"):
+		return "leech"
+	if nm.begins_with("扑灯蛾"):
+		return "moth"
+	if nm.begins_with("灰烬鬼"):
+		return "ashling"
+	if nm.begins_with("灯河浮尸"):
+		return "tidehusk"
+	if nm.begins_with("衔灯兽"):
+		return "lanternjaw"
+	return "shade"
+
+
+## 元素状态留在身上的痕迹（形状层）。
+##
+## 叠光层那一半（火苗、电弧）在 world.draw_bloom 里 —— 与工程一贯的分工一致：
+## 这里画"不发光也看得见的东西"（冰壳、毒雾、头顶刻字），
+## 那里画"要靠加法混合才亮得起来的东西"。
+static func _enemy_status_marks(ci: CanvasItem, e: EnemyState, px: float, py: float,
+		glowc: Color, t: float, fade: float) -> void:
+	if e.dead:
+		return
+	var h := e.h
+	# 冰：一层半透明的壳，把整只包住（还带几道冰晶裂纹）
+	if e.frozen_t > 0.0:
+		var wob := 1.0 + sin(t * 9.0 + e.wob) * 0.04
+		ci.draw_set_transform(Vector2(px, py - h * 0.42), 0.0, Vector2(1.0, 1.55 * wob))
+		ci.draw_circle(Vector2.ZERO, e.r * 1.06, Color(0.60, 0.86, 1.0, 0.34 * fade))
+		ci.draw_arc(Vector2.ZERO, e.r * 1.06, 0.0, TAU, 28, Color(0.80, 0.94, 1.0, 0.60 * fade), 1.6, true)
+		end_xf(ci)
+		# 冰晶
+		for i in 3:
+			var fx := px + float(i - 1) * e.r * 0.55
+			ci.draw_line(Vector2(fx, py - h * 0.86), Vector2(fx + 3.0, py - h * 1.02),
+				Color(0.86, 0.96, 1.0, 0.55 * fade), 1.6, true)
+	# 毒：体表泛绿雾 + 两个上浮的气泡感圆点（气泡的"上浮"交给 bloom 层）
+	if e.venom_t > 0.0:
+		ci.draw_set_transform(Vector2(px, py - h * 0.42), 0.0, Vector2(1.0, 1.5))
+		ci.draw_circle(Vector2.ZERO, e.r * 1.02, Color(0.42, 0.78, 0.30, 0.20 * fade))
+		end_xf(ci)
+	# 头顶元素刻字：最后被打了什么元素，一眼看得见
+	if e.elem_t > 0.0:
+		var ec := Color.html(str(Content.element(e.last_elem).get("color", "#ffffff")))
+		var a := clampf(e.elem_t / 0.4, 0.0, 1.0)
+		var gy2 := py - h - 34.0
+		ci.draw_circle(Vector2(px, gy2), 8.5, Color(0.05, 0.05, 0.08, 0.72 * a))
+		ci.draw_arc(Vector2(px, gy2), 8.5, 0.0, TAU, 18, Color(ec.r, ec.g, ec.b, a), 1.4, true)
+		if font != null:
+			ci.draw_string(font, Vector2(px - 6.0, gy2 + 5.5), str(Content.element(e.last_elem).get("glyph", "?")),
+				HORIZONTAL_ALIGNMENT_LEFT, -1, 12, Color(ec.r, ec.g, ec.b, a))
+
+
+## 灰烬鬼：一团烧剩的灰堆里伸出来的东西 —— 矮、宽、拖着两条灰带
+static func _ashling_body(ci: CanvasItem, e: EnemyState, px: float, py: float,
+		body: Color, glowc: Color, t: float, fade: float) -> void:
+	var r := e.r
+	var h := e.h
+	var a := Color(body.r, body.g, body.b, fade)
+	# 灰堆（下宽上尖）
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px - r * 1.05, py), Vector2(px - r * 0.62, py - h * 0.55),
+		Vector2(px, py - h * 1.02), Vector2(px + r * 0.62, py - h * 0.55),
+		Vector2(px + r * 1.05, py),
+	]), a)
+	# 两条拖在身后的灰带（跑起来像被风吹散的灰）
+	for s in [-1.0, 1.0]:
+		var sw := sin(t * 7.0 + e.wob + s) * 5.0
+		ci.draw_polyline(PackedVector2Array([
+			Vector2(px + s * r * 0.5, py - h * 0.5),
+			Vector2(px + s * r * 0.9 + sw, py - h * 0.24),
+			Vector2(px + s * r * 1.1 - sw, py + 2.0),
+		]), Color(body.r * 1.6, body.g * 1.4, body.b * 1.3, 0.5 * fade), 2.2, true)
+	# 裂隙里的余烬（这是它唯一亮的地方）
+	var fa := 0.55 + sin(t * 6.0 + e.wob) * 0.3
+	for i in 3:
+		var fx := px + float(i - 1) * r * 0.42
+		ci.draw_line(Vector2(fx, py - h * 0.18), Vector2(fx + 2.0, py - h * 0.72),
+			Color(glowc.r, glowc.g, glowc.b, fa * fade), 2.0, true)
+
+
+## 灯河浮尸：泡胀的人形残骸，一肩高一肩低，拖着水草
+static func _tidehusk_body(ci: CanvasItem, e: EnemyState, px: float, py: float,
+		body: Color, glowc: Color, t: float, fade: float) -> void:
+	var r := e.r
+	var h := e.h
+	var bob := sin(t * 2.4 + e.wob) * 2.0
+	var a := Color(body.r, body.g, body.b, fade)
+	# 躯干：故意不对称（一肩高一肩低）——这是"泡歪了"，和灯烬卫的方正对比很大
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px - r * 0.9, py), Vector2(px - r * 0.86, py - h * 0.62),
+		Vector2(px - r * 0.30, py - h * 0.90), Vector2(px + r * 0.52, py - h * 0.74),
+		Vector2(px + r * 0.88, py - h * 0.34), Vector2(px + r * 0.82, py),
+	]), a)
+	# 头：低垂、偏一侧
+	ci.draw_circle(Vector2(px + r * 0.12, py - h * 0.92 + bob), r * 0.42,
+		Color(body.r * 1.15, body.g * 1.15, body.b * 1.2, fade))
+	# 长臂（重击的来源）：一只手拖到地上
+	var arm := 0.5 + 0.5 * sin(t * 3.0 + e.wob)
+	var ax := px - r * 1.1
+	var ay := py - h * 0.30 + arm * h * 0.34
+	ci.draw_line(Vector2(px - r * 0.7, py - h * 0.7), Vector2(ax, ay),
+		Color(body.r * 1.2, body.g * 1.2, body.b * 1.25, fade), 6.0, true)
+	# 水草
+	for i in range(-1, 2):
+		var wx := px + float(i) * r * 0.6
+		ci.draw_polyline(PackedVector2Array([
+			Vector2(wx, py - h * 0.1), Vector2(wx + 4.0 + float(i) * 3.0, py + h * 0.14),
+			Vector2(wx - 2.0, py + h * 0.3),
+		]), Color(0.34, 0.62, 0.44, 0.55 * fade), 2.0, true)
+	# 眼：两团在水下发绿的光
+	ci.draw_circle(Vector2(px + r * 0.02, py - h * 0.92 + bob), 2.4,
+		Color(glowc.r, glowc.g, glowc.b, 0.95 * fade))
+	ci.draw_circle(Vector2(px + r * 0.34, py - h * 0.90 + bob), 2.0,
+		Color(glowc.r, glowc.g, glowc.b, 0.8 * fade))
+
+
+## 衔灯兽：四足低伏，嘴里叼着一盏灯 —— 它亮的地方就是嘴
+static func _lanternjaw_body(ci: CanvasItem, e: EnemyState, px: float, py: float,
+		body: Color, glowc: Color, t: float, fade: float) -> void:
+	var r := e.r
+	var h := e.h
+	var breathe := 1.0 + sin(t * 3.4 + e.wob) * 0.05
+	var a := Color(body.r, body.g, body.b, fade)
+	# 低伏的躯体
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px - r * 1.1, py - h * 0.06), Vector2(px - r * 1.15, py - h * 0.52),
+		Vector2(px - r * 0.10, py - h * 0.78 * breathe), Vector2(px + r * 0.92, py - h * 0.62),
+		Vector2(px + r * 1.12, py - h * 0.24), Vector2(px + r * 0.86, py - h * 0.04),
+	]), a)
+	# 四条腿
+	for i in 4:
+		var lx := px - r * 0.85 + float(i) * r * 0.6
+		var lift := sin(t * 8.0 + float(i) * 1.7 + e.wob) * 3.0
+		ci.draw_line(Vector2(lx, py - h * 0.14), Vector2(lx + 2.0, py + 6.0 + lift),
+			Color(body.r * 1.2, body.g * 1.2, body.b * 1.2, 0.9 * fade), 2.6, true)
+	# 长吻（前伸）
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px + r * 0.86, py - h * 0.60), Vector2(px + r * 1.62, py - h * 0.50),
+		Vector2(px + r * 1.60, py - h * 0.30), Vector2(px + r * 0.88, py - h * 0.28),
+	]), Color(body.r * 1.1, body.g * 1.1, body.b * 1.15, fade))
+	# 嘴里的灯：开合（蓄力时张大）
+	var open := 1.0 if e.state == "windup" else 0.45
+	var lx2 := px + r * 1.5
+	var ly2 := py - h * 0.42
+	ci.draw_circle(Vector2(lx2, ly2), 4.0 + 3.0 * open,
+		Color(glowc.r, glowc.g, glowc.b, 0.95 * fade))
+	# 背脊上的三根倒刺
+	for i in 3:
+		var sx := px - r * 0.5 + float(i) * r * 0.5
+		ci.draw_colored_polygon(PackedVector2Array([
+			Vector2(sx - 4.0, py - h * 0.66), Vector2(sx, py - h * 0.95),
+			Vector2(sx + 4.0, py - h * 0.64),
+		]), Color(0.16, 0.12, 0.09, fade))
+
+
+## 灯魔之影（终章 Boss）：**没有实体**的一块黑暗，只有轮廓与里面那些灯
+##
+## 与噬灯者（`_boss_body`）刻意做成两种东西：噬灯者是"有嘴有角的野兽"，
+## 灯魔之影是"一团会呼吸的黑"。判据是 `def["boss_style"]`。
+static func _boss_shadow_body(ci: CanvasItem, e: EnemyState, px: float, py: float, gy: float,
+		body: Color, glowc: Color, t: float, fade: float) -> void:
+	var r := e.r
+	var h := e.h
+	# 主体：一团由 sine 驱动的软边黑块（不是多边形硬边）
+	var pts := PackedVector2Array()
+	var n := 20
+	for i in n:
+		var a := TAU * float(i) / float(n)
+		var wob := 1.0 + sin(a * 3.0 + t * 1.6 + e.wob) * 0.14 \
+			+ sin(a * 5.0 - t * 2.1) * 0.07
+		pts.append(Vector2(px + cos(a) * r * 1.05 * wob,
+			py - h * 0.52 + sin(a) * h * 0.56 * wob))
+	ci.draw_colored_polygon(pts, Color(0.03, 0.02, 0.05, 0.94 * fade))
+	# 轮廓：一圈冷紫的边，把"这是一团东西"勾出来
+	var ring := PackedVector2Array()
+	for i in n + 1:
+		var a2 := TAU * float(i) / float(n)
+		var wob2 := 1.0 + sin(a2 * 3.0 + t * 1.6 + e.wob) * 0.14 + sin(a2 * 5.0 - t * 2.1) * 0.07
+		ring.append(Vector2(px + cos(a2) * r * 1.05 * wob2,
+			py - h * 0.52 + sin(a2) * h * 0.56 * wob2))
+	ci.draw_polyline(ring, Color(glowc.r, glowc.g, glowc.b, 0.42 * fade), 2.0, true)
+	# 里面浮着几盏被它吃掉的灯（缓慢自转、忽明忽暗）
+	for i in 4:
+		var ang := t * 0.5 + float(i) * TAU / 4.0 + e.wob
+		var rr := r * (0.32 + 0.12 * float(i % 2))
+		var lx := px + cos(ang) * rr
+		var ly := py - h * 0.52 + sin(ang) * rr * 0.72
+		var ta := 0.45 + 0.45 * sin(t * 2.6 + float(i) * 1.9)
+		ci.draw_circle(Vector2(lx, ly), 3.0 + 1.6 * ta, Color(1.0, 0.86, 0.56, ta * fade))
+	# 一对狭长的眼
+	for s in [-1.0, 1.0]:
+		ci.draw_colored_polygon(PackedVector2Array([
+			Vector2(px + s * r * 0.10, py - h * 0.72),
+			Vector2(px + s * r * 0.46, py - h * 0.66),
+			Vector2(px + s * r * 0.46, py - h * 0.60),
+			Vector2(px + s * r * 0.10, py - h * 0.66),
+		]), Color(glowc.r, glowc.g, glowc.b, 0.9 * fade))
 
 
 ## 扑灯蛾：小而快，翅膀一开一合
@@ -917,3 +1279,30 @@ static func effect_ground(ci: CanvasItem, f: Dictionary, cam: Vector2) -> void:
 				Vector2(px + cos(ang) * ln + sin(ang) * wd * 0.5, py + sin(ang) * ln * Proj.YSQUASH - cos(ang) * wd * 0.5 * Proj.YSQUASH),
 				Vector2(px + cos(ang) * ln - sin(ang) * wd * 0.5, py + sin(ang) * ln * Proj.YSQUASH + cos(ang) * wd * 0.5 * Proj.YSQUASH),
 			]), Color(col.r, col.g, col.b, 0.55))
+		"arc":
+			# 雷元素的连锁电弧：地面上那条是**投影**（暗一点），亮的芯在 bloom 层
+			var ap := arc_pts(float(f["x"]), float(f["y"]), float(f["z"]),
+				float(f["x2"]), float(f["y2"]), float(f["z2"]), cam)
+			ci.draw_polyline(ap, Color(col.r, col.g, col.b, 0.45 * fade), 2.0, true)
+
+
+## 电弧的形状：两点之间来回折的折线（屏幕坐标）。
+##
+## 折点用**确定性的伪随机**（由下标与端点推出来，黄金角铺开），不用 RNG ——
+## 它在 `_draw` 里每帧都算，而 `_draw` **绝不能消耗随机流**。
+static func arc_pts(ax: float, ay: float, az: float, bx: float, by: float, bz: float,
+		cam: Vector2, n := 7, amp := 8.5) -> PackedVector2Array:
+	var a := gpos(ax, ay, az, cam)
+	var b := gpos(bx, by, bz, cam)
+	var dx := b.x - a.x
+	var dy := b.y - a.y
+	var ln := maxf(1.0, sqrt(dx * dx + dy * dy))
+	var pts := PackedVector2Array()
+	for i in n + 1:
+		var k := float(i) / float(n)
+		var p := a.lerp(b, k)
+		var off := 0.0
+		if i > 0 and i < n:
+			off = sin(float(i) * 2.39996323 + ax * 0.021 + by * 0.013) * amp
+		pts.append(Vector2(p.x - dy / ln * off, p.y + dx / ln * off))
+	return pts

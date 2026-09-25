@@ -25,8 +25,10 @@ var prog := {
 	## 背包栏：备用武器（"" = 空）与武器词条表（{武器id: [{id,lv}]}）
 	"bag_weapon": "",
 	"waffix": {},
+	## 武器元素：{武器id: 元素id}。**一局摇一次**（看 new_run），过关带走。
+	"welem": {},
 	"kills": 0, "deaths": 0, "max_combo": 0,
-	## 当前关卡（0 = 灯堡外庭，1 = 灯堡深处·无芯之暗）
+	## 当前关卡（0 = 灯堡外庭，1 = 灯堡深处·无芯之暗，2 = 灯河渡口）
 	"level": 0,
 	## 局内恩赐（肉鸽）。死亡 / 重开清空，过关带走。
 	"boons": {},
@@ -122,10 +124,11 @@ func show_title() -> void:
 	_panel_kind = "draft"
 	hud.show_overlay(
 		"灯 骑 士",
-		"第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗\n"
+		"第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗　→　第三关 · 灯河渡口\n"
 		+ "「外庭的灯还亮着，这是你最好的日子。」\n\n"
 		+ "WASD 移动　鼠标瞄准　J 挥击　Shift 冲刺　1/2/3 技能　E 交互\n"
 		+ "X 换手（手持 ↔ 背包武器）　C 喝灯油（背包里的回血道具）\n"
+		+ "每开一局，八把武器各随机带一种元素（火/冰/雷/毒/光），攻击会上状态。\n"
 		+ "地图上有宝箱，能开出带词条的武器；守灯人能重铸 / 锤炼武器、卖灯油。\n"
 		+ "清空一波会跳出三选一：Q / E 左右看，空格拿走。死了就重来一趟。\n"
 		+ "连击就是你的光：打得越顺，灯越亮；停下来，黑暗会咬住你。",
@@ -138,6 +141,9 @@ func show_title() -> void:
 ## 想换地图就回标题（Esc）再按一次开始。
 func new_run() -> void:
 	run_seed = _make_run_seed()
+	# 新的一局 = 8 把武器的元素**全部重摇**（清空后由 World.setup 重新 roll）。
+	# 同一局内过关、死亡重开都不会重摇 —— 玩家记住的"我那把火刀"不会当场变卦。
+	prog["welem"] = {}
 	start_level()
 
 
@@ -173,8 +179,8 @@ func start_level() -> void:
 	hud.hide_overlay()
 	hud.show_dialogue(false)
 	if not skip_dialogue:
-		var lv := int(prog["level"])
-		play_dialogue("l1_start" if lv == 0 else "l2_start")
+		# 三关各自的入场对白：l1_start / l2_start / l3_start
+		play_dialogue("l%d_start" % (int(prog["level"]) + 1))
 
 
 ## 下一关（清空当前关后由玩家确认）
@@ -588,14 +594,16 @@ func _show_clear() -> void:
 	state = "menu"
 	var lv := int(prog["level"])
 	var last := lv >= Content.level_count() - 1
-	var body := ""
-	if lv == 0:
-		body = "钟声第三下，外庭所有的灯同时熄了……\n\n"
-	else:
-		body = "盲女点亮了灯塔。从此她也成了你身上的光。\n\n"
+	# 三关各自的收尾词（0 灯堡外庭 / 1 无芯之暗 / 2 灯河渡口）
+	var bodies := [
+		"钟声第三下，外庭所有的灯同时熄了……\n\n",
+		"盲女点亮了灯塔。从此她也成了你身上的光。\n\n",
+		"灯河上的浮灯全亮了，一盏一盏朝下游漂去。\n\n",
+	]
+	var body := str(bodies[clampi(lv, 0, bodies.size() - 1)])
 	body += _stats_text()
 	if last:
-		body += "\n\n两关都通了——灯骑士走出了无芯之暗。"
+		body += "\n\n三张地图都走完了——灯骑士站在河心，把灯举过头顶。"
 	else:
 		body += "\n\n灯塔已亮起——前面还有更暗的地方。"
 	hud.show_overlay(str(world.level["name"]) + "　已 恢 复 光 明", body,

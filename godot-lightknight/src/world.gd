@@ -13,6 +13,16 @@ const HITSTOP_HIT := 0.045
 const HITSTOP_CRIT := 0.075
 const DT_MAX := 1.0 / 30.0
 
+# ---------------------------------------------------------------- 元素状态参数
+## 火：每 0.4 秒结算一次灼烧（够密才看得出"在烧"，又不至于每帧刷字）
+const IGNITE_TICK := 0.4
+## 毒：每 1.5 秒结算一次（毒的重点是"绵长 + 减速"，不是瞬伤）
+const VENOM_TICK := 1.5
+## Boss 很重：冻结时长按这个系数折算（否则"冻住 → 白打一轮"能连到死）
+const FREEZE_BOSS_MUL := 0.35
+## 敌人头顶元素刻字的停留时间
+const ELEM_MARK_T := 1.2
+
 # ---------------------------------------------------------------- 世界数据
 
 var level := {}
@@ -88,6 +98,8 @@ var prog := {
 	## 武器词条：{武器id: [{"id": 词条id, "lv": 等级}, ...]}。
 	## 挂在**武器 id** 上而不是"当前手持"上 —— 换手不丢，换回来还在。
 	"waffix": {},
+	## 武器元素：{武器id: 元素id}（一局摇一次，见 Content.ELEMENTS）
+	"welem": {},
 	"kills": 0, "deaths": 0, "max_combo": 0,
 	"used_revive": false,
 }
@@ -107,6 +119,11 @@ var _chest_rng: RandomNumberGenerator
 ## 否则"玩家第几步走到某处"会反过来改变世界演化。
 var _layout_rng: RandomNumberGenerator
 var run_seed := 0
+## 元素随机源：**每开一局**给 8 把武器各摇一种元素（见 `_roll_elements`）。
+## 同样只认 `run_seed`、同样是独立流 —— 理由与 `_layout_rng` 完全一致。
+var _elem_rng: RandomNumberGenerator
+## `prog["welem"]` 的本地引用（{武器id: 元素id}）。照抄词条的做法挂在**武器 id** 上。
+var welem := {}
 ## Boss 的**运行时**锚点。`level["boss"]` 是 const 字典（只读，不能就地改），
 ## 所以真实坐标放这里；关卡表里那份只当兜底与文案来源。
 var boss_anchor := Vector2.ZERO
@@ -140,6 +157,10 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 	# 布局随机源：只认 run_seed。用 hash 把 (局种子, 关卡号) 打散，
 	# 免得相邻两局的种子只差 1、生成出来的点位也连成一片。
 	_layout_rng = Proj.make_rng(hash([run_seed, level_index, "layout"]))
+	# 元素随机源：**不带 level_index** —— 元素是"这把武器在一局里的属性"，
+	# 不该因为过关换地图就重摇（玩家刚适应火的剑，过个图变成冰的会很怪）。
+	# 「新的一局」由 Main.new_run() 清空 prog["welem"] 来触发重摇。
+	_elem_rng = Proj.make_rng(hash([run_seed, "elem"]))
 	ambient = float(level["ambient"])
 
 	if not prog.has("boons"):
@@ -150,6 +171,12 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 		prog["bag_weapon"] = ""
 	if not prog.has("waffix"):
 		prog["waffix"] = {}
+	# 武器元素：**一局摇一次**。prog 是 Main 传进来的那一份，所以过关带走、
+	# 死亡重开也还在（同一局里"我那把火刀"不会变成别的）；只有新开一局才重摇。
+	if not prog.has("welem") or typeof(prog["welem"]) != TYPE_DICTIONARY \
+			or (prog["welem"] as Dictionary).is_empty():
+		prog["welem"] = _roll_elements()
+	welem = prog["welem"]
 	# 三选一的随机源按关卡重置 → 同一关的抽取序列可复现
 	draft_rng = Proj.make_rng(int(level["seed"]) + 4242)
 
@@ -316,6 +343,56 @@ func affix_list(wid := "") -> Array:
 ## 背包里的灯油数量（背包里的回血道具）
 func potion_count() -> int:
 	return int(prog["shop"].get("oil_bank", 0))
+
+
+# ---------------------------------------------------------------- 武器元素
+#
+# 元素是**一局一次**的随机属性，挂在武器 id 上（`prog["welem"]`），和词条同一套做法。
+# 它不改数值，只给每一次命中附加一个状态（见 Content.ELEMENTS）。
+
+## 给全部 8 把武器各摇一种元素。只走 `_elem_rng`（`run_seed` 派生），**绝不碰 `_rng`**。
+##
+## 刻意允许**重复**（两把武器可能撞同一个元素）：一旦要求"8 把各不同"，
+## 就成了固定排列，玩家第二局就能背下来"这把一定是火"，随机感反而没了。
+func _roll_elements() -> Dictionary:
+	var out := {}
+	for wid in Content.WEAPONS.keys():
+		var i := _elem_rng.randi_range(0, Content.ELEMENT_ORDER.size() - 1)
+		out[str(wid)] = str(Content.ELEMENT_ORDER[i])
+	return out
+
+
+## 某把武器（默认当前手持）的元素 id。空串 = 没有元素（正常局里不会发生）。
+func weapon_element(wid := "") -> String:
+	var k := wid if wid != "" else str(player.weapon_id)
+	return str(welem.get(k, ""))
+
+
+## 元素颜色（没元素时退回武器自己的颜色，画面上不会突然变白）
+func element_color_of(wid := "") -> Color:
+	var e := Content.element(weapon_element(wid))
+	if e.is_empty():
+		return Color.html(str(player.weapon().get("color", "#ffd070")))
+	return Color.html(str(e["color"]))
+
+
+## HUD 用的一行说明："火 · 灼烧：命中后持续掉血"（没元素则返回空串）
+func element_label(wid := "") -> String:
+	var id := weapon_element(wid)
+	if id == "":
+		return ""
+	var e := Content.element(id)
+	return "%s · %s" % [str(e.get("name", "")), str(e.get("desc", ""))]
+
+
+## 敌人身上当前挂着的元素状态（HUD / 断言用）
+func enemy_status(e: EnemyState) -> Dictionary:
+	return {
+		"ignite": snappedf(e.ignite_t, 0.001),
+		"frozen": snappedf(e.frozen_t, 0.001),
+		"venom": snappedf(e.venom_t, 0.001),
+		"elem": e.last_elem,
+	}
 
 
 # ---------------------------------------------------------------- 派生属性
@@ -1220,7 +1297,9 @@ func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 	var w := player.weapon()
 	var rng_r := float(w["range"]) * range_mul * reach_mul()
 	var arc := float(w["arc"]) * arc_mul
-	var col := str(w.get("color", "#ffd070"))
+	# 基础攻击的**染色**取自元素：这把武器是冰的，打出来就是蓝的。
+	# （技能仍然用武器自己的颜色 —— 那是"这把武器的技艺"，与元素是两件事。）
+	var col := "#" + element_color_of().to_html(false)
 	var hits := 0
 
 	if str(w.get("style", "slash")) == "shot":
@@ -1231,6 +1310,7 @@ func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 			"vx": cos(p.facing) * sp, "vy": sin(p.facing) * sp,
 			"r": 13.0, "dmg": float(w["dmg"]) * dmg_mul_v, "life": rng_r / sp,
 			"color": col, "own": "player", "knock": float(w["knock"]),
+			"elem": weapon_element(),
 		})
 		effects.append({
 			"id": _next_id, "kind": "muzzle", "x": p.x + cos(p.facing) * 22.0,
@@ -1252,7 +1332,8 @@ func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 		var ang := Proj.angle_to(p.x, p.y, e.x, e.y)
 		if absf(Proj.angle_diff(p.facing, ang)) > arc * 0.5 and d > 40.0:
 			continue
-		damage_enemy(e, float(w["dmg"]) * dmg_mul_v, ang, float(w["knock"]))
+		damage_enemy(e, float(w["dmg"]) * dmg_mul_v, ang, float(w["knock"]),
+			0.0, weapon_element())
 		hits += 1
 
 	effects.append({
@@ -1382,11 +1463,13 @@ func cast_skill(id: String) -> void:
 
 		# ============================================================ 锁灯
 		"chain_hook":
-			# 抛链：命中后把敌人拽到面前并震晕
+			# 抛链：命中后把敌人拽到面前并震晕。
+			# `yank` 是**一次性拽过来的距离（px）**，不是速度冲量 —— 理由见
+			# `_apply_effect_damage` 里"牵引是外力"那一段。
 			_push_effect({
 				"kind": "pull", "r0": 26.0, "r1": 208.0, "life": 0.34,
 				"dmg": float(w["dmg"]) * 1.20 * dm, "knock": 0.0, "stun": 0.0,
-				"pull": 760.0, "pull_stun": 0.6, "color": col,
+				"yank": 112.0, "pull_stun": 0.6, "color": col,
 			})
 			_push_effect({"kind": "ring", "r0": 208.0, "r1": 26.0, "life": 0.34,
 				"dmg": 0.0, "color": "#ffe3a8"})
@@ -1557,6 +1640,10 @@ func _push_effect(over: Dictionary) -> void:
 	for k in over.keys():
 		base[k] = over[k]
 	base["max_life"] = base["life"]
+	# 元素：在**产生这一刻**快照进去。技能留下的区域（灯球/光柱）过一会儿才结算，
+	# 那时玩家可能已经换过武器了 —— 快照才能保证"这一下打的是什么元素"不变。
+	if not base.has("elem"):
+		base["elem"] = weapon_element()
 	_next_id += 1
 	effects.append(base)
 
@@ -1607,6 +1694,10 @@ func _update_enemies(dt: float) -> void:
 		# 受击闪白
 		if e.hit_flash > 0.0:
 			e.hit_flash -= dt
+		# 元素状态：计时 + 火/毒的持续伤害（可能在这一次 tick 里把它烧死）
+		_tick_status(e, dt)
+		if e.dead:
+			continue
 		# 词缀「障」：格挡冷却
 		if e.ward_cd > 0.0 and e.ward_t > 0.0:
 			e.ward_t -= dt
@@ -1621,6 +1712,13 @@ func _update_enemies(dt: float) -> void:
 			e.vy = Proj.damp(e.vy, 0.0, 8.0, dt)
 			if e.spawn_t <= 0.0:
 				e.state = "chase"
+			continue
+		# 冰元素·冻结：**完全不能行动**（连思考都跳过、连击退都不结算），
+		# 和下面的"眩晕"是两件事 —— 眩晕只是跳过思考，位移照旧受击退影响。
+		if e.frozen_t > 0.0:
+			e.frozen_t -= dt
+			e.vx = 0.0
+			e.vy = 0.0
 			continue
 		# 眩晕：跳过思考，只做位移
 		if e.stun > 0.0:
@@ -1669,7 +1767,12 @@ func _update_enemies(dt: float) -> void:
 
 ## 位移 + 撞墙反弹（Boss 冲撞撞墙会眩晕）。与 Web 版 moveEntity 一一对应。
 func _move_entity(e: EnemyState, dt: float) -> void:
-	var want := Vector2(e.x + e.vx * dt, e.y + e.vy * dt)
+	# 毒元素：中毒期间减速（"绵长 + 拖着走"，与火的"短促高伤"分开）
+	var slow := 1.0
+	if e.venom_t > 0.0:
+		var el: Dictionary = Content.element("venom")
+		slow = float(el.get("slow", 1.0)) if not el.is_empty() else 1.0
+	var want := Vector2(e.x + e.vx * dt * slow, e.y + e.vy * dt * slow)
 	var np := collide_wall(want, e.r)
 	if absf(np.x - want.x) > 0.5 and absf(np.x - want.x) < e.r * 2.0:
 		e.vx *= -0.2
@@ -1942,7 +2045,11 @@ func _boss_ai(e: EnemyState, dt: float) -> void:
 
 # ---------------------------------------------------------------- 伤害
 
-func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0.0) -> void:
+## `elem` = 这一击带的**元素**（空串 = 用当前手持武器的元素）。
+## 攻击来源（挥击 / 弹丸 / 技能留场物）都在**产生那一刻**把元素快照进自己的数据里，
+## 这样"上一把武器留下的灯球"打出来仍然是当时那次的元素，不会中途换武器就变。
+func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0.0,
+		elem := "") -> void:
 	if e.dead:
 		return
 	# 词缀「障」：每 ward_cd 秒挡住一次伤害
@@ -1952,8 +2059,12 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 		_add_text(e.x, e.y, e.h * 0.9, "格挡", "#ffe08a", 14.0)
 		sfx("ui")
 		return
+	var el_id := elem if elem != "" else weapon_element()
 	var crit := _rng.randf() < minf(0.85, 0.16 + crit_chance())
 	var final := dmg * (1.85 if crit else 1.0)
+	# 光元素：对**暗影系**敌人额外加伤（灯烬卫是灯烬铸出来的实体，不吃这一条）
+	if el_id == "radiant" and bool(e.def.get("shadow", false)):
+		final *= float(Content.element("radiant")["shadow_mul"])
 	# 词缀「韧」：减伤
 	final *= (1.0 - clampf(e.dr, 0.0, 0.9))
 	if e.is_boss() and boss_warded():
@@ -1964,6 +2075,9 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 	var p := player
 	if p.combo < 99.0:
 		p.combo = minf(99.0, p.combo + 1.0 + combo_bonus())
+		# 光元素：命中额外给连击（这条是"光"手感最直观的地方）
+		if el_id == "radiant":
+			p.combo = minf(99.0, p.combo + float(Content.element("radiant")["combo"]))
 	p.combo_timer = 2.6
 	p.combo_peak = maxf(p.combo_peak, p.combo)
 	prog["max_combo"] = int(maxf(float(prog["max_combo"]), floor(p.combo)))
@@ -2007,8 +2121,130 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 		("●" if crit else "") + str(int(round(final))),
 		"#fff2c8" if crit else "#ffcf86", 19.0 if crit else 14.0)
 
+	# 元素状态：伤害结算完之后才施加。这一击已经把它打死的话就不必挂了
+	# （挂了也会被下一帧的清场逻辑收走，只是白跑一遍粒子）。
+	if e.hp > 0.0:
+		_apply_element(e, el_id, final, dir)
+
 	if e.hp <= 0.0:
 		_kill_enemy(e, dir)
+
+
+## 把元素状态施加到敌人身上。`hit` = 这一击实际造成的伤害（持续伤害按它的比例算）。
+func _apply_element(e: EnemyState, el_id: String, hit: float, dir: float) -> void:
+	if el_id == "" or e.dead:
+		return
+	var el: Dictionary = Content.element(el_id)
+	if el.is_empty():
+		return
+	e.last_elem = el_id
+	e.elem_t = ELEM_MARK_T
+	var col := str(el["color"])
+	match el_id:
+		"fire":
+			e.ignite_t = maxf(e.ignite_t, float(el["ignite_t"]))
+			e.ignite_dps = maxf(e.ignite_dps, hit * float(el["ignite_ratio"]))
+			if e.ignite_tick <= 0.0:
+				e.ignite_tick = IGNITE_TICK
+		"frost":
+			# Boss 很重：冻结时长按 0.35 折算。不折的话"冻住 → 白打一轮"能连到死。
+			var ft := float(el["freeze_t"]) * (FREEZE_BOSS_MUL if e.is_boss() else 1.0)
+			e.frozen_t = maxf(e.frozen_t, ft)
+			e.vx = 0.0
+			e.vy = 0.0
+		"shock":
+			e.stun = maxf(e.stun, float(el["stun_t"]))
+			_chain_shock(e, hit * float(el["chain_ratio"]))
+		"venom":
+			e.venom_t = maxf(e.venom_t, float(el["venom_t"]))
+			e.venom_dps = maxf(e.venom_dps, hit * float(el["venom_ratio"]))
+			if e.venom_tick <= 0.0:
+				e.venom_tick = VENOM_TICK
+	# 命中火花：颜色跟着元素走 —— "这把武器是什么元素"在打斗里就能看出来
+	for i in 4:
+		var a := dir + _rng.randf_range(-0.9, 0.9)
+		_add_particle(e.x + _rng.randf_range(-5.0, 5.0), e.y + _rng.randf_range(-5.0, 5.0),
+			_rng.randf_range(12.0, e.h * 0.6), {
+				"vx": cos(a) * _rng.randf_range(60.0, 240.0),
+				"vy": sin(a) * _rng.randf_range(60.0, 240.0),
+				"vz": _rng.randf_range(20.0, 130.0), "life": _rng.randf_range(0.18, 0.4),
+				"size": _rng.randf_range(1.2, 2.6), "color": col, "glow": true,
+				"drag": 2.8, "grav": 220.0,
+			})
+	_add_text(e.x, e.y, e.h * 0.72, str(el["glyph"]), col, 13.0)
+
+
+## 雷元素：从命中点放一道电弧到**最近的、且隔着墙也连得上**的敌人。
+##
+## 只打一跳，不二次连锁。理由有两个：一是二次连锁在一群怪里会变成"一次命中清场"，
+## 太强；二是连锁了几层会变得难以预测 —— 而这一条是要写进断言里的。
+func _chain_shock(src: EnemyState, dmg: float) -> void:
+	var el: Dictionary = Content.element("shock")
+	if el.is_empty():
+		return
+	var rad := float(el["chain_radius"])
+	var best: EnemyState = null
+	var bd := rad
+	for o in enemies:
+		if o == src or o.dead:
+			continue
+		var d := Proj.dist(src.x, src.y, o.x, o.y)
+		if d >= bd:
+			continue
+		# 电弧不能穿墙 —— 和"光被墙挡住"是同一个原则
+		if not has_los(src.x, src.y, o.x, o.y, 12.0):
+			continue
+		bd = d
+		best = o
+	if best == null:
+		return
+	_push_effect({
+		"kind": "arc", "x": src.x, "y": src.y, "z": src.h * 0.5,
+		"x2": best.x, "y2": best.y, "z2": best.h * 0.5,
+		"life": 0.18, "color": str(el["color"]), "dmg": 0.0,
+	})
+	_dot_damage(best, dmg, str(el["color"]))
+
+
+## 不经过 `damage_enemy` 的直接扣血（持续伤害与电弧连锁用）。
+##
+## 刻意**不给连击、不给辉光** —— 那是"玩家主动打中"的奖励。
+## 让 DoT 也能刷连击的话，火/毒元素会变成刷连击的外挂（而且不稳定，难以断言）。
+func _dot_damage(e: EnemyState, dmg: float, color: String) -> void:
+	if e.dead or dmg <= 0.0:
+		return
+	e.hp -= dmg * (1.0 - clampf(e.dr, 0.0, 0.9))
+	e.hit_flash = maxf(e.hit_flash, 0.06)
+	_add_text(e.x, e.y, e.h * 0.78, str(int(round(dmg))), color, 12.0)
+	if e.hp <= 0.0:
+		_kill_enemy(e, Proj.angle_to(player.x, player.y, e.x, e.y))
+
+
+## 元素状态的计时与持续伤害。
+##
+## 冻结**不在这里减** —— 它在 `_update_enemies` 的冻结分支里减，
+## 因为那一条要同时负责"完全不动"，写两处会重复扣时间。
+func _tick_status(e: EnemyState, dt: float) -> void:
+	if e.elem_t > 0.0:
+		e.elem_t -= dt
+	# 火：短促、结算密
+	if e.ignite_t > 0.0:
+		e.ignite_t -= dt
+		e.ignite_tick -= dt
+		if e.ignite_tick <= 0.0:
+			e.ignite_tick = IGNITE_TICK
+			_dot_damage(e, e.ignite_dps * IGNITE_TICK, "#ff8a3c")
+		if e.ignite_t <= 0.0:
+			e.ignite_dps = 0.0
+	# 毒：绵长、结算疏（减速在 _move_entity 里读 venom_t）
+	if e.venom_t > 0.0:
+		e.venom_t -= dt
+		e.venom_tick -= dt
+		if e.venom_tick <= 0.0:
+			e.venom_tick = VENOM_TICK
+			_dot_damage(e, e.venom_dps * VENOM_TICK, "#9adf6a")
+		if e.venom_t <= 0.0:
+			e.venom_dps = 0.0
 
 
 func _kill_enemy(e: EnemyState, dir: float) -> void:
@@ -2247,13 +2483,30 @@ func _apply_effect_damage(f: Dictionary, rr: float) -> void:
 						continue
 			hit[e.id] = true
 			damage_enemy(e, float(f["dmg"]), Proj.angle_to(float(f["x"]), float(f["y"]), e.x, e.y),
-				float(f["knock"]), float(f["stun"]))
-			# 锁灯·链锁：命中后把它拽向施法点
+				float(f["knock"]), float(f["stun"]), str(f.get("elem", "")))
+			# 锁灯·链锁：命中后把它拽向施法点。
+			#
+			# 这里是**一步到位的位置位移**，不是加一段速度让它自己滑过来。原因有三：
+			#  ① 牵引是**技能的直接效果**（"把它拉过来"），不是"打一下顺带推一下"。
+			#     写成速度的话，它会被元素的减速（毒 0.62）和**冻结**（速度清零）吃掉 ——
+			#     实测：这把武器摇到冰时拽近 **0.0**（技能彻底失效），摇到毒时只剩 62%。
+			#     同一套代码因为一次随机元素时好时坏，这本身就是缺陷。
+			#  ② 速度版还要吃顿帧（`hitstop`）：暴击那一帧世界停住，位移就少几帧，
+			#     于是"拽多远"取决于这一下有没有暴击 —— 无法写成稳定断言。
+			#  ③ 位移距离只由几何决定 → 越重拉得越近不了（Boss 的 weight 让它几乎不动），
+			#     这条手感是显式可调、可断言的。
 			if kind == "pull" and not e.dead:
-				var pw := float(f.get("pull", 620.0)) * clampf(1.0 - float(e.def.get("weight", 0.3)), 0.08, 1.0)
+				var yank := float(f.get("yank", 110.0)) \
+					* clampf(1.0 - float(e.def.get("weight", 0.3)), 0.12, 1.0)
 				var pa := Proj.angle_to(e.x, e.y, float(f["x"]), float(f["y"]))
-				e.vx += cos(pa) * pw
-				e.vy += sin(pa) * pw
+				var np := collide_wall(
+					Vector2(e.x + cos(pa) * yank, e.y + sin(pa) * yank), e.r)
+				e.x = np.x
+				e.y = np.y
+				# 拽到位的瞬间把残余速度清掉，否则它还会顺着旧惯性再滑一段，
+				# 落点又变成"看它之前在干什么"，断言不了。
+				e.vx = 0.0
+				e.vy = 0.0
 				e.stun = maxf(e.stun, float(f.get("pull_stun", 0.0)))
 	else:
 		var p := player
@@ -2296,6 +2549,14 @@ func _add_proj(d: Dictionary) -> void:
 	}
 	for k in d.keys():
 		base[k] = d[k]
+	# 玩家侧弹丸默认带上当前武器的元素（见 _push_effect 里的同一段理由）。
+	# 敌人弹丸不带元素 —— 元素是玩家的武器属性，不是敌人的。
+	if str(base["own"]) == "player" and not base.has("elem"):
+		base["elem"] = weapon_element()
+	# 稳定 id：光照层要按它缓存"这一颗弹丸的灯"（见 LightRig._sync_fx_lights）。
+	# 用 _next_id 计数，**不消耗 RNG**。
+	base["pid"] = _next_id
+	_next_id += 1
 	projs.append(base)
 
 
@@ -2328,7 +2589,7 @@ func _update_projs(dt: float) -> void:
 					hitset[e.id] = true
 					damage_enemy(e, float(q["dmg"]),
 						Proj.angle_to(float(q["x"]), float(q["y"]), e.x, e.y),
-						float(q.get("knock", 260.0)))
+						float(q.get("knock", 260.0)), 0.0, str(q.get("elem", "")))
 					hit_any = true
 					if not piercing:
 						break
@@ -2886,7 +3147,7 @@ func _draw() -> void:
 	for it in items:
 		match int(it["k"]):
 			0:
-				Art.wall(self, it["r"], pal, c)
+				Art.wall(self, it["r"], pal, c, str(level.get("art_style", "court")))
 			1:
 				Art.prop(self, it["r"], pal, c, time)
 			2:
@@ -3021,6 +3282,13 @@ func draw_bloom(ci: CanvasItem) -> void:
 				pass
 			"pillar":
 				Art.glow(ci, Vector2(px, py), rr * 1.2, col, 0.35 * (1.0 - t01), 5)
+			"arc":
+				# 雷元素连锁：一道折线电弧 + 两端各一颗亮点
+				var ap := Art.arc_pts(float(f["x"]), float(f["y"]), float(f["z"]),
+					float(f["x2"]), float(f["y2"]), float(f["z2"]), c)
+				ci.draw_polyline(ap, Color(1.0, 0.98, 0.82, 0.9 * (1.0 - t01)), 2.4, true)
+				Art.glow(ci, ap[0], 22.0, col, 0.7 * (1.0 - t01), 5)
+				Art.glow(ci, ap[ap.size() - 1], 26.0, col, 0.8 * (1.0 - t01), 5)
 
 	# 火盆的火焰辉光
 	for pr in props:
@@ -3050,6 +3318,29 @@ func draw_bloom(ci: CanvasItem) -> void:
 		var glowc := Color.html(str(e.def["glow"]))
 		var rr := (e.r * 0.9) if not e.is_boss() else (e.r * 0.8)
 		Art.glow(ci, Vector2(px, py - e.h * 0.7), rr, glowc, 0.22, 4)
+		# ── 元素状态在身上的**发光**那一半（形状那一半在 Art.enemy 里）──
+		# 火：身上几簇跳动的小火苗（位置由 wob/下标推出来，不碰 RNG）
+		if e.ignite_t > 0.0:
+			var ia := clampf(e.ignite_t / 1.2, 0.25, 1.0)
+			for i in 3:
+				var k := float(i) - 1.0
+				var fx := px + k * e.r * 0.52
+				var fy := py - e.h * (0.34 + 0.30 * absf(k)) \
+					- 4.0 - sin(time * 9.0 + e.wob + float(i) * 2.1) * 4.0
+				Art.tex_rot(ci, "fire_01", Vector2(fx, fy), 20.0, 30.0, 0.0,
+					Color(1.0, 0.72, 0.34, 0.78 * ia))
+				Art.glow(ci, Vector2(fx, fy), 12.0, Color("#ff8a3c"), 0.4 * ia, 4)
+		# 毒：缓慢上浮的气泡
+		if e.venom_t > 0.0:
+			for i in 3:
+				var k2 := float(i) - 1.0
+				var rise := fmod(time * 22.0 + float(i) * 17.0, 34.0)
+				var vx2 := px + k2 * e.r * 0.6 + sin(time * 2.0 + float(i)) * 3.0
+				var vy2 := py - e.h * 0.4 - rise
+				Art.glow(ci, Vector2(vx2, vy2), 7.0, Color("#9adf6a"), 0.34, 3)
+		# 冰：壳上的一层冷光（让"冻住了"在暗处也看得出来）
+		if e.frozen_t > 0.0:
+			Art.glow(ci, Vector2(px, py - e.h * 0.45), e.r * 1.2, Color("#8fd8ff"), 0.30, 4)
 
 	# 掉落物的光晕（加一颗会呼吸的星，捡东西这件事更容易被看见）
 	for d in drops:

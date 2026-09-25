@@ -44,6 +44,20 @@ var ward_t := 0.0      ## 障：当前剩余的格挡次数恢复计时
 var burn := 0.0        ## 燃：死亡时爆出火环
 var drain := 0.0       ## 噬：命中额外扣的连击数
 
+## 元素状态（由武器元素在命中时施加，见 Content.ELEMENTS 与 World.damage_enemy）。
+##
+## 命名上刻意与上面那条**词缀** `burn` 分开：`burn` 是精英词缀「燃」（死亡爆火环），
+## 这里用 `ignite_*` 表示**火元素**的灼烧。两者完全不同，别混。
+var last_elem := ""         ## 最后被施加的元素 id（头顶刻字用）
+var elem_t := 0.0           ## 头顶元素刻字的剩余时间
+var ignite_t := 0.0         ## 火：灼烧剩余时间
+var ignite_dps := 0.0       ## 火：灼烧每秒伤害
+var ignite_tick := 0.0      ## 火：下一次结算的倒计时
+var frozen_t := 0.0         ## 冰：冻结剩余时间（完全不能行动）
+var venom_t := 0.0          ## 毒：中毒剩余时间
+var venom_dps := 0.0        ## 毒：中毒每秒伤害
+var venom_tick := 0.0       ## 毒：下一次结算的倒计时
+
 ## 无芯之暗：这只怪是从再生里站起来的（用来避免无限套娃）
 var respawned := false
 

@@ -189,6 +189,70 @@ const AFFIX_ORDER := [
 ]
 
 
+# ================================================================ 元素属性
+# **每开一局，8 把武器各随机领一种元素**（存 `prog["welem"] = {武器id: 元素id}`，
+# 照抄词条的做法挂在**武器 id** 上 —— 换手不丢、换回来还在）。
+#
+# 元素不改武器的基础数值，而是给每一次命中**附加一个状态**：
+#   火 → 灼烧：短时高频率掉血
+#   冰 → 冻结：短暂**完全不能行动**（连转身都不行）
+#   雷 → 麻痹：定身，并从命中点放一道电弧**连锁**到附近敌人
+#   毒 → 中毒：长时间缓慢掉血，并且**减速**
+#   光 → 灼光：对**暗影系**敌人额外伤害，并且命中多给连击
+#
+# 五条互相不重叠：火/毒是"两条不同形状的 DoT"（一个短促一个绵长），
+# 冰/雷是"两种不同的失控"（一个完全不动，一个定身还会外溢），光是对策型。
+#
+# 随机本身走 `World._elem_rng`（由 `run_seed` 派生），**与 `_rng` 无关** ——
+# 主仿真流里插随机数会把之后所有世界演化整体挪掉。
+
+const ELEMENTS := {
+	"fire": {
+		"name": "火", "color": "#ff8a3c", "glyph": "灼",
+		"desc": "灼烧：命中后持续掉血",
+		"ignite_t": 3.0, "ignite_ratio": 0.22,
+	},
+	"frost": {
+		"name": "冰", "color": "#8fd8ff", "glyph": "冻",
+		"desc": "冻结：短暂完全无法行动",
+		"freeze_t": 1.15,
+	},
+	"shock": {
+		"name": "雷", "color": "#ffe066", "glyph": "麻",
+		"desc": "麻痹：定身，并放出电弧连锁到附近敌人",
+		"stun_t": 0.42, "chain_radius": 260.0, "chain_ratio": 0.4,
+	},
+	"venom": {
+		"name": "毒", "color": "#9adf6a", "glyph": "毒",
+		"desc": "中毒：长时间缓慢掉血，并减速",
+		"venom_t": 6.0, "venom_ratio": 0.10, "slow": 0.62,
+	},
+	"radiant": {
+		"name": "光", "color": "#fff2cc", "glyph": "圣",
+		"desc": "灼光：对暗影系敌人额外伤害，命中额外连击",
+		"shadow_mul": 1.30, "combo": 0.35,
+	},
+}
+
+## 元素固定顺序。抽元素时**不用 `Dictionary.keys()`** ——
+## 顺序随版本变会让同一颗种子 roll 出不同结果（词条那边踩过这条）。
+const ELEMENT_ORDER := ["fire", "frost", "shock", "venom", "radiant"]
+
+
+func element(id: String) -> Dictionary:
+	return ELEMENTS.get(id, {})
+
+
+func element_color(id: String) -> String:
+	var e := element(id)
+	return str(e.get("color", "#ffd070")) if not e.is_empty() else "#ffd070"
+
+
+func element_name(id: String) -> String:
+	var e := element(id)
+	return str(e.get("name", "无")) if not e.is_empty() else "无"
+
+
 # ================================================================ 守灯人 / 宝箱
 
 const SHOP := {
@@ -218,19 +282,26 @@ const ELITE_AFFIXES := {
 }
 
 # ================================================================ 敌人
+# 7 种基础 + 3 种新增（灰烬鬼 / 灯河浮尸 / 衔灯兽）。
+# 每种在 art.gd 里都有**自己的一套几何**（不是同一套改颜色）——
+# 判断依据在 `Art.enemy()`，它按 `behavior` 与 `name` 前缀分支。
+# ⚠️ 加新敌人时**必须**同时在 `Art.enemy()` 里给它一个分支，否则会静默退化成
+#    `_shade_body`（自检里有一条断言专门盯着这件事）。
+#
+# `shadow` = 属于「暗影系」，光元素的灼光对它额外加伤（灯烬卫是灯烬铸的实体，不算）。
 
 const ENEMIES := {
 	"shade": {
 		"name": "灯影", "hp": 24.0, "speed": 92.0, "dmg": 9.0, "r": 16.0, "h": 36.0,
 		"aggro": 460.0, "atk_range": 40.0, "atk_cd": 1.05, "wind": 0.34,
 		"behavior": "chase", "body": "#171a2e", "glow": "#b7a8ff", "light": 30.0,
-		"coin": 2, "weight": 0.2,
+		"coin": 2, "weight": 0.2, "shadow": true,
 	},
 	"moth": {
 		"name": "扑灯蛾", "hp": 18.0, "speed": 128.0, "dmg": 7.0, "r": 13.0, "h": 24.0,
 		"aggro": 560.0, "atk_range": 34.0, "atk_cd": 0.90, "wind": 0.26,
 		"behavior": "chase", "body": "#2a2233", "glow": "#ffd98a", "light": 18.0,
-		"coin": 2, "weight": 0.05,
+		"coin": 2, "weight": 0.05, "shadow": true,
 	},
 	"guard": {
 		"name": "灯烬卫", "hp": 78.0, "speed": 60.0, "dmg": 17.0, "r": 23.0, "h": 50.0,
@@ -242,25 +313,46 @@ const ENEMIES := {
 		"name": "灯蛭", "hp": 36.0, "speed": 74.0, "dmg": 11.0, "r": 18.0, "h": 30.0,
 		"aggro": 700.0, "atk_range": 350.0, "atk_cd": 2.3, "wind": 0.68,
 		"behavior": "spitter", "body": "#211826", "glow": "#ff6b8a", "light": 22.0,
-		"coin": 4, "weight": 0.3,
+		"coin": 4, "weight": 0.3, "shadow": true,
+	},
+	# ── 第二关专属：灰烬里爬出来的小东西，快、脆、成群 ──
+	"ashling": {
+		"name": "灰烬鬼", "hp": 30.0, "speed": 118.0, "dmg": 10.0, "r": 14.0, "h": 30.0,
+		"aggro": 620.0, "atk_range": 38.0, "atk_cd": 0.95, "wind": 0.28,
+		"behavior": "chase", "body": "#2b1e24", "glow": "#ff9d5c", "light": 16.0,
+		"coin": 3, "weight": 0.1, "shadow": true,
+	},
+	# ── 第三关专属①：灯河里泡久的沉尸，慢、厚、一击很重 ──
+	"tidehusk": {
+		"name": "灯河浮尸", "hp": 124.0, "speed": 52.0, "dmg": 24.0, "r": 26.0, "h": 58.0,
+		"aggro": 520.0, "atk_range": 70.0, "atk_cd": 2.0, "wind": 0.72,
+		"behavior": "guard", "body": "#1b2b2a", "glow": "#7fe0c0", "light": 20.0,
+		"coin": 9, "weight": 0.85,
+	},
+	# ── 第三关专属②：嘴里叼着灯，隔着老远吐灯油火弹 ──
+	"lanternjaw": {
+		"name": "衔灯兽", "hp": 66.0, "speed": 66.0, "dmg": 15.0, "r": 20.0, "h": 44.0,
+		"aggro": 820.0, "atk_range": 430.0, "atk_cd": 2.6, "wind": 0.78,
+		"behavior": "spitter", "body": "#2c2116", "glow": "#ffcf6b", "light": 26.0,
+		"coin": 7, "weight": 0.4, "shadow": true,
 	},
 	"devourer_jr": {
 		"name": "噬灯者·幼体", "hp": 430.0, "speed": 78.0, "dmg": 17.0, "r": 40.0, "h": 76.0,
 		"aggro": 900.0, "atk_range": 120.0, "atk_cd": 2.0, "wind": 0.62,
 		"behavior": "boss", "body": "#20141c", "glow": "#ff5f3c", "light": 40.0,
-		"coin": 60, "weight": 1.0, "boss_style": "devourer", "boss_scale": 1.0,
+		"coin": 60, "weight": 1.0, "shadow": true, "boss_style": "devourer", "boss_scale": 1.0,
 	},
 	"devourer": {
 		"name": "噬灯者", "hp": 900.0, "speed": 84.0, "dmg": 22.0, "r": 48.0, "h": 92.0,
 		"aggro": 1100.0, "atk_range": 135.0, "atk_cd": 1.8, "wind": 0.58,
 		"behavior": "boss", "body": "#241019", "glow": "#ff4f2e", "light": 46.0,
-		"coin": 110, "weight": 1.0, "boss_style": "devourer", "boss_scale": 1.25,
+		"coin": 110, "weight": 1.0, "shadow": true, "boss_style": "devourer", "boss_scale": 1.25,
 	},
 	"lampdemon_shadow": {
 		"name": "灯魔之影", "hp": 1250.0, "speed": 92.0, "dmg": 26.0, "r": 52.0, "h": 104.0,
 		"aggro": 1200.0, "atk_range": 150.0, "atk_cd": 1.6, "wind": 0.5,
 		"behavior": "boss", "body": "#1a1226", "glow": "#8f6bff", "light": 50.0,
-		"coin": 180.0, "weight": 1.0, "boss_style": "shadow", "boss_scale": 1.35,
+		"coin": 180.0, "weight": 1.0, "shadow": true, "boss_style": "shadow", "boss_scale": 1.35,
 	},
 }
 
@@ -330,6 +422,8 @@ const LEVEL1 := {
 	"seed": 10711,
 	"enemy_scale": 1.0,
 	"decor_count": 26,
+	# 美术风格（见 Art.floor / Art.wall）：court = 方庭石板 + 砖墙
+	"art_style": "court",
 	"boss_dialogue": "l1_boss_pre",
 	"clear_dialogue": "l1_clear",
 	"start": Vector2(300.0, 1350.0),
@@ -401,6 +495,8 @@ const LEVEL2 := {
 	"seed": 20422,
 	"enemy_scale": 1.18,
 	"decor_count": 30,
+	# 美术风格：quarry = 蚀暗矿层（交错凿痕地面 + 凿岩墙）
+	"art_style": "quarry",
 	"boss_dialogue": "l2_boss_pre",
 	"clear_dialogue": "l2_clear",
 	"start": Vector2(300.0, 1750.0),
@@ -457,7 +553,93 @@ const LEVEL2 := {
 	"boss_ward": 0.55,             # 火盆未点满时 Boss 减伤
 }
 
-const LEVELS := [LEVEL1, LEVEL2]
+# 第三关「灯河渡口」——设计稿里那句"渡过灯河，去往更暗处带去光明"就是这一关。
+#
+# 与前两关的三处刻意差异（"三张地图风格各异"不止是换色）：
+#   · 美术风格 river：地面是**会流动的水纹**（横向波纹带 + 随时间推移），
+#     墙是**木桩栈道**（竖纹 + 顶面木色），道具用 dock（浮台）与 lantern（浮灯）——
+#     这两个 kind 的物理尺寸从第一版就在 PROP_TABLE 里、但一直没被任何关卡用过。
+#   · 地貌是一条**横贯的灯河**：两道长堤中间留一个渡口缺口，
+#     所以走法不是"绕柱子"而是"先沿堤找缺口、再过河"。
+#   · 最黑（ambient 0.975）、敌人倍率最高（1.35），Boss 是本作唯一没上过场的
+#     「灯魔之影」（`boss_style: shadow`）。
+
+const LEVEL3 := {
+	"index": 2,
+	"name": "灯河渡口",
+	"subtitle": "第三张地图 · 复仇",
+	"lore": "渡过灯河，去往更暗处带去光明。",
+	"w": 3000.0, "h": 2200.0,
+	"ambient": 0.975,
+	"cleared_ambient": 0.66,
+	"seed": 30733,
+	"enemy_scale": 1.35,
+	"decor_count": 34,
+	"art_style": "river",
+	"boss_dialogue": "l3_boss_pre",
+	"clear_dialogue": "l3_clear",
+	"start": Vector2(320.0, 1980.0),
+	"goal": {"kind": "lighthouse", "pos": Vector2(2680.0, 300.0), "name": "渡口灯塔"},
+	"palette": {
+		"floor": "#12292c", "floor2": "#0e2124",
+		"wall": "#22383a", "wall_top": "#2f4d4e",
+		"rim": "#7fd8cf", "fog": "#040c0e", "accent": "#ffb765",
+	},
+	"walls": [
+		# 外圈边界
+		[0.0, 0.0, 3000.0, 60.0, 66.0],
+		[0.0, 2200.0 - 60.0, 3000.0, 60.0, 66.0],
+		[0.0, 0.0, 60.0, 2200.0, 66.0],
+		[3000.0 - 60.0, 0.0, 60.0, 2200.0, 66.0],
+		# 横贯的灯河：两道长堤，中间 1300~1620 是渡口缺口
+		[300.0, 520.0, 1000.0, 60.0, 58.0],
+		[1620.0, 520.0, 1080.0, 60.0, 58.0],
+		[300.0, 900.0, 340.0, 60.0, 50.0],
+		# 河中沙洲与立柱
+		[1180.0, 1000.0, 640.0, 60.0, 54.0],
+		[1420.0, 1180.0, 60.0, 420.0, 56.0],
+		[700.0, 1180.0, 60.0, 400.0, 62.0],
+		[2260.0, 900.0, 60.0, 460.0, 62.0],
+		# 渡口两侧的栈道与残骸
+		[2400.0, 1560.0, 480.0, 60.0, 50.0],
+		[820.0, 1700.0, 420.0, 60.0, 46.0],
+		[1700.0, 1840.0, 60.0, 300.0, 54.0],
+		[2000.0, 300.0, 60.0, 340.0, 54.0],
+		[400.0, 300.0, 60.0, 300.0, 50.0],
+	],
+	"props": [
+		{"kind": "lighthouse", "x": 2680.0, "y": 300.0},
+		{"kind": "brazier", "x": 640.0, "y": 1420.0},
+		{"kind": "brazier", "x": 1480.0, "y": 780.0},
+		{"kind": "brazier", "x": 2320.0, "y": 1900.0},
+		{"kind": "merchant", "x": 330.0, "y": 2020.0},
+		# 浮台与浮灯：前两关没有的两种道具，专门给这一关的地貌用
+		{"kind": "dock", "x": 1000.0, "y": 640.0},
+		{"kind": "dock", "x": 2520.0, "y": 1300.0},
+		{"kind": "lantern", "x": 1180.0, "y": 420.0},
+		{"kind": "lantern", "x": 1780.0, "y": 1460.0},
+		{"kind": "lantern", "x": 2600.0, "y": 900.0},
+		{"kind": "lantern", "x": 620.0, "y": 1800.0},
+	],
+	# 宝箱（同上：不入 props；点位每局随机，这里是兜底值）
+	"chests": [Vector2(560.0, 1900.0), Vector2(2760.0, 1500.0)],
+	# 波次：`x/y` 兜底锚点，真实锚点每局随机生成
+	"waves": [
+		{"label": "第一波 · 浮尸上岸", "x": 900.0, "y": 1500.0, "radius": 340.0,
+		 "enemies": [{"type": "tidehusk", "count": 2}, {"type": "shade", "count": 4}]},
+		{"label": "第二波 · 衔灯兽群", "x": 2000.0, "y": 1200.0, "radius": 340.0,
+		 "enemies": [{"type": "lanternjaw", "count": 3}, {"type": "tidehusk", "count": 1},
+					 {"type": "ashling", "count": 3}]},
+		{"label": "第三波 · 渡口的守灯人", "x": 1300.0, "y": 600.0, "radius": 320.0,
+		 "enemies": [{"type": "tidehusk", "count": 1, "elite": true},
+					 {"type": "lanternjaw", "count": 2}, {"type": "ashling", "count": 4}]},
+	],
+	# Boss：`x/y` 兜底锚点（真实场地每局随机，见 World.boss_anchor）
+	"boss": {"type": "lampdemon_shadow", "x": 2200.0, "y": 480.0, "radius": 360.0,
+		"label": "灯魔之影"},
+}
+
+const LEVELS := [LEVEL1, LEVEL2, LEVEL3]
 
 
 func level_count() -> int:
@@ -491,6 +673,7 @@ const LORE := {
 	"motto": "暂时的是现实，永恒的是理想。",
 	"l1": "外庭的灯还亮着，这是你最好的日子。",
 	"l2": "没有灯芯的地方，死了的东西会不断再生。",
+	"l3": "渡过灯河，去往更暗处带去光明。",
 }
 
 const DIALOGUES := {
@@ -542,6 +725,26 @@ const DIALOGUES := {
 		["盲女", "点亮我。让我去当灯芯，你就能走到更暗的地方去。"],
 		["旁白", "她点亮了灯塔。从此她也成了你身上的光。"],
 		["旁白", "【获得 盲女之灯】光照更强，且她会在你濒死时替你燃一次。"],
+	],
+	# ── 第三关 ──
+	"l3_start": [
+		["旁白", "【灯河渡口】\n渡过这条河，就是灯魔的地界。水面上飘着的，都是别人的灯。"],
+		["盲女", "（在你身上）前面很黑。比我看不见的地方还黑。"],
+		["灯骑士", "那我就把灯举高一点。"],
+		["旁白", "（河面会流动。浮尸与衔灯兽都泡在这条河里，别让它们围住你。）"],
+	],
+	"l3_boss_pre": [
+		["旁白", "河心的灯全灭了。一个比夜更大的影子从水里站起来。"],
+		["灯魔之影", "灯骑士啊，你是不幸的，可你亦是人们的希望。"],
+		["灯魔之影", "去吧——去往更暗处，把你自己点上。"],
+		["灯骑士", "我不是来点的。我是来灭你的。"],
+	],
+	"l3_clear": [
+		["旁白", "灯魔之影散开时，整条灯河亮了。每一盏浮灯都朝下游漂去。"],
+		["灯神", "（远远地）集齐的灯芯，够刺醒我了。"],
+		["灯神", "可你要往前一步吗？前面还有更暗的地方，而你没有别的灯芯了。"],
+		["灯骑士", "……我有我自己。"],
+		["旁白", "三张地图都走完了。灯骑士站在河心，把灯举过头顶。"],
 	],
 	"girl_talk": [
 		["盲女", "你身上的灯在抖。别怕，我在。"],

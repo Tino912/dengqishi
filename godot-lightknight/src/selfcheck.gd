@@ -83,6 +83,11 @@ func _run() -> void:
 	await _section_bag_chest()
 	await _section_shop()
 	await _section_layout()
+	# 元素 / 攻击发光 / 第三关 / 三图风格 —— 都排在最后：
+	# 命中火花与粒子要吃 `_rng`，插在中间会把前面那些依赖位置与随机的段落整体挪掉。
+	await _section_elements()
+	await _section_attack_light()
+	await _section_level3_art()
 	_finish()
 
 
@@ -187,6 +192,81 @@ func _force_kill(w: World, e: EnemyState) -> void:
 func _collect_kinds(w: World, into: Dictionary) -> void:
 	for f in w.effects:
 		into[str(f["kind"])] = true
+
+
+## 造一只「打不死、也不主动行动」的木桩 —— 元素状态那一组断言都在它身上做。
+##
+## `stun` 默认给 60 秒：既不走 AI 也不出手。注意 `World._update_enemies` 里
+## `_tick_status()` 排在眩晕分支**之前**，所以火/毒的持续伤害照常结算 ——
+## 这一点很关键，否则「状态挂上了」和「状态真的在生效」就分不开。
+func _dummy(w: World, kind: String, x: float, y: float, stun := 60.0) -> EnemyState:
+	var e := w.spawn_enemy(kind, x, y, false)
+	e.hp = 999999.0
+	e.max_hp = 999999.0
+	e.state = "chase"
+	e.stun = stun
+	return e
+
+
+## 收掉木桩（照抄别的段落的手法：标死 + 把死亡计时推远）
+func _kill_dummy(e: EnemyState) -> void:
+	e.dead = true
+	e.death_t = 99.0
+
+
+## 一盏位于 LightRig **局部坐标**的灯，落在屏幕上的像素位置。
+##
+## LightRig 自己就被摆在 `Proj.cam_offset(...)` 处（见它的 `sync`），
+## 所以子节点（灯）的屏幕位置 = cam_offset + 灯自己的 position。
+## 用它来精确采样「这盏灯到底照亮了哪个像素」，而不是靠猜。
+func _light_screen(w: World, lp: Vector2) -> Vector2:
+	return Proj.cam_offset(w.draw_cam.x, w.draw_cam.y) + lp
+
+
+## 在关卡里找一块**周围留得下两个人**的空地（做「位移受不受阻」的对照实验用）。
+## 找不到就退回出生点 —— 出生点保证是空的。
+func _open_spot(w: World, need := 240.0) -> Vector2:
+	var start: Vector2 = w.level["start"]
+	for ring in 40:
+		for a in 24:
+			var ang := float(a) * TAU / 24.0 + float(ring) * 0.137
+			var r := float(ring) * 110.0
+			var q := Vector2(start.x + cos(ang) * r, start.y + sin(ang) * r)
+			if w.blocked(q.x, q.y, need):
+				continue
+			if w.blocked(q.x + need, q.y, need * 0.5):
+				continue
+			return q
+	return start
+
+
+## 两张图在**同一块相对区域**上的差异比例（0~1）。
+##
+## 用来断言「三张地图长得不一样」。两个坑都在这里绕开了：
+##   ① 不能只比全局平均亮度 —— 那只能说明「一张比另一张暗」，说不出画面是否真的不同。
+##   ② 不能直接比整屏 —— 这游戏的屏幕**大部分是黑的**（ambient 0.9+），
+##      照整屏比出来三张图都「一样」（实测只有 3% 像素不同），而那 3% 恰好就是
+##      真正有区别的地方。所以按各自图里**玩家的屏幕位置**为中心裁一块来比。
+func _diff_ratio(a: Image, b: Image, pa: Vector2, pb: Vector2,
+		hw := 260, hh := 200, step := 4, eps := 0.02) -> float:
+	var n := 0
+	var diff := 0
+	for dy in range(-hh, hh + 1, step):
+		for dx in range(-hw, hw + 1, step):
+			var xa := int(pa.x) + dx
+			var ya := int(pa.y) + dy
+			var xb := int(pb.x) + dx
+			var yb := int(pb.y) + dy
+			if xa < 0 or ya < 0 or xa >= a.get_width() or ya >= a.get_height():
+				continue
+			if xb < 0 or yb < 0 or xb >= b.get_width() or yb >= b.get_height():
+				continue
+			var ca := a.get_pixel(xa, ya)
+			var cb := b.get_pixel(xb, yb)
+			if absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b) > eps:
+				diff += 1
+			n += 1
+	return float(diff) / maxf(1.0, float(n))
 
 
 func _w() -> World:
@@ -2154,6 +2234,762 @@ func _section_layout() -> void:
 	main.run_seed = LAYOUT_SEED
 	main.restart_level()
 	_pump(3)
+
+
+# ================================================================ 武器元素
+#
+# 对应用户这一轮的两条要求：
+#   · 攻击（近战挥击 / 远程弹药）要**发光**
+#   · 武器要带**随机元素属性**（冰冻住、火燃烧…）
+#
+# 放在整份自检的**最后**：命中火花与粒子都要吃 `_rng`，
+# 插在中间会把后面所有依赖位置/随机的段落整体挪掉（词条那一轮踩过这个坑）。
+
+func _section_elements() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	_pump(6)
+	var w := _w()
+	var p := _p()
+	p.invuln = 9999.0
+	p.hp = p.max_hp
+
+	# ── ① 元素表本身 ──
+	_ok("五种元素都在表里（火/冰/雷/毒/光）", Content.ELEMENT_ORDER.size() == 5,
+		str(Content.ELEMENT_ORDER.size()))
+	var broken := []
+	for id in Content.ELEMENT_ORDER:
+		var el := Content.element(id)
+		if el.is_empty() or not el.has("name") or not el.has("color") or not el.has("glyph"):
+			broken.append(id)
+	_ok("每种元素都有名字 / 颜色 / 头顶刻字", broken.is_empty(), ", ".join(broken))
+
+	# ── ② 八把武器每把都有元素，且挂在「武器 id」上 ──
+	var map: Dictionary = w.welem
+	_ok("★ 八把武器每把都摇到了元素",
+		map.size() == Content.WEAPONS.size(), "%d/%d" % [map.size(), Content.WEAPONS.size()])
+	var off := []
+	for wid in Content.WEAPONS.keys():
+		if not Content.ELEMENT_ORDER.has(str(map.get(str(wid), ""))):
+			off.append(str(wid))
+	_ok("抽出来的元素都在那五种之内", off.is_empty(), ", ".join(off))
+
+	p.weapon_id = "blade"
+	var e_blade := w.weapon_element()
+	p.weapon_id = "hammer"
+	var e_hammer := w.weapon_element()
+	p.weapon_id = "blade"
+	_ok("★ 元素跟着**武器 id** 走：换手 / 换回来还是同一个（与词条同一套做法）",
+		w.weapon_element() == e_blade and str(map["blade"]) == e_blade
+		and str(map["hammer"]) == e_hammer,
+		"blade=%s hammer=%s map=%s" % [e_blade, e_hammer, str(map)])
+	_ok("HUD 的元素说明非空、且以元素名开头",
+		w.element_label("blade") != ""
+		and w.element_label("blade").begins_with(str(Content.element(e_blade)["name"])),
+		w.element_label("blade"))
+
+	# 基础攻击的染色跟着元素走：「这把武器是冰的，打出来就是蓝的」
+	GameInput.aim_world = Vector2(p.x + 200.0, p.y)
+	p.attack_cd = 0.0
+	p.attack_t = 0.0
+	w.effects.clear()
+	_tap("attack")
+	var slash_col := ""
+	var slash_n := 0
+	for f in w.effects:
+		if str(f["kind"]) == "slash":
+			slash_col = str(f["color"])
+			slash_n += 1
+	var want_col := "#" + w.element_color_of("blade").to_html(false)
+	_ok("★ 基础攻击被染成了元素色（不是武器原本的暖黄）",
+		slash_n > 0 and slash_col == want_col, "%s vs %s" % [slash_col, want_col])
+
+	# ── ③ 状态效果：伤害之外的「元素手感」 ──
+	var spot := _open_spot(w)
+
+	# 火：挂上灼烧，并且**真的在掉血**
+	var fe := _dummy(w, "shade", spot.x, spot.y)
+	w.damage_enemy(fe, 100.0, 0.0, 0.0, 0.0, "fire")
+	_ok("火：命中后挂上灼烧状态", fe.ignite_t > 0.0, "%.2f" % fe.ignite_t)
+	var fe_hp := fe.hp
+	_pump(60)                       # 1 秒 → 每 0.4 秒一跳，至少两跳
+	_ok("★ 火：灼烧一直在掉血（不只是挂了个状态）",
+		fe.hp < fe_hp - 1.0, "%.1f -> %.1f" % [fe_hp, fe.hp])
+	_kill_dummy(fe)
+	w.enemies.erase(fe)
+
+	# 毒：绵长 + 减速（与火的「短促密集」是两种形状）
+	var ve := _dummy(w, "shade", spot.x, spot.y)
+	w.damage_enemy(ve, 100.0, 0.0, 0.0, 0.0, "venom")
+	_ok("毒：命中后挂上中毒状态", ve.venom_t > 0.0, "%.2f" % ve.venom_t)
+	_ok("毒：持续时间比灼烧长得多（「绵长」不是随口说的）",
+		float(Content.element("venom")["venom_t"]) > float(Content.element("fire")["ignite_t"]) * 1.8,
+		"%.1fs vs %.1fs" % [float(Content.element("venom")["venom_t"]),
+			float(Content.element("fire")["ignite_t"])])
+	# 减速：同样给 300 的速度，中毒那只走得明显更短（同地点、同时长）
+	ve.vx = 300.0
+	var vx0 := ve.x
+	_pump(24)
+	var v_moved := absf(ve.x - vx0)
+	var ve2 := _dummy(w, "shade", spot.x, spot.y)
+	ve2.vx = 300.0
+	var vx1 := ve2.x
+	_pump(24)
+	var v_moved2 := absf(ve2.x - vx1)
+	_kill_dummy(ve2)
+	w.enemies.erase(ve2)
+	_ok("★ 毒：中毒的敌人明显走得更慢（对照：同地点同时长、没中毒的那只）",
+		v_moved < v_moved2 * 0.8 and v_moved2 > 10.0,
+		"中毒 %.1f vs 正常 %.1f" % [v_moved, v_moved2])
+	_num("中毒位移", v_moved)
+	_num("未中毒位移", v_moved2)
+	var v_hp := ve.hp
+	_pump(100)                      # 再 1.7 秒 → 累计超过 VENOM_TICK(1.5) → 至少一跳
+	_ok("毒：中毒也在持续掉血（只是结算比火稀疏）",
+		ve.hp < v_hp - 1.0, "%.1f -> %.1f" % [v_hp, ve.hp])
+	_kill_dummy(ve)
+	w.enemies.erase(ve)
+
+	# 持续伤害**不给连击** —— 否则火/毒会变成刷连击的外挂
+	var de := _dummy(w, "shade", spot.x, spot.y)
+	de.ignite_t = 2.0
+	de.ignite_dps = 60.0
+	de.ignite_tick = 0.02
+	p.combo = 5.0
+	p.combo_timer = 60.0
+	var c_before := p.combo
+	var d_hp := de.hp
+	_pump(12)
+	_ok("★ 持续伤害不给连击（DoT 是「白打」的，连击只认玩家亲手打中的那一下）",
+		de.hp < d_hp - 1.0 and is_equal_approx(p.combo, c_before),
+		"hp %.1f→%.1f　combo %.2f→%.2f" % [d_hp, de.hp, c_before, p.combo])
+	_kill_dummy(de)
+	w.enemies.erase(de)
+
+	# 冰：**完全不动**，且解除后立刻恢复 —— 配一组对照，否则分不清「冻住了」和「被卡住了」
+	var ie := _dummy(w, "shade", spot.x, spot.y)
+	w.damage_enemy(ie, 1.0, 0.0, 0.0, 0.0, "frost")
+	_ok("冰：命中后挂上冻结状态", ie.frozen_t > 0.0, "%.2f" % ie.frozen_t)
+	ie.vx = 300.0
+	var ix0 := ie.x
+	_pump(20)
+	var frozen_moved := absf(ie.x - ix0)
+	ie.frozen_t = 0.0
+	ie.vx = 300.0
+	var ix1 := ie.x
+	_pump(20)
+	var thawed_moved := absf(ie.x - ix1)
+	_ok("★ 冰：冻结期间一步都不动（连外力给的速度都被清掉）",
+		frozen_moved < 0.01, "%.3f px" % frozen_moved)
+	_ok("★ 冰：冻结一解除立刻恢复移动（不是被别的东西卡住了）",
+		thawed_moved > 20.0, "%.1f px" % thawed_moved)
+	_num("冻结期间位移", frozen_moved)
+	_num("解冻后位移", thawed_moved)
+	_kill_dummy(ie)
+	w.enemies.erase(ie)
+
+	# 雷：定身 + 电弧连锁（**只一跳**，且隔着墙不连）。
+	# ⚠️ 这一段必须**先清掉前面的木桩**：木桩都堆在同一个点上，而连锁挑的是
+	# 「最近的敌人」—— 距离 0 的木桩会把连锁整个抢走，于是这里的 se2 永远挨不到电，
+	# 而断言会以「se2 血量没变」的形式失败，看起来像连锁没实现。
+	var se := _dummy(w, "shade", spot.x, spot.y, 0.0)
+	var se2 := _dummy(w, "shade", spot.x + 120.0, spot.y, 0.0)
+	var se3 := _dummy(w, "shade", spot.x + 520.0, spot.y, 0.0)
+	var s2_hp := se2.hp
+	var s3_hp := se3.hp
+	w.damage_enemy(se, 200.0, 0.0, 0.0, 0.0, "shock")
+	_ok("雷：命中后麻痹定身（stun 从 0 被抬起来）", se.stun > 0.3, "%.2f" % se.stun)
+	_ok("★ 雷：电弧连锁到附近的另一个敌人",
+		se2.hp < s2_hp - 1.0, "%.1f -> %.1f" % [s2_hp, se2.hp])
+	_ok("★ 雷：连锁只有一跳（更远的第三只没被电到，不是「一次命中清场」）",
+		is_equal_approx(se3.hp, s3_hp), "%.1f -> %.1f" % [s3_hp, se3.hp])
+	var arc_seen := false
+	for f in w.effects:
+		if str(f["kind"]) == "arc":
+			arc_seen = true
+	_ok("雷：画出了电弧特效（看得见才算数）", arc_seen)
+	for e in [se, se2, se3]:
+		_kill_dummy(e)
+		w.enemies.erase(e)
+
+	# 隔墙不连：电弧和光守的是同一条原则 —— **墙能挡住它**。
+	# 做法是找一面横墙，在它南北各放一只：两只相距 < chain_radius，
+	# 但中间隔着那面墙，所以不该连上。
+	var chain_rad := float(Content.element("shock")["chain_radius"])
+	var pair := []
+	for wl in w.walls:
+		if float(wl[2]) < 200.0 or float(wl[3]) > 100.0:
+			continue                       # 只认"够宽、不太厚"的横墙
+		var cx := float(wl[0]) + float(wl[2]) * 0.5
+		var n1 := Vector2(cx, float(wl[1]) - 34.0)
+		var n2 := Vector2(cx, float(wl[1]) + float(wl[3]) + 34.0)
+		var dd := Proj.dist(n1.x, n1.y, n2.x, n2.y)
+		if dd >= chain_rad - 20.0:
+			continue
+		if w.blocked(n1.x, n1.y, 22.0) or w.blocked(n2.x, n2.y, 22.0):
+			continue
+		if w.has_los(n1.x, n1.y, n2.x, n2.y, 12.0):
+			continue                       # 这面墙挡不住这条线，换一面
+		pair = [n1, n2]
+		break
+	_ok("找得到一面墙可以做「隔墙不连」实验", pair.size() == 2, str(pair))
+	if pair.size() == 2:
+		var wx1: Vector2 = pair[0]
+		var wx2: Vector2 = pair[1]
+		var cs := _dummy(w, "shade", wx1.x, wx1.y, 0.0)
+		var ct := _dummy(w, "shade", wx2.x, wx2.y, 0.0)
+		ct.hp = 999999.0
+		var ct_hp := ct.hp
+		w.damage_enemy(cs, 200.0, 0.0, 0.0, 0.0, "shock")
+		_ok("★ 雷：电弧**不能穿墙**（墙那边的敌人不会被连到）",
+			is_equal_approx(ct.hp, ct_hp),
+			"距离 %.0f / 半径 %.0f　血量 %.1f" % [Proj.dist(wx1.x, wx1.y, wx2.x, wx2.y),
+				chain_rad, ct.hp])
+		_kill_dummy(cs)
+		_kill_dummy(ct)
+		w.enemies.erase(cs)
+		w.enemies.erase(ct)
+
+	# 光：对**暗影系**额外伤害 + 命中额外连击
+	# ① 额外连击：这一条完全确定（不掷骰子）—— 与「没有元素」的同一击对照
+	p.weapon_id = "blade"
+	var keep_blade := str(map["blade"])
+	w.welem["blade"] = ""           # 「没有元素」必须走这条路：damage_enemy 的空串参数
+	                                # 表示「用当前武器的元素」，不是「无元素」
+	var ge1 := _dummy(w, "shade", spot.x, spot.y)
+	var ge2 := _dummy(w, "shade", spot.x, spot.y)
+	p.combo = 0.0
+	w.damage_enemy(ge1, 1.0, 0.0, 0.0, 0.0, "")
+	var c_plain := p.combo
+	p.combo = 0.0
+	w.damage_enemy(ge2, 1.0, 0.0, 0.0, 0.0, "radiant")
+	var c_rad := p.combo
+	_ok("★ 光：命中额外给连击（对照：同样一击、没有元素）",
+		c_rad > c_plain + 0.2, "无元素 %.2f vs 光 %.2f" % [c_plain, c_rad])
+	_num("无元素一击的连击增量", c_plain)
+	_num("光元素一击的连击增量", c_rad)
+	# 注意 `w.welem["blade"]` 还停在空串上 —— 下面②要比"没有元素"的伤害，
+	# 所以留到那一段结束再还原。
+
+	# ② 额外伤害：光对暗影系 ×1.30。
+	#
+	#    这里比的是**单次最大伤害**，不是总和。暴击（1.85×）让每一下在
+	#    「100」与「185」之间二选一 —— 比总和要几百次才收敛，
+	#    而"最大值"直接把档位钉死：有加成的上限是 100×1.85×1.30 = 240.5，
+	#    没有的是 185.0，两档根本不相交，所以可以断言**相等**而不是"大概 1.3 倍"。
+	var max_plain := 0.0
+	var max_rad_shadow := 0.0
+	var max_rad_plain := 0.0
+	for i in 120:
+		var ea := _dummy(w, "shade", spot.x, spot.y)
+		p.combo = 0.0
+		w.damage_enemy(ea, 100.0, 0.0, 0.0, 0.0, "")
+		max_plain = maxf(max_plain, 999999.0 - ea.hp)
+		_kill_dummy(ea)
+		w.enemies.erase(ea)
+		var eb := _dummy(w, "shade", spot.x, spot.y)
+		p.combo = 0.0
+		w.damage_enemy(eb, 100.0, 0.0, 0.0, 0.0, "radiant")
+		max_rad_shadow = maxf(max_rad_shadow, 999999.0 - eb.hp)
+		_kill_dummy(eb)
+		w.enemies.erase(eb)
+		# ③ 同一件事打在**非**暗影系（灯烬卫是灯烬铸出来的实体）上，不该有加成 ——
+		#    这一条把「光」钉成对策，而不是"通用变强"。
+		var ec := _dummy(w, "guard", spot.x, spot.y)
+		p.combo = 0.0
+		w.damage_enemy(ec, 100.0, 0.0, 0.0, 0.0, "radiant")
+		max_rad_plain = maxf(max_rad_plain, 999999.0 - ec.hp)
+		_kill_dummy(ec)
+		w.enemies.erase(ec)
+	_ok("★ 光：对**暗影系**敌人加伤 1.30 倍（单次上限 240.5 vs 185.0）",
+		is_equal_approx(max_plain, 185.0) and is_equal_approx(max_rad_shadow, max_plain * 1.30),
+		"无元素 %.1f　光打暗影 %.1f" % [max_plain, max_rad_shadow])
+	_ok("★ 光：对**非**暗影系敌人没有加伤（是「对策」，不是「通用变强」）",
+		is_equal_approx(max_rad_plain, max_plain),
+		"光打非暗影 %.1f vs 无元素 %.1f" % [max_rad_plain, max_plain])
+	_num("无元素的单次伤害上限", max_plain)
+	_num("光打暗影系的单次伤害上限", max_rad_shadow)
+	_num("光打非暗影系的单次伤害上限", max_rad_plain)
+	w.welem["blade"] = keep_blade
+
+	_ok("敌人状态可查询（HUD / 断言共用同一份）",
+		not w.enemy_status(ge2).is_empty() and str(w.enemy_status(ge2)["elem"]) == "radiant")
+	_kill_dummy(ge1)
+	_kill_dummy(ge2)
+	w.enemies.erase(ge1)
+	w.enemies.erase(ge2)
+
+	# ── ④ 随机性：一局摇一次、同种子可复现、换种子换掉、五种都摇得到 ──
+	main.run_seed = LAYOUT_SEED
+	main.prog["welem"] = {}
+	main.start_level()
+	_pump(3)
+	var map_a: Dictionary = _w().welem
+	_ok("★ 同一个局种子重建世界 → 元素表逐项相同（确定性没被随机化破坏）",
+		map_a == map, "%s vs %s" % [str(map_a), str(map)])
+
+	main.run_seed = LAYOUT_SEED + 4242
+	main.prog["welem"] = {}
+	main.start_level()
+	_pump(3)
+	var map_b: Dictionary = _w().welem
+	_ok("★ 换一个局种子 → 元素表整套换掉（随机真的生效）",
+		map_b != map_a, "两局元素表相同 = 随机没生效")
+
+	# 过关换地图**不该**重摇：玩家刚适应火的剑，过个图变成冰的很怪。
+	# 元素属于「这一局」，不属于「这一张图」—— 所以 `_elem_rng` 不带 level_index。
+	main.prog["level"] = 1
+	main.start_level()
+	_pump(3)
+	_ok("★ 过关换地图不会重摇元素（元素属于这一局，不属于这一张图）",
+		_w().welem == map_b, "%s vs %s" % [str(_w().welem), str(map_b)])
+
+	# 分布：48 个种子 × 8 把武器，五种都该出现，且不能退化
+	var wd0 := _w()
+	var keep_elem_rng := wd0._elem_rng
+	var count := {}
+	var dup_seeds := 0
+	for i in 48:
+		wd0._elem_rng = Proj.make_rng(hash([LAYOUT_SEED + i * 131, "elem"]))
+		var m: Dictionary = wd0._roll_elements()
+		var seen := {}
+		for k in m.keys():
+			var v := str(m[k])
+			count[v] = int(count.get(v, 0)) + 1
+			seen[v] = true
+		if seen.size() < Content.WEAPONS.size():
+			dup_seeds += 1
+	wd0._elem_rng = keep_elem_rng
+	_ok("★ 五种元素都摇得到（48 个种子 × 8 把武器）", count.size() == 5, str(count))
+	var thin := 99999
+	for id in Content.ELEMENT_ORDER:
+		thin = mini(thin, int(count.get(id, 0)))
+	_ok("分布不退化（每种都至少出现 20 次 / 共 384 次）", thin >= 20,
+		"最少 %d 次" % thin)
+	_ok("★ 允许两把武器撞同一个元素（若强制 8 把各不同，第二局就能背下来了）",
+		dup_seeds >= 40, "%d/48 个种子出现重复" % dup_seeds)
+	_num("元素分布里的最少出现次数", float(thin))
+	report["samples"]["element_map"] = map
+	report["samples"]["element_counts"] = count
+	report["samples"]["element_dup_seeds"] = dup_seeds
+	report["cases"]["elements"] = {
+		"count": Content.ELEMENT_ORDER.size(),
+		"names": Content.ELEMENT_ORDER.duplicate(),
+		"per_weapon": map,
+		"counts_over_48_seeds": count,
+		"seeds_with_duplicate": dup_seeds,
+	}
+
+	# 收尾：回到干净状态，别把木桩与临时状态留给后面的段落。
+	# ⚠️ 上面几次 `start_level()` 已经把世界换掉了，`w` / `p` 是**旧世界**的对象，
+	# 从这里开始必须重新取。
+	for e in wd0.enemies:
+		_kill_dummy(e)
+	wd0.effects.clear()
+	wd0.projs.clear()
+	var p_now := _p()
+	p_now.invuln = 0.0
+	p_now.combo = 0.0
+	GameInput.aim_world = null
+
+
+# ================================================================ 攻击发光
+#
+# 用户要求「近战挥击与远程弹药会发出一定的光」。这一段的重点是：
+# 那盏灯不只是「叠加层上的亮斑」，而是**真的 Light2D**（带遮挡、认墙），
+# 并且它真的把画面照亮了 —— 用同一像素的前后对比来证明。
+
+func _section_attack_light() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	GameInput.aim_world = null
+	_pump(40)                        # 让相机跟稳，采样点才不会偏
+	var w := _w()
+	var p := _p()
+	p.hp = p.max_hp
+	p.invuln = 9999.0
+	# 把「玩家自己的光」冻住：连击与辉光都会改玩家灯的半径与亮度，
+	# 不冻住的话下面的前后对比就同时动了两个变量，测出来的差值说明不了是谁干的。
+	p.combo = 0.0
+	p.combo_timer = 0.0
+	p.glow = 0.0
+	w.effects.clear()
+	w.projs.clear()
+	_pump(4)
+
+	_ok("没在挥击时就没有攻击类灯", w.light_rig.fx_light_count() == 0,
+		", ".join(w.light_rig.fx_light_keys()))
+
+	# ── ① 近战挥击：刀锋上点一盏灯，且真的照亮了那里 ──
+	p.weapon_id = "chain"            # 长兵器：光能甩到玩家自身光照半径之外，看得见
+	p.attack_cd = 0.0
+	p.attack_t = 0.0
+	GameInput.aim_world = Vector2(p.x + 400.0, p.y)   # 朝东挥，采样点好算
+	_pump(20)
+	_tap("attack")
+	_ok("★ 挥击中：刀锋上多了一盏灯", w.light_rig.fx_light_keys().has("swing"),
+		", ".join(w.light_rig.fx_light_keys()))
+	var sl: PointLight2D = w.light_rig._fx_lights.get("swing", null)
+	_ok("★ 这盏灯**带遮挡**（所以它是真的光，不是叠加层上的一块亮斑）",
+		sl != null and sl.shadow_enabled)
+	# 供报告汇总用的几个数（在下面各自的 if 里赋值）
+	var swing_lit := 0.0
+	var swing_dark := 0.0
+	var proj_lit := 0.0
+	var proj_dark := 0.0
+	var proj_light_n := 0
+	if sl != null:
+		_ok("灯的染色跟着武器元素走（不是固定的暖黄）",
+			sl.color.is_equal_approx(w.element_color_of()),
+			"%s vs %s" % [str(sl.color), str(w.element_color_of())])
+		_ok("灯的半径跟着攻击距离走（长兵器的光伸得更远）",
+			sl.texture_scale * LightRig.TEX_HALF > float(p.weapon()["range"]) * 0.5,
+			"%.1f" % (sl.texture_scale * LightRig.TEX_HALF))
+		var spot_px := _light_screen(w, sl.position)
+		var img_on := await _grab()
+		var l_on := _lum(img_on, spot_px, 5)
+		# 收手：结束挥击并重同步一次（灯会被回收），**同一像素**再采一次。
+		# 这中间不调 main.advance —— 世界的其它一切都原样不动，只剩「有没有这盏灯」。
+		p.attack_t = 0.0
+		w.light_rig.sync(w)
+		var img_off := await _grab()
+		var l_off := _lum(img_off, spot_px, 5)
+		swing_lit = l_on
+		swing_dark = l_off
+		_ok("★ 挥击真的把画面照亮了（同一像素：挥击中 vs 收手后）",
+			l_on > l_off + 0.05, "%.4f -> %.4f" % [l_off, l_on])
+		_num("挥击灯下的像素亮度（挥击中）", l_on)
+		_num("挥击灯下的像素亮度（收手后）", l_off)
+		await _shot("17-swing-light")
+		_ok("收手后刀锋灯被回收（不是亮着不灭）",
+			not w.light_rig.fx_light_keys().has("swing"),
+			", ".join(w.light_rig.fx_light_keys()))
+
+	# ── ② 远程弹药：飞行中的弹丸带一盏灯，跟着弹丸走 ──
+	p.weapon_id = "crossbow"
+	p.attack_cd = 0.0
+	p.attack_t = 0.0
+	# 先挑一个「又通、又还在画面里」的方向：弹药要飞出两百多像素才算离开
+	# 玩家那盏灯的强光区 —— 在玩家脚边采样的话那里本来就亮到接近饱和，
+	# 弹丸灯加进去只能挤出 0.04 的差，那种断言看着绿其实什么都证明不了。
+	var aim_ang := 0.0
+	var aim_ok := false
+	for k in 24:
+		var a := TAU * float(k) / 24.0
+		var tx := p.x + cos(a) * 250.0
+		var ty := p.y + sin(a) * 250.0
+		if not w.has_los(p.x, p.y, tx, ty, 14.0):
+			continue
+		var sc := _screen_of(w, tx, ty)
+		if sc.x < 60.0 or sc.x > 1220.0 or sc.y < 60.0 or sc.y > 660.0:
+			continue
+		aim_ang = a
+		aim_ok = true
+		break
+	_ok("找得到一个又通、又还在画面里的射击方向（弹药灯采样的前提）", aim_ok)
+	GameInput.aim_world = Vector2(p.x + cos(aim_ang) * 500.0, p.y + sin(aim_ang) * 500.0)
+	_pump(20)
+	_tap("attack")
+	_pump(14)                        # 飞出去约 240px（灯弩射程 380，还活着）
+	var q: Dictionary = {}
+	for f in w.projs:
+		if str(f.get("own", "")) == "player":
+			q = f
+	_ok("灯弩挥击射出了光矢", not q.is_empty())
+	if not q.is_empty():
+		_ok("★ 弹丸带着**产生那一刻**的元素（快照：之后换武器也不会变）",
+			str(q.get("elem", "")) == w.weapon_element(),
+			"%s vs %s" % [str(q.get("elem", "")), w.weapon_element()])
+		var pk := "proj:%d" % int(q.get("pid", -1))
+		_ok("★ 飞行中的弹丸带一盏灯（key 是弹丸的稳定 id）",
+			w.light_rig.fx_light_keys().has(pk), ", ".join(w.light_rig.fx_light_keys()))
+		var pl: PointLight2D = w.light_rig._fx_lights.get(pk, null)
+		if pl != null:
+			var want := Vector2(float(q["x"]), float(q["y"]) * Proj.YSQUASH - float(q["z"]))
+			_ok("这盏灯**跟着弹丸飞**（不是钉在发射点）",
+				pl.position.distance_to(want) < 0.01,
+				"%s vs %s" % [str(pl.position), str(want)])
+			var q_px := _light_screen(w, pl.position)
+			var img_fly := await _grab()
+			var l_fly := _lum(img_fly, q_px, 5)
+			# 让弹丸消失（灯随之回收），同一个像素再采一次
+			w.projs.clear()
+			w.light_rig.sync(w)
+			var img_gone := await _grab()
+			var l_gone := _lum(img_gone, q_px, 5)
+			proj_lit = l_fly
+			proj_dark = l_gone
+			_ok("★ 弹丸的灯真的照亮了那一块（飞行中 vs 消失后，同一像素）",
+				l_fly > l_gone + 0.03, "%.4f -> %.4f" % [l_gone, l_fly])
+			_num("弹丸灯下的像素亮度（飞行中）", l_fly)
+			_num("弹丸灯下的像素亮度（消失后）", l_gone)
+			await _shot("18-proj-light")
+		_ok("弹丸消失后灯自动回收", not w.light_rig.fx_light_keys().has(pk),
+			", ".join(w.light_rig.fx_light_keys()))
+
+	# ── ③ 上限：软渲染下每盏投影灯都要重算一遍遮挡，不能无限点 ──
+	w.projs.clear()
+	for i in 24:
+		w._add_proj({"x": p.x + float(i) * 14.0, "y": p.y, "z": 20.0,
+			"vx": 0.0, "vy": 0.0, "r": 8.0, "dmg": 1.0, "life": 5.0,
+			"color": "#ffffff", "own": "player"})
+	w.light_rig.sync(w)
+	_ok("★ 攻击类灯有上限（弹丸雨一次能造十几颗，不封顶会把帧率拖垮）",
+		w.light_rig.fx_light_count() <= LightRig.FX_LIGHT_MAX,
+		"%d 盏 / 上限 %d" % [w.light_rig.fx_light_count(), LightRig.FX_LIGHT_MAX])
+	_num("24 颗弹丸时的攻击灯盏数", 0.0, w.light_rig.fx_light_count())
+	proj_light_n = w.light_rig.fx_light_count()
+	w.projs.clear()
+	# 顺手把挥击也结束掉 —— 刚才那一下攻击同样点了一盏刀锋灯，
+	# 不清掉的话下面「灯归零」会一直为假（而且那不是弹丸的问题）。
+	p.attack_t = 0.0
+	w.effects.clear()
+	w.light_rig.sync(w)
+	_ok("弹丸与挥击都结束之后，攻击灯归零", w.light_rig.fx_light_count() == 0,
+		", ".join(w.light_rig.fx_light_keys()))
+
+	# 收尾
+	p.invuln = 0.0
+	p.combo = 0.0
+	GameInput.aim_world = null
+	report["cases"]["attack_light"] = {
+		"swing_px_dark": snappedf(swing_dark, 0.0001),
+		"swing_px_lit": snappedf(swing_lit, 0.0001),
+		"proj_px_dark": snappedf(proj_dark, 0.0001),
+		"proj_px_lit": snappedf(proj_lit, 0.0001),
+		"fx_light_max": LightRig.FX_LIGHT_MAX,
+		"fx_lights_with_24_projs": proj_light_n,
+	}
+	_pump(2)
+
+
+# ================================================================ 第三张地图 · 三图风格 · 敌人样貌
+
+func _section_level3_art() -> void:
+	# ── ① 三关各自的静态事实 ──
+	_ok("本作是三关", Content.level_count() == 3, str(Content.level_count()))
+	var names := []
+	var styles := []
+	var ambs := []
+	var scales := []
+	var bosses := []
+	for i in 3:
+		var lv: Dictionary = Content.LEVELS[i]
+		names.append(str(lv["name"]))
+		styles.append(str(lv.get("art_style", "")))
+		ambs.append(float(lv["ambient"]))
+		scales.append(float(lv["enemy_scale"]))
+		bosses.append(str(lv["boss"]["type"]))
+		_ok("第 %d 关的 index 与它的位置一致" % (i + 1), int(lv["index"]) == i, str(lv["index"]))
+	_ok("★ 三张地图的美术风格互不相同（court / quarry / river）",
+		styles[0] != styles[1] and styles[1] != styles[2] and styles[0] != styles[2],
+		str(styles))
+	_ok("★ 一关更比一关黑（ambient 递增）",
+		ambs[0] < ambs[1] and ambs[1] < ambs[2],
+		"%.3f / %.3f / %.3f" % [ambs[0], ambs[1], ambs[2]])
+	_ok("★ 一关更比一关狠（enemy_scale 递增）",
+		scales[0] < scales[1] and scales[1] < scales[2],
+		"%.2f / %.2f / %.2f" % [scales[0], scales[1], scales[2]])
+	_ok("★ 三关的 Boss 各不相同（幼体 / 成体 / 灯魔之影）",
+		bosses[0] != bosses[1] and bosses[1] != bosses[2] and bosses[0] != bosses[2],
+		str(bosses))
+	_ok("第三关是本作唯一一场「灯魔之影」", bosses[2] == "lampdemon_shadow", bosses[2])
+	_ok("灯魔之影算暗影系（所以「光」元素对它加伤）",
+		bool(Content.ENEMIES["lampdemon_shadow"].get("shadow", false)))
+	_ok("只有第二关有盲女同行", not (Content.LEVELS[0] as Dictionary).has("blind_girl")
+		and (Content.LEVELS[1] as Dictionary).has("blind_girl")
+		and not (Content.LEVELS[2] as Dictionary).has("blind_girl"))
+	_ok("第三关是灯河渡口", names[2] == "灯河渡口", names[2])
+	_ok("第三关的地图最大（3000×2200）",
+		float(Content.LEVELS[2]["w"]) == 3000.0 and float(Content.LEVELS[2]["h"]) == 2200.0)
+
+	# 三关各有各的入场 / Boss / 清关对白，且都在对白表里
+	var dlgs := []
+	for i in 3:
+		dlgs.append([str(Content.LEVELS[i].get("start_dialogue", "l%d_start" % (i + 1))),
+			str(Content.LEVELS[i].get("clear_dialogue", "")),
+			str(Content.LEVELS[i].get("boss_dialogue", ""))])
+	var missing_dlg := []
+	for i in 3:
+		for d in dlgs[i]:
+			if d != "" and not Content.DIALOGUES.has(d):
+				missing_dlg.append(d)
+	_ok("三关的对白都在对白表里", missing_dlg.is_empty(), ", ".join(missing_dlg))
+	_ok("三关的清关对白各不相同",
+		dlgs[0][1] != dlgs[1][1] and dlgs[1][1] != dlgs[2][1] and dlgs[0][1] != dlgs[2][1],
+		str([dlgs[0][1], dlgs[1][1], dlgs[2][1]]))
+
+	# ── ② 一关一关真的走一遍，各拍一张照 ──
+	main.run_seed = LAYOUT_SEED
+	main.prog["boons"] = {}
+	main.waves_off = true
+	var imgs: Array[Image] = []
+	var lums := []
+	# 每张图里玩家落在屏幕上的位置 —— 三张图要按**各自的玩家位置**对齐着比，
+	# 否则比的是"屏幕的同一块砖"，而玩家在三张图里并不都在同一个屏幕位置。
+	var pcs := []
+	for i in 3:
+		main.prog["level"] = i
+		# 展示用：把上一段跑出来的计数清零，免得第三关的封面照挂着「击杀 89」
+		main.prog["kills"] = 0
+		main.prog["deaths"] = 0
+		main.prog["max_combo"] = 0
+		main.prog["coins"] = 0
+		main.prog["bag_weapon"] = ""
+		main.start_level()
+		_pump(40)                    # 等相机跟稳，画面才是「这张图的样子」
+		var w := _w()
+		var st: Vector2 = w.level["start"]
+		_ok("第 %d 关「%s」加载成功" % [i + 1, str(w.level["name"])],
+			int(w.level["index"]) == i, str(w.level["index"]))
+		_ok("第 %d 关有墙、且遮挡体一一对应" % (i + 1),
+			w.walls.size() > 0 and w.light_rig.occluder_count() == w.walls.size(),
+			"墙 %d / 遮挡体 %d" % [w.walls.size(), w.light_rig.occluder_count()])
+		_ok("第 %d 关玩家出生在关卡起点" % (i + 1),
+			Proj.dist(w.player.x, w.player.y, st.x, st.y) < 2.0,
+			"(%.0f,%.0f) vs (%.0f,%.0f)" % [w.player.x, w.player.y, st.x, st.y])
+		_ok("第 %d 关的敌人倍率来自关卡表" % (i + 1),
+			is_equal_approx(float(w.level["enemy_scale"]), scales[i]),
+			"%.2f vs %.2f" % [float(w.level["enemy_scale"]), scales[i]])
+		var img := await _grab()
+		imgs.append(img)
+		lums.append(_mean_lum(img))
+		pcs.append(_screen_of(w, w.player.x, w.player.y))
+		if i == 2:
+			_write_png(img, "16-level3")
+			report["cases"]["level3"] = {
+				"name": str(w.level["name"]), "index": int(w.level["index"]),
+				"w": float(w.level["w"]), "h": float(w.level["h"]),
+				"walls": w.walls.size(), "ambient": snappedf(float(w.level["ambient"]), 0.001),
+				"enemy_scale": float(w.level["enemy_scale"]),
+				"boss": str((w.level["boss"] as Dictionary)["type"]),
+			}
+			_ok("第三关有灯河渡口专属道具（浮台 / 浮灯，前两关没有）",
+				_has_prop(w, "dock") and _has_prop(w, "lantern"),
+				"dock=%s lantern=%s" % [_has_prop(w, "dock"), _has_prop(w, "lantern")])
+			# 再拍一张「灯河」本身：这条横贯的地貌是第三关的主角，
+			# 出生点那张拍不到它。传送到河边的渡口缺口再拍。
+			w.teleport(1460.0, 700.0)
+			_pump(40)
+			await _shot("19-level3-river")
+
+	# 三张画面必须真的不一样。比的是**各自玩家周围那一片**：
+	# 整屏比会全都"一样"（这游戏的屏幕大部分是黑的），只比平均亮度又只能看出明暗。
+	for a in 3:
+		for b in range(a + 1, 3):
+			var r := _diff_ratio(imgs[a], imgs[b], pcs[a], pcs[b])
+			_ok("★ 地图 %d 与地图 %d 在出生点周围的画面差异 > 25%%（不是同一张图换了个滤镜）"
+				% [a + 1, b + 1], r > 0.25, "%.1f%%" % (r * 100.0))
+			report["samples"]["art_diff_%d_%d" % [a + 1, b + 1]] = snappedf(r, 0.0001)
+
+	# 对照：同一关**重建两次**，画面应当几乎逐像素相同。
+	# 这一条是上面那三个百分数的地基 —— 没有它，"30% 不同"根本说明不了什么，
+	# 因为这个指标也可能对任何输入都吐出 30%。
+	main.prog["level"] = 0
+	main.prog["kills"] = 0
+	main.prog["deaths"] = 0
+	main.prog["max_combo"] = 0
+	main.prog["coins"] = 0
+	main.prog["bag_weapon"] = ""
+	main.start_level()
+	_pump(40)
+	var w_same := _w()
+	var img_same := await _grab()
+	var pc_same := _screen_of(w_same, w_same.player.x, w_same.player.y)
+	var r_same := _diff_ratio(img_same, imgs[0], pc_same, pcs[0])
+	_ok("★ 对照：同一关重建两次，画面几乎逐像素相同（差异 < 3%）",
+		r_same < 0.03, "%.2f%%" % (r_same * 100.0))
+	_num("同一关重建两次的画面差异", r_same)
+
+	# 另外，三关的调色板也得各不同 —— 几何不同是一回事，"这张图是这个颜色"是另一回事。
+	var pal_vals := {}
+	for key in ["floor", "floor2", "wall", "wall_top", "rim"]:
+		var v := []
+		for i in 3:
+			v.append(str((Content.LEVELS[i]["palette"] as Dictionary).get(key, "")))
+		pal_vals[key] = v
+	var pal_diff := 0
+	for key in pal_vals.keys():
+		var v: Array = pal_vals[key]
+		if v[0] != v[1] or v[1] != v[2] or v[0] != v[2]:
+			pal_diff += 1
+	_ok("★ 三关的调色板也各不相同（5 项里至少 4 项互异）", pal_diff >= 4,
+		"%d/5 项" % pal_diff)
+	_num("三关调色板里互异的项数", 0.0, pal_diff)
+	_ok("三张地图的平均亮度也各不相同",
+		lums[0] != lums[1] and lums[1] != lums[2],
+		"%.4f / %.4f / %.4f" % [lums[0], lums[1], lums[2]])
+	_num("第一关画面平均亮度", lums[0])
+	_num("第二关画面平均亮度", lums[1])
+	_num("第三关画面平均亮度", lums[2])
+
+	# ── ③ 敌人样貌各异 ──
+	# `Art.body_kind` 是「这只敌人长什么样」的唯一入口；**没登记的会静默退回「灯影」**，
+	# 而画面照常能跑 —— 所以必须有这么一条盯住它。
+	var kinds := {}
+	var dup := []
+	var fell := []
+	for k in Content.ENEMIES.keys():
+		var bk := Art.body_kind(Content.ENEMIES[k])
+		if bk == "shade" and str(k) != "shade":
+			fell.append(str(k))
+		if kinds.has(bk):
+			dup.append("%s 与 %s 共用 %s" % [str(k), str(kinds[bk]), bk])
+		else:
+			kinds[bk] = k
+	_ok("★ 除了「灯影」本身，没有敌人落回兜底造型（新敌人忘了登记就落这里）",
+		fell.is_empty(), ", ".join(fell))
+	_ok("★ 敌人造型两两不同（只有噬灯者幼体/成体是故意的共用）",
+		dup.size() == 1 and str(dup[0]).find("devourer") >= 0, "; ".join(dup))
+	_ok("噬灯者幼体与成体共用一套身子（是故意的，不是漏登记）",
+		Art.body_kind(Content.ENEMIES["devourer_jr"])
+		== Art.body_kind(Content.ENEMIES["devourer"]))
+	_ok("★ 造型数 = 敌人数 - 1（%d 种敌人 → %d 套身子）"
+		% [Content.ENEMIES.size(), kinds.size()],
+		kinds.size() == Content.ENEMIES.size() - 1,
+		str(kinds))
+	report["samples"]["enemy_bodies"] = kinds
+	_ok("第三关的两个新敌人都有自己的身子（灰烬鬼 / 灯河浮尸 / 衔灯兽）",
+		str(kinds.get("ashling", "")) == "ashling"
+		and str(kinds.get("tidehusk", "")) == "tidehusk"
+		and str(kinds.get("lanternjaw", "")) == "lanternjaw")
+
+	# ── ④ 三关推进：L1 → L2 → L3 → 通关（不再往前）──
+	main.prog["level"] = 0
+	main.start_level()
+	_pump(3)
+	_ok("第一关加载成功（index == 0）", int(_w().level["index"]) == 0)
+	main.next_level()
+	_ok("★ 第一关过关 → 进入第二关",
+		int(main.prog["level"]) == 1 and int(_w().level["index"]) == 1,
+		"level=%d" % int(main.prog["level"]))
+	main.next_level()
+	_ok("★ 第二关过关 → 进入第三关",
+		int(main.prog["level"]) == 2 and int(_w().level["index"]) == 2,
+		"level=%d" % int(main.prog["level"]))
+	main.next_level()
+	_ok("★ 第三关之后不再往前（通关，不会越界出第 4 关）",
+		int(main.prog["level"]) == 2 and int(_w().level["index"]) == 2,
+		"level=%d" % int(main.prog["level"]))
+
+	# 收尾：回到第一关，离开这一段时世界干净
+	main.prog["level"] = 0
+	main.start_level()
+	_pump(3)
+
+
+## 关卡里有没有某种道具
+func _has_prop(w: World, kind: String) -> bool:
+	for pr in w.props:
+		if str(pr["kind"]) == kind:
+			return true
+	return false
 
 
 func _finish() -> void:
