@@ -314,6 +314,19 @@ func _section_assets() -> void:
 		t0 != null and t0.get_width() == Art.TEX_SIZE,
 		str(t0.get_width()) if t0 != null else "null")
 	_ok("程序化光晕贴图就绪（所有 glow 现在都走它）", Art.soft_dot != null)
+
+	# 三选一卡片的徽记：Hud.EMBLEMS 的键必须覆盖 roll_draft 会产出的每一个 id，
+	# 否则卡片会静默回退到默认 star_06 —— 视觉上"几个恩赐长得一样"。
+	var _emblem_keys: Dictionary = Hud.EMBLEMS
+	var _miss_em := []
+	for b in Content.BOONS:
+		if not _emblem_keys.has(str(b["id"])):
+			_miss_em.append(str(b["id"]))
+	for wid in Content.WEAPONS.keys():
+		if not _emblem_keys.has(str(wid)):
+			_miss_em.append(str(wid))
+	_ok("三选一徽记覆盖全部武器与恩赐（不靠默认图兜底）",
+		_miss_em.is_empty(), "缺 " + ", ".join(_miss_em))
 	report["samples"]["assets"] = {
 		"display_font": nm, "textures": names.size(), "tex_size": Art.TEX_SIZE,
 		"tex_errors": Art.tex_errors.duplicate(),
@@ -756,6 +769,16 @@ func _section_drops_death() -> void:
 		"%d -> %d" % [deaths0, int(w.prog["deaths"])])
 	_ok("死亡弹出结算面板", main.state == "menu" and main._menu_kind == "death",
 		"%s/%s" % [main.state, main._menu_kind])
+	# 死亡时世界被冻结（state=menu 不调 step），但闪光是视觉反馈必须照常淡出，
+	# 否则红闪会一直盖在结算画面上。
+	# 走完整的 main.advance() 而不是只调 world.tick_fx()：清除 flash_rect 的颜色是
+	# hud.refresh() 干的，只调 tick_fx 会让 flash_power 归零而屏幕仍亮着。
+	# advance 在 menu 状态不调 world.step()、不消耗世界 RNG，所以走 40 次也不挪动 RNG 流。
+	for i in 40:
+		main.advance(Main.STEP)
+	_ok("死亡期间全屏闪光照常淡出（世界冻结但表现层仍在演进）",
+		_w().flash_power <= 0.001 and main.hud.flash_rect.color.a <= 0.001,
+		"flash_power=%.3f alpha=%.3f" % [_w().flash_power, main.hud.flash_rect.color.a])
 	await _shot("07-death")
 
 	_tap("restart")
@@ -763,6 +786,12 @@ func _section_drops_death() -> void:
 	_ok("按 R 重生：回到战斗且满血", main.state == "play" and is_equal_approx(_p().hp, _p().max_hp),
 		"%s hp=%.0f" % [main.state, _p().hp])
 	_ok("重生后世界重建（灯塔回到未点亮）", not bool(_w().goal_prop["lit"]))
+	# 死亡瞬间打出的红闪（flash_power=0.34）会被 hud.refresh() 读到。
+	# HUD 是常驻节点、flash_power 属于旧 World 实例，重生后新世界 flash_power=0，
+	# 若 refresh 不把颜色写回透明，红闪会一直盖在新关卡画面上。
+	_ok("重生后全屏滤镜已清除（不再残留死亡红闪）",
+		_w().flash_power <= 0.0 and main.hud.flash_rect.color.a <= 0.001,
+		"flash_power=%.3f alpha=%.3f" % [_w().flash_power, main.hud.flash_rect.color.a])
 
 	# 交互：火盆
 	var bw := _w()

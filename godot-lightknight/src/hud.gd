@@ -505,9 +505,14 @@ func refresh(world: World) -> void:
 	else:
 		boss_box.visible = false
 
+	# flash_power 衰减到 0 后必须把颜色写回透明：HUD 是常驻节点，
+	# 而 flash_power 属于 World 实例，换关卡 / 重生后新世界从 0 开始，
+	# 若这里只在 >0 时写，上一关死亡时的红闪会一直留在新关卡画面上。
 	if world.flash_power > 0.0:
 		var fc := world.flash_color
 		flash_rect.color = Color(fc.r, fc.g, fc.b, minf(0.42, world.flash_power))
+	else:
+		flash_rect.color = Color(0, 0, 0, 0)
 
 	# 暗角随亮度收放：越亮越"开"，越黑越"收"
 	var vig := clampf(0.72 - world.brightness01() * 0.42, 0.16, 0.9)
@@ -675,11 +680,12 @@ const CARD_BOON := Color("#ffd27a")
 const EMBLEMS := {
 	"blade": "slash_03", "twin": "slash_01", "spear": "trace_04", "chain": "spark_04",
 	"hammer": "circle_03", "scythe": "slash_02", "crossbow": "muzzle_01", "staff": "magic_05",
-	"edge": "star_06", "bright": "light_02", "swift": "trace_01", "fuel": "magic_01",
-	"kindle": "star_03", "vamp": "smoke_05", "thorn": "spark_01", "ward": "twirl_01",
-	"greed": "star_09", "heavy": "scorch_02", "reach": "trace_04", "crit": "star_09",
-	"combo": "light_03", "killboom": "fire_01", "drain": "smoke_08", "dr": "circle_03",
-	"swift2": "trace_01", "shield": "twirl_01", "grow": "magic_03", "thorns": "spark_01",
+	## 键必须与 content.gd 里 BOONS 的 id 逐一对齐，
+	## 否则 roll_draft 产出的卡片会回退到默认 star_06，徽记就失去区分作用。
+	"hp": "star_06", "dmg": "spark_01", "haste": "trace_01", "light": "light_02",
+	"reach": "trace_04", "vamp": "smoke_05", "combo_up": "light_03",
+	"combo_add": "fire_01", "dash": "trace_04", "skill_cd": "magic_03",
+	"cost_cut": "magic_01", "crit": "star_09", "bounty": "star_03", "killboom": "fire_01",
 }
 
 

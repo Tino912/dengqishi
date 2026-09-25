@@ -156,6 +156,7 @@ func advance(dt: float) -> void:
 			_draft_input(dt)
 
 	if world != null:
+		world.tick_fx(dt)
 		_drain_events()
 		hud.refresh(world)
 	hud.tick(dt)
@@ -286,8 +287,6 @@ func restart_level() -> void:
 
 
 func respawn() -> void:
-	if world != null:
-		world.prog["deaths"] = int(world.prog["deaths"])
 	prog["coins"] = int(float(prog["coins"]) * 0.75)
 	prog["boons"] = {}
 	start_level()
