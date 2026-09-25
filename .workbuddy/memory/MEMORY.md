@@ -135,9 +135,26 @@
 少点一个，后面所有段落会成片变红（敌人不动、镜头不跟、灯不亮），极难反查。
 三个面板的收尾统一走 `_resume_play()`。
 
+## 仓库 / 版本控制（2026-09-25 起）
+- 远程 `origin` = **`git@github.com:Tino912/dengqishi.git`**（SSH，密钥 `/home/tino12/.ssh/id_rsa`）。
+  **沙箱里 push/pull 要绕三层墙**（系统 ssh 配置属主、uid 与 `$HOME` 不一致、私钥读取需授权）——
+  可复制的写法与诊断手法见 skill **`git-remote-in-sandbox`**。
+- 仓库原来**没有 `.gitignore`**，`.godot/` 缓存、`node_modules/`、`.Trash-0/`（桌面回收站）
+  全被跟踪，是噪音与冲突的主要来源。已加 `.gitignore` 并把这三类**移出跟踪**
+  （`git rm -r --cached`，磁盘文件未删）。`shots/` 与 `dist/` **保持跟踪**（是给人看的产物）。
+- 提交历史：`7b95646`（基线）→ `c5e8ed2`（宝箱/背包/守灯人那轮）→ `64886d7`（清理 + .gitignore）。
+- ⚠️ **已知回归**：曾有一个 fork PR（`maxlen727/LightKnight-rev@fix/godot-fx-residual`，
+  提交 `55cb837`，原合并提交 `1a9f2a8`）修了三个真 bug，但被强推退掉了，**当前 master 上没有**：
+  ① `flash_rect` 在 `flash_power` 归零后没写回透明（换关卡/重生后红闪残留）；
+  ② `flash_power` 衰减仍在 `world.step()` 里 → 对白/菜单/三选一**冻结世界时红闪卡在结算画面**；
+  ③ `EMBLEMS` 键名与 `content.gd` 的 BOONS id 对不上 → **4 张恩赐卡徽记静默回退默认图**。
+  要拿回：`git fetch origin refs/pull/1/head && git cherry-pick 55cb837`（GitHub 永久保留该 ref）。
+
 ## 已知待办（未做）
 - Godot 版只有**两关**；设计稿的第三关（盲女被吃→化为力量）未做。
-- Godot 版无商店/升级/存档/传送；三选一是唯一局内成长。无手柄触屏。
+- ~~Godot 版无商店~~ → **已有守灯人商店**（买灯油/重铸/锤炼）；但仍**无升级/存档/传送**，
+  局内成长 = 三选一 + 宝箱 + 词条。无手柄触屏。
+- 上面「已知回归」那三条（红闪残留、红闪卡结算、恩赐徽记）尚未自行修回。
 - 敌人弹道只做了 leech；`spitter` 手感未与 Web 逐帧比对。
 - **Web 版 `render.ts` 的 `applyLighting` 用 `createRadialGradient` 画屏幕正圆**，
   在 2.5D 地面上是椭圆 → 南北多照 60%。**与换引擎无关，可独立先修**（竖向压 YSQUASH）。
