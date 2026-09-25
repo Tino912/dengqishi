@@ -321,6 +321,48 @@ func _section_assets() -> void:
 		t0 != null and t0.get_width() == Art.TEX_SIZE,
 		str(t0.get_width()) if t0 != null else "null")
 	_ok("程序化光晕贴图就绪（所有 glow 现在都走它）", Art.soft_dot != null)
+
+	# 三选一 / 宝箱卡片的徽记。这张表有**两处静默出错**的方式，各断言一条：
+	#   ① 键与 content.gd 的 id 对不上 → 回退默认 star_06，视觉上"好几张恩赐长得一样"
+	#      （历史坑：EMBLEMS 用的还是老版本恩赐 id，与 content.gd 完全对不上）
+	#   ② 值写了个不存在的贴图名 → Art.tex() 返回 null，徽记**直接隐形**，比回退更糟
+	var em_keys: Dictionary = Hud.EMBLEMS
+	var em_miss: Array = []
+	var em_bad: Array = []
+	for b in Content.BOONS:
+		if not em_keys.has(str(b["id"])):
+			em_miss.append(str(b["id"]))
+	for wid in Content.WEAPONS.keys():
+		if not em_keys.has(str(wid)):
+			em_miss.append(str(wid))
+	for aid in Content.WEAPON_AFFIXES.keys():
+		if not em_keys.has(str(aid)):
+			em_miss.append(str(aid))
+	for k in em_keys.keys():
+		if Art.tex(str(em_keys[k])) == null:
+			em_bad.append("%s -> %s" % [k, em_keys[k]])
+	_ok("三选一徽记覆盖全部武器 / 恩赐 / 词条（不靠默认图兜底）",
+		em_miss.is_empty(), "缺 " + ", ".join(em_miss))
+	_ok("三选一徽记引用的贴图全部真实存在（写错名会静默隐形）",
+		em_bad.is_empty(), "问题项 " + ", ".join(em_bad))
+	# 徽记的意义就是"一眼能区分"，所以要防的是"多张卡撞用同一张贴图"。
+	# 只统计**真的会出现在卡片上**的 id（武器 + 恩赐），不含只走文字 chip 的词条。
+	var em_used := {}
+	for b2 in Content.BOONS:
+		var v := str(em_keys.get(str(b2["id"]), "star_06"))
+		em_used[v] = int(em_used.get(v, 0)) + 1
+	for wid2 in Content.WEAPONS.keys():
+		var v2 := str(em_keys.get(str(wid2), "star_06"))
+		em_used[v2] = int(em_used.get(v2, 0)) + 1
+	var em_worst := 0
+	var em_worst_name := ""
+	for vk in em_used.keys():
+		if int(em_used[vk]) > em_worst:
+			em_worst = int(em_used[vk])
+			em_worst_name = str(vk)
+	_ok("卡片徽记有足够区分度（同一张贴图最多被 2 个卡片 id 复用）",
+		em_worst <= 2, "最多复用 %d 次（%s）" % [em_worst, em_worst_name])
+
 	report["samples"]["assets"] = {
 		"display_font": nm, "textures": names.size(), "tex_size": Art.TEX_SIZE,
 		"tex_errors": Art.tex_errors.duplicate(),
@@ -763,13 +805,51 @@ func _section_drops_death() -> void:
 		"%d -> %d" % [deaths0, int(w.prog["deaths"])])
 	_ok("死亡弹出结算面板", main.state == "menu" and main._menu_kind == "death",
 		"%s/%s" % [main.state, main._menu_kind])
+	# 死亡会打出一发全屏红闪，颜色被写在**常驻 HUD** 的 flash_rect 上。
+	# 先确认它真的亮着 —— 否则下面所有"清掉了"的断言都会退化成同义反复。
+	_ok("死亡瞬间打出全屏红闪（红闪确实画在屏幕上）",
+		_w().flash_power > 0.05 and main.hud.flash_rect.color.a > 0.03,
+		"flash_power=%.3f alpha=%.3f" % [_w().flash_power, main.hud.flash_rect.color.a])
 	await _shot("07-death")
+
+	# 衰减**不能跟着世界一起冻结**。结算时 state == "menu"，advance() 不调 world.step()；
+	# 衰减若还留在 step() 里，这发红闪就会一直糊在结算画面上直到重生。
+	# 这里刻意走完整的 main.advance()，而不是只调 world.tick_fx() —— 把 flash_rect
+	# 刷回透明是 hud.refresh() 干的，只调 tick_fx 会漏掉"power 归零但屏幕还亮着"这种假通过。
+	# menu 状态下 advance() 不调 world.step()、不消耗世界 RNG，多走几步不会挪动随机流。
+	var w_time0 := _w().time
+	var fx_steps := 0
+	while _w().flash_power > 0.001 and fx_steps < 60:
+		main.advance(STEP)
+		fx_steps += 1
+	_ok("死亡期间全屏闪光照常淡出（世界冻结但表现层仍在演进）",
+		_w().flash_power <= 0.001 and main.hud.flash_rect.color.a <= 0.001,
+		"走了 %d 步 flash_power=%.3f alpha=%.3f" % [fx_steps, _w().flash_power,
+			main.hud.flash_rect.color.a])
+	# 顺带证明"世界真的停住了"：这些步进只该推进表现层，不该推动世界时间。
+	# 少了这条，上面那条断言在"衰减其实写在 step() 里"的实现下也能过。
+	_ok("结算期间世界时间没有前进（世界确实被冻结，不是靠 step 衰减）",
+		is_equal_approx(_w().time, w_time0), "time %.4f -> %.4f" % [w_time0, _w().time])
+
+	# 重生前**再手动点亮一次**红闪：上面那轮已经把 flash_power 淡到 0，
+	# 如果就这么重生，"重生后不残留"就成了同义反复（本来就是 0，当然清得掉）。
+	# 这条真正要测的是 hud.refresh() 的 else 分支：HUD 常驻，而 flash_power 属于旧
+	# World 实例 —— 新世界从 0 开始，refresh 若不把颜色写回透明，
+	# 上一关的红闪就会一直盖在新关卡的画面上。
+	_w().flash_color = Color.html("#d8543f")
+	_w().flash_power = 0.34
+	main.advance(STEP)
+	_ok("重生前红闪确实在屏幕上（给下一条断言制造真实前提）",
+		main.hud.flash_rect.color.a > 0.1, "alpha=%.3f" % main.hud.flash_rect.color.a)
 
 	_tap("restart")
 	_pump(4)
 	_ok("按 R 重生：回到战斗且满血", main.state == "play" and is_equal_approx(_p().hp, _p().max_hp),
 		"%s hp=%.0f" % [main.state, _p().hp])
 	_ok("重生后世界重建（灯塔回到未点亮）", not bool(_w().goal_prop["lit"]))
+	_ok("重生后全屏滤镜已清除（新世界 flash_power=0 时 refresh 必须写回透明）",
+		_w().flash_power <= 0.0 and main.hud.flash_rect.color.a <= 0.001,
+		"flash_power=%.3f alpha=%.3f" % [_w().flash_power, main.hud.flash_rect.color.a])
 
 	# 交互：火盆
 	var bw := _w()

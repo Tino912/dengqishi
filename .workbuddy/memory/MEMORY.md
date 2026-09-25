@@ -31,12 +31,20 @@
    6 处故意改坏、对应 9 条断言真的在盯着实现。
 
 ## 一键验证脚本（tools/）
-- `tools/godot-lightknight.sh` — Godot 版完整自检（**214/214 断言**，rc=0，
-  连跑两遍 `shots/report.json` **逐字节相同**）
+- `tools/godot-lightknight.sh` — Godot 版完整自检（**222/222 断言**，rc=0，
+  连跑两遍 `shots/report.json` **逐字节相同**，基线 md5 `a31fb02ce9e331a52456d5df8a630d46`）
+- `tools/godot-mutate.py` — **变异测试**（故意改坏实现，确认只有对应断言变红）。
+  备份在 `~/.cache/dq-mutate/src.bak`；`--list` / 名字过滤 / `--restore-only`。
+  ⚠️ 它**刻意不用 `shutil.rmtree`**（沙箱批量删除保护会拦，导致"还原失败、改坏的源码留在盘上"），
+  改用 `copytree(..., dirs_exist_ok=True)` 覆盖式还原。
 - `tools/godot-probe25d.sh` / `godot-probe.sh` — 迁移前的遮挡体探针
 - `tools/browser-verify.sh` + `make-verify.py` / `make-regress.py` / `make-hunt.py` — Web 版浏览器验证
 
 ## 本机环境坑（会反复遇到）
+- **沙箱有「批量删除保护」**：一次删 >50 个文件会被拦
+  （`[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`），**连 Python 的 `shutil.rmtree` 也拦**。
+  脚本里"备份→改→rmtree 还原"会在还原那步崩掉，**把改坏的文件留在盘上**。
+  → 还原/同步一律**覆盖式复制**（`shutil.copytree(dirs_exist_ok=True)` / `cp -a bak/. live/`），只写不删。
 - 沙箱预置了 `HTTP_PROXY/HTTPS_PROXY` → **本地回环会 502**，命令前必须 unset。
 - **`/tmp` 是 10MB tmpfs**。`TMPDIR` / `--user-data-dir` / 截图输出一律放 `~/.cache/` 下，
   否则进程写满就崩（症状是「同样命令时好时坏」，极难排查）。
@@ -143,18 +151,25 @@
   全被跟踪，是噪音与冲突的主要来源。已加 `.gitignore` 并把这三类**移出跟踪**
   （`git rm -r --cached`，磁盘文件未删）。`shots/` 与 `dist/` **保持跟踪**（是给人看的产物）。
 - 提交历史：`7b95646`（基线）→ `c5e8ed2`（宝箱/背包/守灯人那轮）→ `64886d7`（清理 + .gitignore）。
-- ⚠️ **已知回归**：曾有一个 fork PR（`maxlen727/LightKnight-rev@fix/godot-fx-residual`，
-  提交 `55cb837`，原合并提交 `1a9f2a8`）修了三个真 bug，但被强推退掉了，**当前 master 上没有**：
-  ① `flash_rect` 在 `flash_power` 归零后没写回透明（换关卡/重生后红闪残留）；
-  ② `flash_power` 衰减仍在 `world.step()` 里 → 对白/菜单/三选一**冻结世界时红闪卡在结算画面**；
-  ③ `EMBLEMS` 键名与 `content.gd` 的 BOONS id 对不上 → **4 张恩赐卡徽记静默回退默认图**。
-  要拿回：`git fetch origin refs/pull/1/head && git cherry-pick 55cb837`（GitHub 永久保留该 ref）。
+- ✅ **那三个 bug 我们已自己重新实现**（2026-09-25，不是 cherry-pick；PR 的 diff 套不上，
+  因为宝箱那轮改过同样的 4 个文件）。原 PR = fork `maxlen727/LightKnight-rev@fix/godot-fx-residual`，
+  提交 `55cb837`，原合并提交 `1a9f2a8`（已被强推掉，但 GitHub 永久保留 `refs/pull/1/head`，
+  `git fetch origin refs/pull/1/head` 可取回对照）。三条修复落点：
+  ① `hud.refresh()` 的 `else` 分支把 `flash_rect.color` 写回透明；
+  ② 闪光衰减抽成 `World.tick_fx(dt)` 由 `main.advance()` **无条件**调用
+     （**同时必须从 `step()` 里删掉**，否则双重衰减）；
+  ③ `Hud.EMBLEMS` 按 `content.gd` 的 `WEAPONS`/`BOONS`/`WEAPON_AFFIXES` 重写。
+  → 另注：这三条修复**顺手清掉了一个像素采样的污染源**，遮挡断言的余量大幅变好，
+  详见 daily log 与 skill `godot-headless-verify` 8.9。
 
 ## 已知待办（未做）
 - Godot 版只有**两关**；设计稿的第三关（盲女被吃→化为力量）未做。
 - ~~Godot 版无商店~~ → **已有守灯人商店**（买灯油/重铸/锤炼）；但仍**无升级/存档/传送**，
   局内成长 = 三选一 + 宝箱 + 词条。无手柄触屏。
-- 上面「已知回归」那三条（红闪残留、红闪卡结算、恩赐徽记）尚未自行修回。
+- ~~上面「已知回归」那三条（红闪残留、红闪卡结算、恩赐徽记）尚未自行修回~~
+  → **2026-09-25 已自行修回**（见「仓库 / 版本控制」节），并各补了回归断言。
+- **像素采样要注意没被"关后处理"开关覆盖的叠加层**：`set_post_enabled(false)` 只关暗角，
+  **管不到全屏 `flash_rect`**。残留闪光会给每个采样点加常数、压平比值型断言。
 - 敌人弹道只做了 leech；`spitter` 手感未与 Web 逐帧比对。
 - **Web 版 `render.ts` 的 `applyLighting` 用 `createRadialGradient` 画屏幕正圆**，
   在 2.5D 地面上是椭圆 → 南北多照 60%。**与换引擎无关，可独立先修**（竖向压 YSQUASH）。

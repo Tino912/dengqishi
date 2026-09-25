@@ -809,6 +809,17 @@ func damage_mul() -> float:
 
 # ---------------------------------------------------------------- 主步进
 
+## 只推进**纯表现层**（目前只有全屏闪光）。
+##
+## 对白 / 菜单（结算）/ 三选一 / 商店期间世界被冻结（main 在那些 state 下不调 step()），
+## 但闪光是给玩家的视觉反馈，不该跟着一起冻住 —— 否则死亡瞬间那一下红闪
+## 会一直糊在结算画面上，直到重生才消失。
+##
+## 这条衰减**不消耗任何 RNG**，在冻结期间调用不会挪动随机流，所以自检的确定性不受影响。
+func tick_fx(dt: float) -> void:
+	flash_power = maxf(0.0, flash_power - dt * 2.4)
+
+
 ## 固定步长推进。游戏内与自检都走这一条路径。
 func step(dt_raw: float) -> void:
 	if hitstop > 0.0:
@@ -835,7 +846,7 @@ func step(dt_raw: float) -> void:
 	if shake > 0.0:
 		draw_cam += Vector2(_rng.randf_range(-shake, shake), _rng.randf_range(-shake, shake))
 	shake = maxf(0.0, shake - dt * 40.0)
-	flash_power = maxf(0.0, flash_power - dt * 2.4)
+	# 闪光的衰减**不在这里** —— 见 tick_fx()：它必须在世界被冻结时也照常推进。
 
 	if light_rig != null:
 		light_rig.sync(self)

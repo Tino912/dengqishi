@@ -187,6 +187,11 @@ func advance(dt: float) -> void:
 			_shop_input(dt)
 
 	if world != null:
+		# 表现层不跟着"世界是否冻结"走：对白 / 结算 / 三选一 / 商店期间上面的
+		# match 分支不会调 world.step()，但全屏闪光必须照常淡出 ——
+		# 否则死亡瞬间的红闪会一直糊在结算画面上，直到重生才消失。
+		# tick_fx 不消耗 RNG，在这里调用不影响自检的确定性。
+		world.tick_fx(dt)
 		_drain_events()
 		hud.refresh(world)
 	hud.tick(dt)

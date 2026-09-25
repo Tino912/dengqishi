@@ -607,9 +607,14 @@ func refresh(world: World) -> void:
 	else:
 		boss_box.visible = false
 
+	# flash_power 归零后必须把颜色**写回透明**：HUD 是常驻节点，而 flash_power 属于
+	# World 实例 —— 换关卡 / 重生后新世界从 0 开始，上面那个「>0 才写」的分支
+	# 永远不会再走，上一关死亡时的红闪就会一直留在新关卡的画面上。
 	if world.flash_power > 0.0:
 		var fc := world.flash_color
 		flash_rect.color = Color(fc.r, fc.g, fc.b, minf(0.42, world.flash_power))
+	else:
+		flash_rect.color = Color(0, 0, 0, 0)
 
 	# 暗角随亮度收放：越亮越"开"，越黑越"收"
 	var vig := clampf(0.72 - world.brightness01() * 0.42, 0.16, 0.9)
@@ -837,16 +842,26 @@ func tick(dt: float) -> void:
 const CARD_WEAPON := Color("#8fd0ff")
 const CARD_BOON := Color("#ffd27a")
 
-## 每把武器/每种恩赐配一枚徽记（用下载来的粒子素材当"图形"，
-## 比画一排方块好看，而且一眼能区分）
+## 每把武器 / 每种恩赐 / 每条款词配一枚徽记（用下载来的粒子素材当"图形"，
+## 比画一排方块好看，而且一眼能区分）。
+##
+## ⚠️ 这张表有两处**静默**出错的方式，自检里各有一条断言盯着：
+##   · 键与 content.gd 的 WEAPONS / BOONS / WEAPON_AFFIXES id 对不上 → 回退默认 star_06
+##   · 值写了一个不存在的贴图名 → Art.tex() 返回 null，徽记直接隐形（比回退更糟）
+## 历史坑：这份映射原先还是**老版本恩赐 id**（bright/fuel/kindle/greed/heavy/dr/…），
+## 与 content.gd 现在的 id 完全对不上，于是 10 张恩赐卡全长得一样。
 const EMBLEMS := {
+	# 武器
 	"blade": "slash_03", "twin": "slash_01", "spear": "trace_04", "chain": "spark_04",
 	"hammer": "circle_03", "scythe": "slash_02", "crossbow": "muzzle_01", "staff": "magic_05",
-	"edge": "star_06", "bright": "light_02", "swift": "trace_01", "fuel": "magic_01",
-	"kindle": "star_03", "vamp": "smoke_05", "thorn": "spark_01", "ward": "twirl_01",
-	"greed": "star_09", "heavy": "scorch_02", "reach": "trace_04", "crit": "star_09",
-	"combo": "light_03", "killboom": "fire_01", "drain": "smoke_08", "dr": "circle_03",
-	"swift2": "trace_01", "shield": "twirl_01", "grow": "magic_03", "thorns": "spark_01",
+	# 恩赐
+	"hp": "star_06", "dmg": "spark_01", "haste": "trace_01", "light": "light_02",
+	"reach": "light_03", "vamp": "smoke_05", "combo_up": "flame_03", "combo_add": "light_01",
+	"dash": "smoke_02", "skill_cd": "magic_03", "cost_cut": "magic_01", "crit": "star_09",
+	"bounty": "star_03", "killboom": "fire_01",
+	# 武器词条（reach / crit / vamp 与恩赐同名，复用上面那三条）
+	"edge": "spark_07", "swift": "smoke_08", "shine": "flame_05",
+	"ember": "flame_01", "frugal": "scorch_02",
 }
 
 
