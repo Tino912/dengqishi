@@ -34,6 +34,18 @@ var prog := {
 
 var dev_spawn := false
 
+## 这一局的布局种子：宝箱点位、敌人波次锚点、Boss 场地都由它派生。
+## **每开一局换一次**（点开始游戏时重新生成），同一局内死亡重生 / 重开这一趟沿用 ——
+## 所以"重开一趟"时地图还是刚才那张，玩家记住的宝箱位置不会当场失效。
+## 自检会把它覆写成固定值，用来保证 report.json 逐字节可复现。
+var run_seed := 0
+
+## 自检沙盒：停掉「波次 → Boss」链条（详见 World.waves_disabled）。
+## 波次锚点现在是每局随机的，它可能落进测试段落的活动范围，
+## 于是那一波会在不该出现的时候刷出来、又被判"清空"弹出三选一，把世界冻住。
+## 正常游戏恒为 false；自检默认 true，只在专门验波次的那一段放开。
+var waves_off := false
+
 var _acc := 0.0
 var _dlg_lines := []
 var _dlg_i := 0
@@ -121,6 +133,23 @@ func show_title() -> void:
 	)
 
 
+## 开新的一局：**换一张地图**（宝箱与敌人的位置重新生成）。
+## 死亡重生 / `restart_level()` **不换** —— 重开这一趟时地图还是刚才那张；
+## 想换地图就回标题（Esc）再按一次开始。
+func new_run() -> void:
+	run_seed = _make_run_seed()
+	start_level()
+
+
+## 这一局的布局种子：时间 + 单调计数混合，保证每次开局都不一样。
+## 注意它**不参与"逐字节可复现"** —— 那是由自检注入固定 run_seed 实现的，
+## 不是靠这里的随机。所以这里可以放心用真随机。
+func _make_run_seed() -> int:
+	var ms := int(Time.get_unix_time_from_system() * 1000.0)
+	var us := Time.get_ticks_usec()
+	return absi(hash([ms, us, randi()]))
+
+
 func start_level() -> void:
 	_free_world()
 	world = World.new()
@@ -128,7 +157,10 @@ func start_level() -> void:
 	world.prog = prog
 	add_child(world)
 	move_child(world, 0)
-	world.setup(dev_spawn, int(prog["level"]))
+	# 兜底：没走过"开始游戏"那一步（比如 --dev-spawn 直接开）时也得有个非 0 的局种子
+	if run_seed == 0:
+		run_seed = _make_run_seed()
+	world.setup(dev_spawn, int(prog["level"]), run_seed, waves_off)
 	state = "play"
 	_menu_kind = ""
 	_clear_pending = false
@@ -167,7 +199,8 @@ func advance(dt: float) -> void:
 		"title":
 			if GameInput.just("confirm") or GameInput.just("attack"):
 				Sound.play("ui_big")
-				start_level()
+				# 从标题开局 = 新的一局 → 重新摇一张地图（宝箱与敌人换位置）
+				new_run()
 		"play":
 			if GameInput.just("pause"):
 				_menu_kind = "pause"
@@ -624,6 +657,12 @@ func debug_state() -> Dictionary:
 		d["boss_warded"] = world.boss_warded()
 		d["skill_count"] = world.player.skills().size()
 		d["respawn_count"] = world.respawn_count
+		# 布局随机化：这一局实际生成的点位（排查"这箱子怎么在这儿"时看它）
+		d["run_seed"] = run_seed
+		d["chest_spots"] = world.layout_info.get("chests", [])
+		d["wave_spots"] = world.layout_info.get("waves", [])
+		d["boss_spot"] = world.layout_info.get("boss", [])
+		d["layout_fallbacks"] = int(world.layout_info.get("fallbacks", 0))
 		d["has_girl"] = world.girl != null
 		d["girl_near"] = world.girl_near
 		# 背包 / 词条 / 宝箱

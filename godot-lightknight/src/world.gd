@@ -99,18 +99,47 @@ var _decor_rng: RandomNumberGenerator
 ## `_rng` 是主仿真流，动它会把之后所有的世界演化都挪掉（见 README 的"步数就是货币"）。
 var _shop_rng: RandomNumberGenerator
 var _chest_rng: RandomNumberGenerator
+## 布局随机源：宝箱点位 / 敌人波次锚点 / Boss 场地。
+## 种子来自 `Main.run_seed`（**每开一局换一次**，同一局内死亡重开沿用），
+## 与关卡的 `seed` 完全无关 —— 所以换一局就是一张新地图，
+## 而重开这一趟时地图还是刚才那张（玩家记住的宝箱位置不会当场失效）。
+## 和上面四份一样是独立流：**布局随机绝不能碰 `_rng`**，
+## 否则"玩家第几步走到某处"会反过来改变世界演化。
+var _layout_rng: RandomNumberGenerator
+var run_seed := 0
+## Boss 的**运行时**锚点。`level["boss"]` 是 const 字典（只读，不能就地改），
+## 所以真实坐标放这里；关卡表里那份只当兜底与文案来源。
+var boss_anchor := Vector2.ZERO
+## 这一局实际生成的布局快照（宝箱点位 / 波次锚点 / 兜底次数），写进报告备查
+var layout_info := {}
+## 自检沙盒：把「波次 → Boss」这条链条整体停掉。
+##
+## 为什么需要它：波次锚点现在是**每局随机**的，它可能落在自检早期段落的活动范围里，
+## 于是那一波会在**不该出现的时候**刷出来；而一旦它的成员被别的段落顺手清掉，
+## `_update_waves` 会判"这一波清空了"→ **弹出三选一**→ `state = "draft"` → 世界被冻住。
+## 症状极其难反查：表现是几百行之后某条**看似无关**的断言失败
+## （本轮实测：`_tap("attack")` 的两步正好被面板吃掉，于是"灯弩射出光矢"红，
+## 连带"八把武器产出 ≥7 种特效"也红）。
+##
+## 正常游戏恒为 false。自检默认 true，只在真正要验波次的两段临时放开。
+var waves_disabled := false
 
 
-func setup(dev := false, lv_index := -1) -> void:
+func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> void:
 	dev_spawn_all = dev
+	waves_disabled = waves_off
 	if lv_index >= 0:
 		level_index = lv_index
 	level = Content.level_at(level_index)
+	run_seed = seed_v
 	_rng = Proj.make_rng(int(level["seed"]))
 	_decor_rng = Proj.make_rng(int(level["seed"]) + 991)
 	# 商店/宝箱的随机源：和 _rng、_decor_rng 都分开，互不干扰（各自确定）
 	_shop_rng = Proj.make_rng(int(level["seed"]) + 6060)
 	_chest_rng = Proj.make_rng(int(level["seed"]) + 5150)
+	# 布局随机源：只认 run_seed。用 hash 把 (局种子, 关卡号) 打散，
+	# 免得相邻两局的种子只差 1、生成出来的点位也连成一片。
+	_layout_rng = Proj.make_rng(hash([run_seed, level_index, "layout"]))
 	ambient = float(level["ambient"])
 
 	if not prog.has("boons"):
@@ -144,7 +173,10 @@ func setup(dev := false, lv_index := -1) -> void:
 	#   ① props 里每一项都要 `_decor_rng.randi_range` 抽 seed —— 提前加会挪动装饰的随机流；
 	#   ② `_decorate()` 会躲开已有道具 120px —— 提前加会改变"哪里能放装饰"的判定。
 	# 两条都会让整关装饰换位置，把依赖装饰的像素断言全撞掉。
-	for cp in level.get("chests", []):
+	# 点位**随机生成**（不再写死在关卡表里）：_layout_rng 在全图撒点 + 合法性检查。
+	# 关卡表 `chests` 里那份坐标只在随机生成彻底失败时兜底 —— 数量必须永远对得上。
+	var chest_spots := _roll_chest_spots(level.get("chests", []))
+	for cp in chest_spots:
 		var chest := {
 			"kind": "chest", "x": float(cp.x), "y": float(cp.y),
 			"r": float(Content.PROP_TABLE["chest"]["r"]),
@@ -154,6 +186,11 @@ func setup(dev := false, lv_index := -1) -> void:
 		}
 		props.append(chest)
 		chests.append(chest)
+	# 快照转成 JSON 友好形式（要进 report）
+	var chest_flat := []
+	for cp in chest_spots:
+		chest_flat.append([snappedf(cp.x, 0.1), snappedf(cp.y, 0.1)])
+	layout_info["chests"] = chest_flat
 
 	for pr in props:
 		match str(pr["kind"]):
@@ -169,8 +206,20 @@ func setup(dev := false, lv_index := -1) -> void:
 
 	braziers_required = int(level.get("braziers_required", 0))
 
+	# 敌人锚点（每波中心 + Boss 场地）**随机生成**，不再写死在关卡表里。
+	# 顺序要求：必须在 walls / props / _decorate() 都就位之后 ——
+	# 合法性检查要问 blocked()（墙）和已有 props（避让），早一步都问不出东西。
+	var anchors := _roll_anchors()
+	boss_anchor = anchors["boss"]
+	var wave_flat := []
+	for a in anchors["waves"]:
+		wave_flat.append([snappedf(a.x, 0.1), snappedf(a.y, 0.1)])
+	layout_info["waves"] = wave_flat
+	layout_info["boss"] = [snappedf(boss_anchor.x, 0.1), snappedf(boss_anchor.y, 0.1)]
+	layout_info["fallbacks"] = int(anchors["fallbacks"])
+
 	# 肉鸽：波次组成每次跑都不一样（用关卡种子派生，仍然确定）
-	var rolled := _roll_waves()
+	var rolled := _roll_waves(anchors["waves"])
 
 	for wd in rolled:
 		waves.append({"def": wd, "spawned": false, "cleared": false, "members": []})
@@ -324,10 +373,154 @@ const WAVE_SWAP := {
 	"leech": ["leech", "moth"],
 }
 
-func _roll_waves() -> Array:
+# ---------------------------------------------------------------- 布局随机化
+#
+# 宝箱点位与敌人锚点**每局重新生成**：在全图撒点 + 合法性检查，
+# 全部走 `_layout_rng`（种子 = `Main.run_seed`，与关卡的 `seed` 无关）。
+#
+# 三条硬约束，缺一条都会出很难查的问题：
+#  ① **绝不能用 `_rng`**。它是主仿真流，"玩家第几步走到哪儿"决定了它被消耗多少，
+#     往里面插随机数会让之后所有世界演化整体错位（"步数就是货币"）。
+#  ② 点位必须**真的可站**：不撞墙。否则敌人卡在墙里出不来、宝箱贴墙摸不到。
+#  ③ 生成失败必须**兜底到关卡表里的那份坐标**。数量一个都不能少 ——
+#     少一个宝箱或一波怪，会连带撞掉一大片跟数量有关的断言。
+
+## 宝箱点位：撒出与 `fallback` 同样多的点。`fallback` 是关卡表里写的那份坐标，
+## 只在撒不出来时兜底（保证数量永远对得上）。
+func _roll_chest_spots(fallback: Array) -> Array:
+	var out := []
+	var lw := float(level["w"])
+	var lh := float(level["h"])
+	var start: Vector2 = level["start"]
+	var goal: Vector2 = level["goal"]["pos"]
+	var guard := 0
+	while out.size() < fallback.size() and guard < 600:
+		guard += 1
+		var x := _layout_rng.randf_range(130.0, lw - 130.0)
+		var y := _layout_rng.randf_range(130.0, lh - 130.0)
+		# 箱体自己也占地方，得放得下
+		if blocked(x, y, 26.0):
+			continue
+		# 别贴出生点：否则一开局就白送一把武器
+		if Proj.dist(x, y, start.x, start.y) < 240.0:
+			continue
+		# 别压在灯塔脚下（那里是终点，视觉上要干净）
+		if Proj.dist(x, y, goal.x, goal.y) < 200.0:
+			continue
+		var ok := true
+		for pr in props:
+			# 离已有道具够远：既避免视觉重叠，也避免抢走交互提示（半径 78）。
+			# `_decorate()` 已经跑过，所以这里连装饰一起避开了。
+			if Proj.dist(x, y, float(pr["x"]), float(pr["y"])) < 96.0 + float(pr.get("r", 18.0)):
+				ok = false
+				break
+		if ok:
+			for o in out:
+				if Proj.dist(x, y, o.x, o.y) < 320.0:
+					ok = false
+					break
+		if ok:
+			out.append(Vector2(x, y))
+	# 兜底：撒不出来就用关卡表那份。**数量必须对得上**，少一个都不行。
+	var fi := 0
+	while out.size() < fallback.size() and fi < fallback.size():
+		out.append(fallback[fi])
+		fi += 1
+	return out
+
+
+## 敌人锚点：Boss 场地一个 + 每一波一个。
+func _roll_anchors() -> Dictionary:
+	var lw := float(level["w"])
+	var lh := float(level["h"])
+	var start: Vector2 = level["start"]
+	var goal: Vector2 = level["goal"]["pos"]
+	var bd: Dictionary = level["boss"]
+	var falls := 0
+
+	# ── Boss 场地 ──
+	# 净空要得大（120）：它是贴身近战 + 冲锋 + 扫射/虹吸，场地太挤会变成"卡在墙角挨打"。
+	# 同时对灯塔留 260 的余地，免得在终点灯下开打。
+	var boss := Vector2.ZERO
+	var got_boss := false
+	var gb := 0
+	while not got_boss and gb < 1200:
+		gb += 1
+		var x := _layout_rng.randf_range(220.0, lw - 220.0)
+		var y := _layout_rng.randf_range(220.0, lh - 220.0)
+		if blocked(x, y, 120.0):
+			continue
+		if Proj.dist(x, y, start.x, start.y) < 480.0:
+			continue
+		if Proj.dist(x, y, goal.x, goal.y) < 260.0:
+			continue
+		# 场地要从出生点**直着走得到** —— 被墙围死的角落会让 Boss 永远打不到
+		if not has_los(start.x, start.y, x, y, 26.0):
+			continue
+		boss = Vector2(x, y)
+		got_boss = true
+	if not got_boss:
+		boss = Vector2(float(bd["x"]), float(bd["y"]))
+		falls += 1
+
+	# ── 每波锚点 ──
+	# 互相拉开 ≥460（不然两波的怪叠在一起，清一波顺手把另一波也清了）、
+	# 离出生点 ≥360、离 Boss 场地 ≥380（两场战斗分开），
+	# 而且**从出生点、从已经定下来的每一波，都要能直着走过去** ——
+	# 波次是链条（清完这波才去下波），中间被一道墙断开就会永远卡住。
+	var anchors := []
+	for i in level["waves"].size():
+		var wd: Dictionary = level["waves"][i]
+		var fb := Vector2(float(wd["x"]), float(wd["y"]))
+		var spot := Vector2.ZERO
+		var got := false
+		var gw := 0
+		while not got and gw < 1200:
+			gw += 1
+			var x := _layout_rng.randf_range(200.0, lw - 200.0)
+			var y := _layout_rng.randf_range(200.0, lh - 200.0)
+			# 中心附近要留一块空地给这一波落脚 —— 敌人半径最大 ~22，
+			# 74 的净空保证"这一圈里能站下几只"，不会全被推到墙缝里
+			if blocked(x, y, 74.0):
+				continue
+			if Proj.dist(x, y, start.x, start.y) < 360.0:
+				continue
+			if Proj.dist(x, y, boss.x, boss.y) < 380.0:
+				continue
+			# ── 与"参照点"的关系（第一波看出生点，之后看上一波）──
+			# 距离**上下都要卡**：
+			#   太近 → 清一波顺手把下一波也清了，波次失去节奏；
+			#   太远 → 链条被拉断，玩家（和自检里的机器人）要横穿半张地图才能接上，
+			#          实测会把机器人拖到时间用尽，只清得掉前两波。
+			# 再加上"直着走得到"，保证这一波真的接得上。
+			var ref := start
+			if not anchors.is_empty():
+				ref = anchors[anchors.size() - 1]
+			var rd := Proj.dist(ref.x, ref.y, x, y)
+			if rd < 460.0 or rd > 900.0:
+				continue
+			if not has_los(ref.x, ref.y, x, y, 24.0):
+				continue
+			var ok := true
+			for a in anchors:
+				if Proj.dist(x, y, a.x, a.y) < 460.0:
+					ok = false
+					break
+			if ok:
+				spot = Vector2(x, y)
+				got = true
+		if not got:
+			spot = fb
+			falls += 1
+		anchors.append(spot)
+	return {"boss": boss, "waves": anchors, "fallbacks": falls}
+
+
+func _roll_waves(anchors: Array) -> Array:
 	var rng := Proj.make_rng(int(level["seed"]) + 7331)
 	var out := []
-	for wd in level["waves"]:
+	for i in level["waves"].size():
+		var wd: Dictionary = level["waves"][i]
 		var groups := []
 		for grp in wd["enemies"]:
 			var tid := str(grp["type"])
@@ -349,7 +542,9 @@ func _roll_waves() -> Array:
 		if rng.randf() < 0.35:
 			groups.append({"type": "moth", "count": rng.randi_range(2, 3), "elite": false})
 		out.append({
-			"label": str(wd["label"]), "x": float(wd["x"]), "y": float(wd["y"]),
+			"label": str(wd["label"]),
+			# 坐标取自**随机锚点**（`_roll_anchors()`），不再用关卡表里写死的那个
+			"x": float(anchors[i].x), "y": float(anchors[i].y),
 			"radius": float(wd["radius"]), "enemies": groups,
 		})
 	return out
@@ -762,6 +957,24 @@ func blocked(x: float, y: float, r: float) -> bool:
 		if Proj.circle_rect(x, y, r, w[0], w[1], w[2], w[3]):
 			return true
 	return false
+
+
+## 两点之间有没有**直线通路**（沿线采样，把墙按 thick 加粗来看）。
+##
+## 为什么需要：随机撒点最容易生成"看着在空地上、其实被墙围死"的位置。
+## 波次锚点落在那种地方，或者敌人被撒到墙的另一侧，玩家就走不过去
+## —— 这一波永远清不掉、关卡直接卡死。而这类布局**跑起来完全不报错**，
+## 只有真的走一遍（自检里的机器人试玩）才暴露得出来。
+##
+## 采样步长 24 足够稳：最窄的墙也有 60 厚，不会从采样缝里漏过去。
+func has_los(x0: float, y0: float, x1: float, y1: float, thick := 20.0) -> bool:
+	var d := Proj.dist(x0, y0, x1, y1)
+	var n := maxi(2, int(d / 24.0))
+	for i in n + 1:
+		var t := float(i) / float(n)
+		if blocked(lerpf(x0, x1, t), lerpf(y0, y1, t), thick):
+			return false
+	return true
 
 
 func collide_wall(pos: Vector2, r: float) -> Vector2:
@@ -2262,7 +2475,20 @@ func boss_warded() -> bool:
 
 func _update_waves(dt: float) -> void:
 	respawn_timer -= dt
+	# 「火盆没点满时死掉的怪会再生」不属于"波次链"，它由第二关自己的规则驱动
+	# （谁死了谁排队再生），所以**不跟着 waves_disabled 一起停** ——
+	# 第二关自检要用它，而那时波次链是关着的。
 	_update_respawns(dt)
+
+	# 停链：不刷波次、不判「清空 → 弹三选一」、不进 Boss 区判定。
+	#
+	# 关键：**判断放在这里（运行时每步都读），而不是在 setup 里把波次标记成
+	# "已刷已清"**。原因有两条：
+	#   ① 自检需要在同一个世界里**临时**放开（某一段要验三选一，别的段不要），
+	#      提前标记就没法中途打开；
+	#   ② 只挡"刷新"那一处不够 —— 老的 spawned 状态照样会走到清空分支去弹面板。
+	if waves_disabled:
+		return
 
 	if dev_spawn_all and not dev_spawned:
 		dev_spawned = true
@@ -2298,6 +2524,7 @@ func _update_waves(dt: float) -> void:
 						events.append({"type": "draft"})
 
 	# Boss：其它波次全清后再进入区域才触发
+	# （`waves_disabled` 时整条链在本函数开头就 return 了，到不了这里）
 	if not boss_spawned and not boss_dead:
 		var all_clear := true
 		for w in waves:
@@ -2305,11 +2532,14 @@ func _update_waves(dt: float) -> void:
 				all_clear = false
 				break
 		var bd: Dictionary = level["boss"]
-		var in_boss := Proj.dist(player.x, player.y, float(bd["x"]), float(bd["y"])) < float(bd["radius"])
-		var near_boss := Proj.dist(player.x, player.y, float(bd["x"]), float(bd["y"])) < float(bd["radius"]) + 320.0
+		# 坐标用**运行时锚点**（boss_anchor，每局随机生成），
+		# 关卡表里那个只当兜底；radius 仍是"这块场地的势力范围"，大小不变。
+		var ba := boss_anchor
+		var in_boss := Proj.dist(player.x, player.y, ba.x, ba.y) < float(bd["radius"])
+		var near_boss := Proj.dist(player.x, player.y, ba.x, ba.y) < float(bd["radius"]) + 320.0
 		if (dev_spawn_all or in_boss or (all_clear and near_boss)) and (all_clear or dev_spawn_all):
 			boss_spawned = true
-			var pt := find_spawn_point(float(bd["x"]), float(bd["y"]), 80.0, 40.0)
+			var pt := find_spawn_point(ba.x, ba.y, 80.0, 40.0)
 			boss_enemy = spawn_enemy(str(bd["type"]), pt.x, pt.y, false)
 			events.append({"type": "boss_start", "name": str(bd["label"])})
 			events.append({"type": "dialogue", "key": str(level.get("boss_dialogue", "l1_boss_pre"))})
@@ -2367,6 +2597,22 @@ func _update_respawns(dt: float) -> void:
 	respawn_queue = keep
 
 
+## 在锚点周围找一个**从锚点直线走得到**的落脚点。不消耗任何 RNG。
+## 按固定角度扫一圈（36 方向 × 6 档距离），找到第一个"不撞墙且与锚点连通"的点。
+func _reachable_spot(cx: float, cy: float, radius: float, r: float) -> Vector2:
+	for k1 in 36:
+		var a := float(k1) * (TAU / 36.0)
+		for k2 in 6:
+			var d := radius * float(k2 + 1) / 6.0
+			var x := cx + cos(a) * d
+			var y := cy + sin(a) * d
+			if blocked(x, y, r + 4.0):
+				continue
+			if has_los(cx, cy, x, y, r + 6.0):
+				return Vector2(x, y)
+	return Vector2(cx, cy)
+
+
 func _spawn_wave_members(w: Dictionary, fx: bool) -> void:
 	var wd: Dictionary = w["def"]
 	for grp in wd["enemies"]:
@@ -2375,6 +2621,11 @@ func _spawn_wave_members(w: Dictionary, fx: bool) -> void:
 			var def: Dictionary = Content.ENEMIES.get(tid, {})
 			var rr := float(def.get("r", 18.0))
 			var pt := find_spawn_point(float(wd["x"]), float(wd["y"]), float(wd["radius"]), rr)
+			# 撒点可能落到墙的另一侧：玩家走不过去 → 这一波永远清不掉 → 关卡卡死。
+			# 用**不消耗 RNG** 的环形搜索兜一格。**不能**改调 `find_spawn_point` 重试
+			# —— 它吃 `_rng`（主仿真流），重试会挪动整条随机流，把后面全带偏。
+			if not has_los(float(wd["x"]), float(wd["y"]), pt.x, pt.y, rr + 6.0):
+				pt = _reachable_spot(float(wd["x"]), float(wd["y"]), float(wd["radius"]), rr)
 			var e := spawn_enemy(tid, pt.x, pt.y, bool(grp.get("elite", false)))
 			if e != null:
 				w["members"].append(e.id)

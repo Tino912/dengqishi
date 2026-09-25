@@ -369,7 +369,13 @@ const LEVEL1 := {
 	# 宝箱：**故意不写进 props**。props 里每一项都会消耗 _decor_rng 抽一个 seed，
 	# 往里加东西会整体挪动装饰的随机流 → 所有装饰的位置都会变 → 依赖装饰的像素断言全崩。
 	# 单独一个 key，用独立的 rng、并且等 _decorate() 跑完再入 props。
+	#
+	# ⚠️ 这里只管**数量**与**兜底坐标**：真实点位每局由 `World._roll_chest_spots()`
+	# 按 `Main.run_seed` 随机生成；只有撒点失败时才回落到下面这两个点
+	# （数量必须永远对得上 —— 少一个宝箱会连带撞掉一片断言）。
 	"chests": [Vector2(700.0, 1450.0), Vector2(2150.0, 1150.0)],
+	# 波次：`x/y` 是**兜底锚点**（真实锚点每局由 `World._roll_anchors()` 随机生成）；
+	# 触发半径 `radius` 与 `enemies` 的构成仍然由这里说了算。
 	"waves": [
 		{"label": "第一波 · 石灯下的影", "x": 830.0, "y": 830.0, "radius": 300.0,
 		 "enemies": [{"type": "shade", "count": 4}]},
@@ -379,6 +385,8 @@ const LEVEL1 := {
 		 "enemies": [{"type": "shade", "count": 4}, {"type": "guard", "count": 1, "elite": true},
 						 {"type": "leech", "count": 2}]},
 	],
+	# Boss：`x/y` 也是**兜底锚点**，真实场地每局随机生成（存于 `World.boss_anchor`）。
+	# 场上"势力范围"大小仍用这里的 `radius`；`label` / `type` 不受影响。
 	"boss": {"type": "devourer_jr", "x": 2080.0, "y": 420.0, "radius": 320.0, "label": "噬灯者·幼体"},
 }
 
@@ -429,8 +437,9 @@ const LEVEL2 := {
 		{"kind": "statue", "x": 1420.0, "y": 1180.0},
 		{"kind": "statue", "x": 2100.0, "y": 1620.0},
 	],
-	# 宝箱（同上：不入 props，避免挪动 _decor_rng 流）
+	# 宝箱（同上：不入 props，避免挪动 _decor_rng 流；点位每局随机，这里是兜底）
 	"chests": [Vector2(500.0, 1750.0), Vector2(2500.0, 800.0)],
+	# 波次：`x/y` 兜底锚点，真实锚点每局随机生成
 	"waves": [
 		{"label": "第一波 · 再生之影", "x": 900.0, "y": 760.0, "radius": 340.0,
 		 "enemies": [{"type": "shade", "count": 5}, {"type": "guard", "count": 1}]},
@@ -439,6 +448,7 @@ const LEVEL2 := {
 		{"label": "第三波 · 烬卫队长", "x": 2380.0, "y": 560.0, "radius": 320.0,
 		 "enemies": [{"type": "shade", "count": 4}, {"type": "guard", "count": 1, "elite": true}, {"type": "leech", "count": 2}]},
 	],
+	# Boss：`x/y` 兜底锚点（真实场地每局随机，见 World.boss_anchor）
 	"boss": {"type": "devourer", "x": 1240.0, "y": 420.0, "radius": 340.0, "label": "噬灯者"},
 	# ── 第二关专属机制 ──
 	"braziers_required": 3,        # 点满 3 座火盆才能压制再生

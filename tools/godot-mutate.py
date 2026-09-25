@@ -7,7 +7,7 @@
   · 没有连带误伤（别的断言不该无故变红 —— 那说明它们互相耦合，将来会误导人）。
 
 **怎么用**
-    tools/godot-mutate.py              # 跑全部变异，约 4~5 分钟
+    tools/godot-mutate.py              # 跑全部变异（8 个，约 10 分钟）
     tools/godot-mutate.py 闪光          # 只跑名字里含「闪光」的
     tools/godot-mutate.py --list       # 只列出变异清单
     tools/godot-mutate.py --restore-only   # 从备份还原 src（中途崩了用这个）
@@ -98,6 +98,64 @@ MUTATIONS: list[dict] = [
         "edits": [("hud.gd", '"hp": "star_06"', '"hp": "star_6"')],
         "expect": ["徽记引用的贴图全部真实存在"],
         "forbid": ["徽记覆盖全部武器 / 恩赐 / 词条"],
+    },
+    # ── 布局随机化（宝箱 / 波次锚点 / Boss 场地每局重摇）────────────────────────
+    # 这一组专盯"随机化"本身。它有个天然难处：随机化的**失败方式是不报错的** ——
+    # 退回固定坐标、换种子不变、撒到墙里，画面照常能跑，只有断言会红。
+    # 所以这几条必须有牙齿，否则等于没做随机化。
+    {
+        "name": "宝箱退回关卡表里写死的坐标（复现「随机化被静默绕过」）",
+        "edits": [
+            (
+                "world.gd",
+                '	var chest_spots := _roll_chest_spots(level.get("chests", []))',
+                '	var chest_spots: Array = level.get("chests", []).duplicate()',
+            ),
+        ],
+        "expect": ["宝箱点位不是关卡表里写死的那个"],
+    },
+    {
+        "name": "敌人锚点（波次 + Boss）退回关卡表里写死的坐标",
+        "edits": [
+            (
+                "world.gd",
+                'func _roll_anchors() -> Dictionary:\n\tvar lw := float(level["w"])',
+                'func _roll_anchors() -> Dictionary:\n'
+                '\tvar _fixed := []\n'
+                '\tfor _wd in level["waves"]:\n'
+                '\t\t_fixed.append(Vector2(float(_wd["x"]), float(_wd["y"])))\n'
+                '\tvar _bd: Dictionary = level["boss"]\n'
+                '\treturn {"boss": Vector2(float(_bd["x"]), float(_bd["y"])),\n'
+                '\t\t"waves": _fixed, "fallbacks": 0}\n'
+                '\tvar lw := float(level["w"])',
+            ),
+        ],
+        "expect": ["波次锚点不是关卡表里写死的那个", "Boss 场地也不是写死那个坐标"],
+    },
+    {
+        "name": "布局随机源不再吃 run_seed（复现「换种子地图不变」）",
+        "edits": [
+            (
+                "world.gd",
+                '_layout_rng = Proj.make_rng(hash([run_seed, level_index, "layout"]))',
+                "_layout_rng = Proj.make_rng(0)",
+            ),
+        ],
+        "expect": ["★ 换一个局种子 → 宝箱与敌人的位置整套换了"],
+        # 同种子可复现是**必须保住**的：改坏的只是"换种子会变"，不是"确定性"。
+        # 这条 forbid 就是在确认随机化的修法没有连坐把确定性自检的地基砸掉。
+        "forbid": ["★ 同一个局种子重建世界 → 点位逐点相同"],
+    },
+    {
+        "name": "波次锚点不再校验「从上一波直着走得到」（复现「清不掉的一波」）",
+        "edits": [
+            (
+                "world.gd",
+                "\t\t\tif not has_los(ref.x, ref.y, x, y, 24.0):\n\t\t\t\tcontinue\n",
+                "",
+            ),
+        ],
+        "expect": ["★ 波次锚点从出生点起链式可达"],
     },
 ]
 

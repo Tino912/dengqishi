@@ -16,6 +16,14 @@ const STEP := 1.0 / 60.0
 ## 第一关里选来测遮挡的那面墙（x, y, w, d, h）
 const TEST_WALL := [520.0, 300.0, 140.0, 400.0, 54.0]
 
+## 布局种子（宝箱点位 / 敌人锚点 / Boss 场地都由它派生）。
+##
+## **自检必须注入固定值**：正常游戏里这个种子是 Main 开局时随机摇的，
+## 那样每跑一次宝箱和敌人的位置都不一样，`shots/report.json` 不可能逐字节相同，
+## "确定性"这条底线就没了。所以这里注入一个常数，
+## 再在 `_section_layout()` 里显式验两件事：**换种子位置真的会变、同种子位置不变**。
+const LAYOUT_SEED := 20260925
+
 var sub: SubViewport
 var main: Main
 var report := {"cases": {}, "checks": {}, "samples": {}, "errors": []}
@@ -44,6 +52,12 @@ func _ready() -> void:
 	main = Main.new()
 	main.manual = true
 	main.skip_dialogue = true
+	# 布局种子注入固定值 —— 必须在任何 start_level() 之前
+	main.run_seed = LAYOUT_SEED
+	# 默认停掉「波次 → Boss」链条：锚点是随机的，若落进某段的活动范围，
+	# 那一波会意外刷出、又被判"清空"弹出三选一，把正在测的世界冻住。
+	# 只有 `_section_waves_boss()` 会临时放开（并重建世界拿干净进度）。
+	main.waves_off = true
 	sub.add_child(main)
 
 	GameInput.aim_mode = "move"
@@ -68,6 +82,7 @@ func _run() -> void:
 	await _section_level2()
 	await _section_bag_chest()
 	await _section_shop()
+	await _section_layout()
 	_finish()
 
 
@@ -476,6 +491,17 @@ func _section_light_occlusion() -> void:
 	w.drops.clear()
 	w.particles.clear()
 
+	# ── 临时净场：把随机布局带进来的干扰物拿走 ──
+	# 宝箱位置现在每局随机，而它自带一道**呼吸的暖色缝光**（直接画的贴图，不认遮挡）。
+	# 万一它落在采样点上，量到的就是"宝箱有多亮"，而不是"墙有没有把光挡住"。
+	# （波次不用在这里操心：整份自检默认 `main.waves_off = true`，
+	#  这一段里根本不会有怪刷出来 —— 见那个开关的注释。）
+	var chest_bak := []
+	for c in w.chests:
+		if w.props.has(c):
+			w.props.erase(c)
+			chest_bak.append(c)
+
 	# ── 测光之前先关掉 HUD 的后处理（暗角）──
 	# 三个采样点分别在画面中部（墙前/墙后）和靠右边缘（射程外），而暗角是**径向**的：
 	# 同一个"世界亮度"，画面正中和靠边的点被压暗的幅度不一样。
@@ -628,6 +654,10 @@ func _section_light_occlusion() -> void:
 	# 后处理（暗角）恢复 —— 后面的截图要的是玩家真正看到的画面
 	main.hud.set_post_enabled(true)
 
+	# 把宝箱放回去（`append` 回末尾，props 顺序不变）
+	for c in chest_bak:
+		w.props.append(c)
+
 
 func _section_enemy_ai() -> void:
 	var w := _w()
@@ -668,6 +698,13 @@ func _section_enemy_ai() -> void:
 
 
 func _section_waves_boss() -> void:
+	# 这一段要验的正是"走进范围才刷 / 清空才弹三选一 / 全清才出 Boss"，
+	# 所以必须**放开**波次，并**重建世界**拿一份干净进度 ——
+	# 前面所有段落都跑在 `waves_off` 下（波次一律不刷、状态全是"已刷已清"），
+	# 不重建的话这里的"走进去才刷"就会退化成同义反复。
+	main.waves_off = false
+	main.restart_level()
+	_pump(2)
 	var w := _w()
 	var p := _p()
 	var bd: Dictionary = w.level["boss"]
@@ -677,7 +714,7 @@ func _section_waves_boss() -> void:
 
 	# ── 先验：一波都没清的时候，就算跑进 Boss 区也只该给提示，不该刷 Boss ──
 	_ok("开局 Boss 未出现", not w.boss_spawned)
-	w.teleport(float(bd["x"]), float(bd["y"]) - 120.0)
+	w.teleport(w.boss_anchor.x, w.boss_anchor.y - 100.0)
 	p.hp = p.max_hp
 	p.invuln = 0.0
 	_pump(20)
@@ -703,7 +740,7 @@ func _section_waves_boss() -> void:
 		_ok("第 %d 波清空后标记 cleared" % (i + 1), bool(wv["cleared"]))
 		if i < w.waves.size() - 1:
 			# 还剩波次没清：此刻站进 Boss 区也仍然不该刷（这才是"清空前不出现"的本意）
-			w.teleport(float(bd["x"]), float(bd["y"]) - 120.0)
+			w.teleport(w.boss_anchor.x, w.boss_anchor.y - 100.0)
 			p.hp = p.max_hp
 			p.invuln = 0.0
 			_pump(6)
@@ -713,7 +750,7 @@ func _section_waves_boss() -> void:
 	_ok("三波全部清空", w.waves_cleared_count() == 3, str(w.waves_cleared_count()))
 
 	# 进 Boss 区（第三波的位置本来就在 Boss 圈内，所以此刻多半已经刷出来了）
-	w.teleport(float(bd["x"]), float(bd["y"]) - 120.0)
+	w.teleport(w.boss_anchor.x, w.boss_anchor.y - 100.0)
 	p.hp = p.max_hp
 	p.invuln = 0.0
 	# 这里**故意**不让 _pump 替我们把对白翻掉（第 4 个参数 = auto_dialogue: false）：
@@ -1255,6 +1292,10 @@ func _section_weapons_skills() -> void:
 
 func _section_level2() -> void:
 	# 切到第二关（重新建世界）。这一段放最后，因为它会把世界换掉。
+	# **波次必须是开着的**：这段要验"清空一波 → 弹出三选一"，
+	# 而那个面板就是靠"波次被判定清空"才弹出来的。
+	# 验完三选一立刻停链（见本段中间），免得随机锚点把别的怪刷进火盆 / 盲女那几段。
+	main.waves_off = false
 	main.prog["boons"] = {}
 	main.prog["weapon"] = "blade"
 	main.prog["level"] = 1
@@ -1388,6 +1429,11 @@ func _section_level2() -> void:
 				int(main.prog["boons"].size())])
 	_ok("三选一后世界恢复推进（state 回到 play）", main.state == "play", main.state)
 	_num("三选一后恩赐项数", 0.0, int(main.prog["boons"].size()))
+
+	# 三选一验完了 → 立刻停掉波次链。
+	# 后面的火盆 / 再生 / 盲女 / Boss 都是**自己摆敌人**来测的，
+	# 不希望随机锚点把别的波次刷进来（那会给"她近了更亮"这类比较掺进噪音）。
+	w.waves_disabled = true
 
 	# ── 无芯之暗：火盆没点满，死掉的东西会再生 ──
 	p.hp = p.max_hp
@@ -1531,8 +1577,22 @@ func _next_goal(w: World) -> Vector2:
 			return Vector2(float(wd["x"]), float(wd["y"]))
 	if w.boss_enemy != null and not w.boss_enemy.dead:
 		return Vector2(w.boss_enemy.x, w.boss_enemy.y)
-	var bd: Dictionary = w.level["boss"]
-	return Vector2(float(bd["x"]), float(bd["y"]))
+	# 兜底：Boss 场地的**运行时锚点**（随机生成的那份，不是关卡表里的固定值）
+	return w.boss_anchor
+
+
+## 在 (cx, cy) 周围找一个**不合墙**的落脚点，离中心 dist。
+##
+## 为什么不用 `world.find_spawn_point()`：那个函数吃 `_rng`（主仿真流），
+## 自检调它会把后面所有跟随机有关的东西整体错位 —— 本项目最容易踩的坑。
+## 这里只要"哪儿能站"这一个答案，所以自己按固定角度扫一圈，不消耗任何 RNG。
+func _stand_near(w: World, cx: float, cy: float, dist: float) -> Vector2:
+	for k in 24:
+		var a := float(k) / 24.0 * TAU
+		var q := Vector2(cx + cos(a) * dist, cy + sin(a) * dist)
+		if not w.blocked(q.x, q.y, 14.0):
+			return q
+	return Vector2(cx, cy)   # 实在没地方就站箱子上 —— 宝箱故意不 solid，站得住
 
 
 # ================================================================ 收尾
@@ -1560,6 +1620,8 @@ func _affix_sig_of(w: World) -> String:
 func _section_bag_chest() -> void:
 	# 这一段自己重开一次第一关：世界随机器全部重置，背包/词条从干净状态验。
 	# （放在所有段落之后，所以这里多推多少步都不会影响前面的断言。）
+	# 关掉波次链：锚点是随机的，别让一整波怪刷进宝箱 / 商店那几段。
+	main.waves_off = true
 	main.prog["level"] = 0
 	main.restart_level()
 	_pump(4)
@@ -1583,7 +1645,10 @@ func _section_bag_chest() -> void:
 
 	# ── 走过去按 E 开箱 ──
 	var c0: Dictionary = w.chests[0]
-	w.teleport(float(c0["x"]) + 34.0, float(c0["y"]) + 30.0)
+	# 宝箱位置现在每局随机，所以站位也要**算出来**而不是写死偏移：
+	# 固定偏移（+34,+30）在一个随机点旁边很可能正好是墙。
+	var st0 := _stand_near(w, float(c0["x"]), float(c0["y"]), 46.0)
+	w.teleport(st0.x, st0.y)
 	_pump(3)
 	_ok("靠近宝箱会出现交互提示", w.prompt.find("宝箱") >= 0, w.prompt)
 
@@ -1640,7 +1705,8 @@ func _section_bag_chest() -> void:
 	# ── 背包满时：新武器换掉旧的，旧的被搁下 ──
 	var bag_before := str(w.prog["bag_weapon"])
 	var c1: Dictionary = w.chests[1]
-	w.teleport(float(c1["x"]) + 30.0, float(c1["y"]) + 26.0)
+	var st1 := _stand_near(w, float(c1["x"]), float(c1["y"]), 46.0)
+	w.teleport(st1.x, st1.y)
 	_pump(3)
 	_tap("interact")
 	_ok("第二个宝箱能开", main.state == "draft" and main._panel_kind == "chest", main.state)
@@ -1961,6 +2027,133 @@ func _section_shop() -> void:
 	_ok("按 Esc 离开商店，世界恢复推进", main.state == "play", main.state)
 	_pump(2)
 	_ok("离开后商店面板确实藏起来了（遮罩不会留着）", not main.hud.shop_layer.visible)
+
+
+# ================================================================ 布局随机化
+#
+# 这一轮要的：宝箱与敌人的位置**随机生成**，不再每关固定。
+#
+# 下面要证明三件事，缺一条这个功能就是假的：
+#   ① 生成的点**不是**关卡表里写死的那几个（否则等于没随机）；
+#   ② 换个 run_seed，位置**真的整体换了**（否则"随机"只是摆设）；
+#   ③ 同一个 run_seed 重建世界，点位**逐点相同**
+#      —— 这是整份确定性自检的地基，被随机化破坏的话后面全不可复现。
+# 另外必须验：撒出来的点**站得住**（不撞墙、离出生点够远）——
+# 随机撒点最典型的翻车就是撒进墙里：敌人永久卡住、宝箱摸不到，而断言还全绿。
+
+## 一套布局的签名（宝箱 / 波次锚点 / Boss 场地），用来比较"两套布局一样不一样"
+func _layout_sig(w: World) -> String:
+	var s := ""
+	for c in w.chests:
+		s += "C%.1f,%.1f;" % [float(c["x"]), float(c["y"])]
+	for wv in w.waves:
+		var wd: Dictionary = wv["def"]
+		s += "W%.1f,%.1f;" % [float(wd["x"]), float(wd["y"])]
+	s += "B%.1f,%.1f" % [w.boss_anchor.x, w.boss_anchor.y]
+	return s
+
+
+func _section_layout() -> void:
+	# ── 从头来一局，记住这批点位 ──
+	main.run_seed = LAYOUT_SEED
+	main.restart_level()
+	_pump(3)
+	var w := _w()
+
+	# ① 不再是关卡表里写死的坐标
+	var fixed_chests: Array = w.level["chests"]
+	var same_chest := 0
+	for i in mini(w.chests.size(), fixed_chests.size()):
+		var fp: Vector2 = fixed_chests[i]
+		if Proj.dist(float(w.chests[i]["x"]), float(w.chests[i]["y"]), fp.x, fp.y) < 1.0:
+			same_chest += 1
+	_ok("宝箱点位不是关卡表里写死的那个（真的重摇过）",
+		same_chest == 0, "%d/%d 与固定点重合" % [same_chest, w.chests.size()])
+
+	var fixed_waves: Array = w.level["waves"]
+	var same_wave := 0
+	for i in mini(w.waves.size(), fixed_waves.size()):
+		var fd: Dictionary = fixed_waves[i]
+		var wd: Dictionary = w.waves[i]["def"]
+		if Proj.dist(float(wd["x"]), float(wd["y"]), float(fd["x"]), float(fd["y"])) < 1.0:
+			same_wave += 1
+	_ok("波次锚点不是关卡表里写死的那个（真的重摇过）",
+		same_wave == 0, "%d/%d 与固定点重合" % [same_wave, w.waves.size()])
+
+	var bf: Dictionary = w.level["boss"]
+	_ok("Boss 场地也不是写死那个坐标",
+		Proj.dist(w.boss_anchor.x, w.boss_anchor.y, float(bf["x"]), float(bf["y"])) > 40.0,
+		"生成 (%.0f,%.0f)　表里 (%.0f,%.0f)" % [w.boss_anchor.x, w.boss_anchor.y,
+			float(bf["x"]), float(bf["y"])])
+
+	# ② 换一个局种子 → 整套位置必须换掉
+	var sig_a := _layout_sig(w)
+	main.run_seed = LAYOUT_SEED + 7717
+	main.restart_level()
+	_pump(3)
+	var w2 := _w()
+	var sig_b := _layout_sig(w2)
+	_ok("★ 换一个局种子 → 宝箱与敌人的位置整套换了",
+		sig_a != sig_b, "两套签名相同 = 随机没生效")
+
+	# ③ 换回同一个种子 → 逐点相同（确定性自检的地基）
+	main.run_seed = LAYOUT_SEED
+	main.restart_level()
+	_pump(3)
+	var w3 := _w()
+	_ok("★ 同一个局种子重建世界 → 点位逐点相同（确定性没被随机化破坏）",
+		_layout_sig(w3) == sig_a, "%s vs %s" % [_layout_sig(w3), sig_a])
+
+	# ④ 撒出来的点真的站得住
+	var bad_chest := 0
+	for c in w3.chests:
+		if w3.blocked(float(c["x"]), float(c["y"]), 20.0):
+			bad_chest += 1
+	_ok("生成的宝箱点都不在墙里", bad_chest == 0, "%d 个卡墙" % bad_chest)
+
+	var start: Vector2 = w3.level["start"]
+	var bad_wave := 0
+	var too_close := 0
+	for wv in w3.waves:
+		var wd: Dictionary = wv["def"]
+		if w3.blocked(float(wd["x"]), float(wd["y"]), 60.0):
+			bad_wave += 1
+		if Proj.dist(float(wd["x"]), float(wd["y"]), start.x, start.y) < 340.0:
+			too_close += 1
+	_ok("生成的波次锚点都不在墙里（中心留得下落脚地）", bad_wave == 0, "%d 个卡墙" % bad_wave)
+	_ok("波次锚点都离出生点够远（不会一出生就开打）", too_close == 0, "%d 个太近" % too_close)
+
+	# 可达性 —— 这一条是随机布局最容易漏、也最致命的一类：
+	# 点位看着都在空地上，但被一道墙隔开，玩家/机器人过不去，那一波永远清不掉，
+	# 关卡直接卡死。而**全程不报任何错**，只有真的走一遍（机器人试玩）才暴露。
+	var unreachable := 0
+	var prev := start
+	for wv in w3.waves:
+		var wd2: Dictionary = wv["def"]
+		var q := Vector2(float(wd2["x"]), float(wd2["y"]))
+		if not w3.has_los(prev.x, prev.y, q.x, q.y, 20.0):
+			unreachable += 1
+		prev = q
+	_ok("★ 波次锚点从出生点起链式可达（走不通就会卡关，而且不报错）",
+		unreachable == 0, "%d 段走不通" % unreachable)
+
+	# ⑤ 撒点成功率：退化到兜底说明约束太严或地图太空，都要修
+	_ok("随机布局没有退化到兜底坐标", int(w3.layout_info.get("fallbacks", -1)) == 0,
+		"fallbacks=%d" % int(w3.layout_info.get("fallbacks", -1)))
+
+	# 报告里留一份：出事时一眼看出"这一局地图长什么样"
+	report["samples"]["layout"] = {
+		"seed": LAYOUT_SEED,
+		"chests": w3.layout_info.get("chests", []),
+		"waves": w3.layout_info.get("waves", []),
+		"boss": w3.layout_info.get("boss", []),
+		"alt_seed_changes": sig_a != sig_b,
+	}
+
+	# 收尾：种子调回标准值并重建，离开这一段时世界与别的段落看到的一致
+	main.run_seed = LAYOUT_SEED
+	main.restart_level()
+	_pump(3)
 
 
 func _finish() -> void:
