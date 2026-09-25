@@ -37,6 +37,7 @@ var projs := []
 var player: PlayerState
 var waves := []            # {def, spawned, cleared, members}
 var braziers := []
+var chests := []           # 宝箱（也是 props 里的一项，这里单独存一份方便遍历）
 var goal_prop := {}
 var merchant_prop := {}
 var girl = null
@@ -82,6 +83,11 @@ var prog := {
 	"up": {"hp": 0, "light": 0, "edge": 0},
 	"shop": {"ember": 0, "brightoil": 0},
 	"weapon": "blade",
+	## 背包里的备用武器（"" = 空）。按 X 与手持互换。
+	"bag_weapon": "",
+	## 武器词条：{武器id: [{"id": 词条id, "lv": 等级}, ...]}。
+	## 挂在**武器 id** 上而不是"当前手持"上 —— 换手不丢，换回来还在。
+	"waffix": {},
 	"kills": 0, "deaths": 0, "max_combo": 0,
 	"used_revive": false,
 }
@@ -89,6 +95,10 @@ var prog := {
 var _next_id := 1
 var _rng: RandomNumberGenerator
 var _decor_rng: RandomNumberGenerator
+## 重铸 / 锤炼 / 宝箱各自独立的随机源。**绝不能用 `_rng`** ——
+## `_rng` 是主仿真流，动它会把之后所有的世界演化都挪掉（见 README 的"步数就是货币"）。
+var _shop_rng: RandomNumberGenerator
+var _chest_rng: RandomNumberGenerator
 
 
 func setup(dev := false, lv_index := -1) -> void:
@@ -98,11 +108,19 @@ func setup(dev := false, lv_index := -1) -> void:
 	level = Content.level_at(level_index)
 	_rng = Proj.make_rng(int(level["seed"]))
 	_decor_rng = Proj.make_rng(int(level["seed"]) + 991)
+	# 商店/宝箱的随机源：和 _rng、_decor_rng 都分开，互不干扰（各自确定）
+	_shop_rng = Proj.make_rng(int(level["seed"]) + 6060)
+	_chest_rng = Proj.make_rng(int(level["seed"]) + 5150)
 	ambient = float(level["ambient"])
 
 	if not prog.has("boons"):
 		prog["boons"] = {}
 	boons = prog["boons"]
+	# 背包与词条表：跨关保留（prog 是 Main 传进来的那一份）
+	if not prog.has("bag_weapon"):
+		prog["bag_weapon"] = ""
+	if not prog.has("waffix"):
+		prog["waffix"] = {}
 	# 三选一的随机源按关卡重置 → 同一关的抽取序列可复现
 	draft_rng = Proj.make_rng(int(level["seed"]) + 4242)
 
@@ -120,6 +138,22 @@ func setup(dev := false, lv_index := -1) -> void:
 	for pd in level["props"]:
 		props.append(_make_prop(pd))
 	_decorate()
+
+	# 宝箱：**必须等 _decorate() 之后再入 props**。
+	# 两个原因，都是"不要打扰已经量好的世界"：
+	#   ① props 里每一项都要 `_decor_rng.randi_range` 抽 seed —— 提前加会挪动装饰的随机流；
+	#   ② `_decorate()` 会躲开已有道具 120px —— 提前加会改变"哪里能放装饰"的判定。
+	# 两条都会让整关装饰换位置，把依赖装饰的像素断言全撞掉。
+	for cp in level.get("chests", []):
+		var chest := {
+			"kind": "chest", "x": float(cp.x), "y": float(cp.y),
+			"r": float(Content.PROP_TABLE["chest"]["r"]),
+			"h": float(Content.PROP_TABLE["chest"]["h"]),
+			"solid": false, "seed": 0, "lit": false, "lit_t": 0.0, "pulse": 0.0,
+			"opened": false, "items": [],
+		}
+		props.append(chest)
+		chests.append(chest)
 
 	for pr in props:
 		match str(pr["kind"]):
@@ -178,9 +212,71 @@ func boon(id: String) -> int:
 	return int(boons.get(id, 0))
 
 
-## 挥击冷却倍率（灯芯·疾）
+# ---------------------------------------------------------------- 武器词条
+#
+# 词条存在 `prog["waffix"]`：`{武器id: [{"id":…, "lv":…}, …]}`。
+# 读的时候一律走下面这几个访问器，**写的时候**只有守灯人的重铸/锤炼两个入口。
+#
+# 注意 `affix_lv()` 默认看的是**手持**那把武器 —— 所以"换手之后手感变了"
+# 是自动生效的，不需要在 swap 里再同步一遍任何东西。
+
+## 取某把武器的词条数组。create=true 时顺便建好条目（写入路径用）。
+func _affix_arr(wid: String, create := false) -> Array:
+	if not prog["waffix"].has(wid):
+		if not create:
+			return []
+		prog["waffix"][wid] = []
+	return prog["waffix"][wid]
+
+
+## 某把武器的词条列表（默认手持那把）
+func weapon_affixes(wid := "") -> Array:
+	return _affix_arr(wid if wid != "" else str(prog["weapon"]))
+
+
+## 某条词条在某把武器上的等级（0 = 没有）
+func affix_lv(id: String, wid := "") -> int:
+	for a in weapon_affixes(wid):
+		if str(a["id"]) == id:
+			return int(a["lv"])
+	return 0
+
+
+## 某把武器所有词条的**等级之和** —— 锤炼的价钱按它涨
+func affix_levels_sum(wid := "") -> int:
+	var s := 0
+	for a in weapon_affixes(wid):
+		s += int(a["lv"])
+	return s
+
+
+## HUD 用：{id,name,lv,color,desc}
+func affix_list(wid := "") -> Array:
+	var out := []
+	for a in weapon_affixes(wid):
+		var id := str(a["id"])
+		var meta: Dictionary = Content.WEAPON_AFFIXES.get(id, {})
+		out.append({
+			"id": id, "name": str(meta.get("name", id)), "lv": int(a["lv"]),
+			"color": str(meta.get("color", "#ffe0a8")),
+			"desc": str(meta.get("desc", "")),
+		})
+	return out
+
+
+## 背包里的灯油数量（背包里的回血道具）
+func potion_count() -> int:
+	return int(prog["shop"].get("oil_bank", 0))
+
+
+# ---------------------------------------------------------------- 派生属性
+#
+# 这一节是**唯一**把「恩赐 + 词条 + 存档升级」折成倍率的地方。
+# 别在别处再乘一遍：自检的数值断言全靠这里。
+
+## 挥击冷却倍率（灯芯·疾 + 词条「疾」）
 func attack_cd_mul() -> float:
-	return pow(0.88, float(boon("haste")))
+	return pow(0.88, float(boon("haste"))) * pow(0.90, float(affix_lv("swift")))
 
 
 ## 技能冷却倍率（灯芯·通）
@@ -188,19 +284,19 @@ func skill_cd_mul() -> float:
 	return pow(0.82, float(boon("skill_cd")))
 
 
-## 技能连击消耗（省火，最低 1）
+## 技能连击消耗（省火 + 词条「省」，最低 1）
 func skill_cost(cost: int) -> int:
-	return maxi(1, cost - boon("cost_cut"))
+	return maxi(1, cost - boon("cost_cut") - affix_lv("frugal"))
 
 
-## 攻击范围倍率（灯芯·远）
+## 攻击范围倍率（灯芯·远 + 词条「远」）
 func reach_mul() -> float:
-	return 1.0 + float(boon("reach")) * 0.12
+	return 1.0 + float(boon("reach")) * 0.12 + float(affix_lv("reach")) * 0.12
 
 
-## 暴击概率（灯芯·锐）
+## 暴击概率（灯芯·锐 + 词条「锐」）
 func crit_chance() -> float:
-	return minf(0.75, float(boon("crit")) * 0.12)
+	return minf(0.75, float(boon("crit")) * 0.12 + float(affix_lv("crit")) * 0.08)
 
 
 ## 连击衰减速度（火种不熄）
@@ -208,9 +304,9 @@ func combo_decay() -> float:
 	return 14.0 * pow(0.7, float(boon("combo_up")))
 
 
-## 命中额外连击（越战越亮）
+## 命中额外连击（越战越亮 + 词条「火」）
 func combo_bonus() -> float:
-	return float(boon("combo_add")) * 0.2
+	return float(boon("combo_add")) * 0.2 + float(affix_lv("ember")) * 0.15
 
 
 # ---------------------------------------------------------------- 肉鸽：波次随机
@@ -336,6 +432,291 @@ func boon_list() -> Array:
 	return out
 
 
+# ================================================================ 背包 / 换手 / 灯油
+#
+# · 背包栏 —— 额外带一把武器（`prog["bag_weapon"]`）+ 存的回血道具（`prog["shop"]["oil_bank"]`）
+# · X 换手 —— 手持 ↔ 背包 互换
+# · C 喝灯油 —— 消耗一件回血
+#
+# 灯油沿用**已有的**第 3 种掉落（`_take_drop` 里的 "oil" 早就往 `oil_bank` 里加了），
+# 只是在此之前没有任何地方消费它 —— 现在它是背包里的回血道具。
+
+func weapon_name(wid: String) -> String:
+	var w: Dictionary = Content.WEAPONS.get(wid, Content.WEAPONS["blade"])
+	return str(w["name"])
+
+
+## 换手：手持 ↔ 背包。**背包空时什么都不做**，只提示 ——
+## 不做"把手上的塞进背包、手上变空"，那等于让玩家一键把自己缴械。
+func swap_weapon() -> bool:
+	var cur := str(prog["weapon"])
+	var bag := str(prog.get("bag_weapon", ""))
+	if bag == "":
+		events.append({"type": "toast", "text": "背包里没有备用武器。"})
+		sfx("ui")
+		return false
+	prog["weapon"] = bag
+	prog["bag_weapon"] = cur
+	player.weapon_id = bag
+	player.skill_cd.clear()      # 换武器 → 技能冷却重算（与三选一换武器一致）
+	sfx("swap")
+	var w := player.weapon()
+	events.append({"type": "toast", "text": "换手：「%s」→「%s」"
+		% [weapon_name(cur), str(w["name"])]})
+	return true
+
+
+## 喝一件灯油回血。**没药 / 满血都不消耗** —— 别让玩家白扔一瓶。
+func use_potion() -> bool:
+	var p := player
+	if p.dead:
+		return false
+	var n := potion_count()
+	if n <= 0:
+		events.append({"type": "toast", "text": "背包里没有灯油。"})
+		sfx("ui")
+		return false
+	if p.hp >= p.max_hp - 0.01:
+		events.append({"type": "toast", "text": "生命是满的，灯油先留着。"})
+		sfx("ui")
+		return false
+	var healed := minf(p.max_hp, p.hp + p.max_hp * float(Content.SHOP["oil"]["heal"])) - p.hp
+	p.hp += healed
+	prog["shop"]["oil_bank"] = n - 1
+	sfx("coin")
+	_add_text(p.x, p.y, 70.0, "+%d" % int(round(healed)), "#ffe0a8", 16.0)
+	events.append({"type": "toast", "text": "喝下灯油 ×1（背包还剩 %d）" % (n - 1)})
+	return true
+
+
+# ================================================================ 宝箱
+
+## 从词条表里**不重复**抽 n 条，等级都是 1。走 _shop_rng（不碰主仿真流）。
+func _roll_affixes(n: int) -> Array:
+	var out := []
+	var guard := 0
+	while out.size() < n and guard < 80:
+		guard += 1
+		var id := str(Content.AFFIX_ORDER[
+			_shop_rng.randi_range(0, Content.AFFIX_ORDER.size() - 1)])
+		var dup := false
+		for a in out:
+			if str(a["id"]) == id:
+				dup = true
+				break
+		if not dup:
+			out.append({"id": id, "lv": 1})
+	return out
+
+
+## "锋×2　噬×1" 这样的短描述（HUD 与 toast 共用）
+func _affix_desc(arr: Array) -> String:
+	var parts := []
+	for a in arr:
+		var meta: Dictionary = Content.WEAPON_AFFIXES.get(str(a["id"]), {})
+		parts.append("%s×%d" % [str(meta.get("name", str(a["id"]))), int(a["lv"])])
+	return "　".join(parts)
+
+
+## 抽宝箱的三把武器。**排除手持与背包这两把** ——
+## 否则开箱开出手上那把，玩家会觉得箱子坏了。
+func roll_chest() -> Array:
+	var exclude := [str(prog["weapon"]), str(prog.get("bag_weapon", ""))]
+	var cands := []
+	for wid in Content.WEAPONS.keys():
+		if not exclude.has(str(wid)):
+			cands.append(str(wid))
+	if cands.is_empty():     # 兜底：8 把武器不可能全被排除，但别让箱子空着
+		for wid in Content.WEAPONS.keys():
+			cands.append(str(wid))
+	var picked := []
+	var guard := 0
+	while picked.size() < 3 and guard < 60:
+		guard += 1
+		var wid := str(cands[_chest_rng.randi_range(0, cands.size() - 1)])
+		if not picked.has(wid):
+			picked.append(wid)
+	var out := []
+	for wid in picked:
+		var affix := _roll_affixes(1)
+		var wd: Dictionary = Content.WEAPONS[wid]
+		var desc := "%s　词条：%s" % [str(wd["desc"]), _affix_desc(affix)]
+		# 卡片左上角那行小字：开箱是"入背包"，不是"换武器"（换手要按 X）
+		out.append({"kind": "weapon", "id": wid, "name": str(wd["name"]),
+			"desc": desc, "affix": affix, "kind_label": "入背包"})
+	return out
+
+
+func open_chest(pr: Dictionary) -> void:
+	if bool(pr.get("opened", false)):
+		events.append({"type": "toast", "text": "这个箱子已经空了。"})
+		sfx("ui")
+		return
+	pr["opened"] = true
+	pr["items"] = roll_chest()
+	sfx("open")
+	_spawn_fx(float(pr["x"]), float(pr["y"]), "#ffd9a0")
+	events.append({"type": "toast", "text": "箱盖掀开了。"})
+	# 面板交给 main 开（世界只负责"箱子里有什么"）
+	events.append({"type": "chest", "items": pr["items"]})
+
+
+## 开箱选中一把 → 进背包。背包满了就把旧的**换下来丢掉**（toast 明说）。
+## 这里刻意不做"掉到地上再捡" —— 那要引入可拾取的武器掉落，
+## 而掉落一多，`_update_drops` 的随机流和自检的时机断言都会变脆。
+func apply_chest(item: Dictionary) -> void:
+	var wid := str(item["id"])
+	var bag := str(prog.get("bag_weapon", ""))
+	# 这把武器还没有词条时才带上宝箱给的 —— 别覆盖已经练过的
+	var affix: Array = item.get("affix", [])
+	if not affix.is_empty() and weapon_affixes(wid).is_empty():
+		prog["waffix"][wid] = affix
+	if bag != "":
+		events.append({"type": "toast", "text": "背包里的「%s」被搁下了。" % weapon_name(bag)})
+	prog["bag_weapon"] = wid
+	sfx("levelup")
+	flash_color = Color.html("#ffd9a0")
+	flash_power = 0.3
+	events.append({"type": "toast",
+		"text": "「%s」放进了背包（按 X 换手）" % weapon_name(wid)})
+
+
+# ================================================================ 守灯人：重铸 / 锤炼
+
+func shop_oil_price() -> int:
+	return int(Content.SHOP["oil"]["price"])
+
+
+func reforge_price() -> int:
+	return int(Content.SHOP["reforge"]["price"])
+
+
+## 锤炼价钱随"这把武器词条等级之和"上涨 —— 越练越贵，防免费刷数值
+func temper_price() -> int:
+	return Content.temper_cost(affix_levels_sum())
+
+
+## 还能不能锤炼：词条没满，或者还有词条没到等级上限
+func _can_temper(wid: String) -> bool:
+	var arr := weapon_affixes(wid)
+	if arr.size() < Content.AFFIX_MAX:
+		return true
+	for a in arr:
+		if int(a["lv"]) < Content.AFFIX_LV_MAX:
+			return true
+	return false
+
+
+## 商店的三个选项。**HUD 与自检都读这一份**，别各写一套文案与价钱。
+func shop_items() -> Array:
+	var cur := str(prog["weapon"])
+	var coins := int(prog["coins"])
+	var cur_affix := _affix_desc(weapon_affixes(cur))
+	if cur_affix == "":
+		cur_affix = "现在没有词条"
+	var oil_p := shop_oil_price()
+	var ref_p := reforge_price()
+	var tem_p := temper_price()
+	var can_tem := _can_temper(cur)
+	var out := []
+	out.append({
+		"id": "oil", "name": "买灯油", "price": oil_p,
+		"desc": "灯油 ×1（背包现有 %d）。按 C 喝，回 45%% 生命。" % potion_count(),
+		"ok": coins >= oil_p,
+	})
+	out.append({
+		"id": "reforge", "name": "重铸", "price": ref_p,
+		"desc": "把「%s」的词条全部重 roll。当前：%s" % [weapon_name(cur), cur_affix],
+		"ok": coins >= ref_p,
+	})
+	out.append({
+		"id": "temper", "name": "锤炼", "price": tem_p,
+		"desc": "给「%s」加一条词条，满了就升一级。当前：%s" % [weapon_name(cur), cur_affix],
+		"ok": coins >= tem_p and can_tem,
+	})
+	return out
+
+
+func buy_shop(id: String) -> bool:
+	match id:
+		"oil":
+			return buy_oil()
+		"reforge":
+			return reforge_weapon()
+		"temper":
+			return temper_weapon()
+	return false
+
+
+## 买灯油：**进背包**，不是当场回血（用户要的就是"存背包里"）
+func buy_oil() -> bool:
+	var price := shop_oil_price()
+	if int(prog["coins"]) < price:
+		events.append({"type": "toast", "text": "灯火不够（灯油要 %d，你有 %d）。"
+			% [price, int(prog["coins"])]})
+		sfx("ui")
+		return false
+	prog["coins"] = int(prog["coins"]) - price
+	prog["shop"]["oil_bank"] = potion_count() + 1
+	sfx("coin")
+	events.append({"type": "toast", "text": "买下灯油 ×1（背包里现在 %d 件）。" % potion_count()})
+	return true
+
+
+## 重铸：词条**全部推倒重来**（1~3 条，等级归 1）
+func reforge_weapon() -> bool:
+	var price := reforge_price()
+	if int(prog["coins"]) < price:
+		events.append({"type": "toast", "text": "灯火不够（重铸要 %d）。" % price})
+		sfx("ui")
+		return false
+	var wid := str(prog["weapon"])
+	var arr := _roll_affixes(_shop_rng.randi_range(1, Content.AFFIX_MAX))
+	prog["coins"] = int(prog["coins"]) - price
+	prog["waffix"][wid] = arr
+	sfx("levelup")
+	events.append({"type": "toast", "text": "重铸「%s」：%s"
+		% [weapon_name(wid), _affix_desc(arr)]})
+	return true
+
+
+## 锤炼：没满就**加一条**，满了就**升一级**
+func temper_weapon() -> bool:
+	var wid := str(prog["weapon"])
+	if not _can_temper(wid):
+		events.append({"type": "toast", "text": "「%s」的词条已经练满了。" % weapon_name(wid)})
+		sfx("ui")
+		return false
+	var price := temper_price()
+	if int(prog["coins"]) < price:
+		events.append({"type": "toast", "text": "灯火不够（锤炼要 %d）。" % price})
+		sfx("ui")
+		return false
+	var arr := _affix_arr(wid, true)
+	var msg := ""
+	if arr.size() < Content.AFFIX_MAX:
+		var cands := []
+		for id in Content.AFFIX_ORDER:
+			if affix_lv(str(id), wid) == 0:
+				cands.append(str(id))
+		var nid := str(cands[_shop_rng.randi_range(0, cands.size() - 1)])
+		arr.append({"id": nid, "lv": 1})
+		msg = "添了词条「%s」" % str(Content.WEAPON_AFFIXES[nid]["name"])
+	else:
+		var ups := []
+		for a in arr:
+			if int(a["lv"]) < Content.AFFIX_LV_MAX:
+				ups.append(a)
+		var up: Dictionary = ups[_shop_rng.randi_range(0, ups.size() - 1)]
+		up["lv"] = int(up["lv"]) + 1
+		msg = "词条「%s」升到 %d 级" % [
+			str(Content.WEAPON_AFFIXES[str(up["id"])]["name"]), int(up["lv"])]
+	prog["coins"] = int(prog["coins"]) - price
+	sfx("levelup")
+	events.append({"type": "toast", "text": "锤炼「%s」：%s" % [weapon_name(wid), msg]})
+	return true
+
+
 
 func _make_prop(pd: Dictionary) -> Dictionary:
 	var kind := str(pd["kind"])
@@ -406,6 +787,7 @@ func player_light_radius() -> float:
 	var p := player
 	var r := 150.0 + float(prog["up"]["light"]) * 24.0 + float(prog["shop"]["brightoil"]) * 10.0
 	r += float(boon("light")) * 26.0
+	r += float(affix_lv("shine")) * 22.0
 	r += minf(p.combo, 40.0) * 7.0
 	r += p.glow * 46.0
 	if girl_near:
@@ -420,7 +802,8 @@ func brightness01() -> float:
 func damage_mul() -> float:
 	return (1.0 + minf(player.combo, 60.0) * 0.012) \
 		* (1.0 + float(prog["up"]["edge"]) * 0.12) \
-		* (1.0 + float(boon("dmg")) * 0.14)
+		* (1.0 + float(boon("dmg")) * 0.14) \
+		* (1.0 + float(affix_lv("edge")) * 0.12)
 
 
 
@@ -594,6 +977,12 @@ func _update_player(dt: float) -> void:
 	for i in 3:
 		if GameInput.just("skill" + str(i + 1)):
 			use_skill(i)
+
+	# 背包：X 换手 / C 喝灯油（都不吃 RNG，放哪都确定）
+	if GameInput.just("swap_weapon"):
+		swap_weapon()
+	if GameInput.just("use_potion"):
+		use_potion()
 
 	# 交互
 	if GameInput.just("interact"):
@@ -1405,6 +1794,15 @@ func _kill_enemy(e: EnemyState, dir: float) -> void:
 	player.kills += 1
 	sfx("die" if e.is_boss() else "hit")
 
+	# 词条「噬」：击杀回复生命（不吃 RNG）
+	var vamp := affix_lv("vamp")
+	if vamp > 0 and not player.dead:
+		var hp_before := player.hp
+		player.hp = minf(player.max_hp, player.hp + float(vamp) * 3.0)
+		if player.hp > hp_before + 0.01:
+			_add_text(e.x, e.y, e.h + 12.0,
+				"+%d" % int(round(player.hp - hp_before)), "#ff9db4", 13.0)
+
 	var is_boss := e.is_boss()
 	var coins := int(e.def["coin"])
 	# 恩赐「灯油丰沛」：掉落更多灯火
@@ -2045,7 +2443,15 @@ func _update_interaction(dt: float) -> void:
 		var d := Proj.dist(p.x, p.y, float(merchant_prop["x"]), float(merchant_prop["y"]))
 		if d < 76.0 and d < best_d:
 			best_d = d
-			best = "掌灯人：用 22 灯火换灯油（回复 45% 生命）"
+			best = "守灯人：重铸 / 锤炼 / 买灯油（按 E 交谈）"
+	for c in chests:
+		var d := Proj.dist(p.x, p.y, float(c["x"]), float(c["y"]))
+		if d < 78.0 and d < best_d:
+			best_d = d
+			if bool(c["opened"]):
+				best = "空宝箱（按 E 再看看）"
+			else:
+				best = "宝箱：掀开看看（按 E）"
 	if not goal_prop.is_empty():
 		var d := Proj.dist(p.x, p.y, float(goal_prop["x"]), float(goal_prop["y"]))
 		if d < 110.0 and d < best_d:
@@ -2104,16 +2510,16 @@ func interact() -> void:
 			girl["talk_cd"] = 12.0
 			events.append({"type": "dialogue", "key": "girl_talk"})
 		return
-	if not merchant_prop.is_empty() and Proj.dist(p.x, p.y, float(merchant_prop["x"]), float(merchant_prop["y"])) < 76.0:
-		if int(prog["coins"]) < 22:
-			events.append({"type": "toast", "text": "灯火不够（需要 22）。"})
-			sfx("ui")
+	for c in chests:
+		if Proj.dist(p.x, p.y, float(c["x"]), float(c["y"])) < 78.0:
+			open_chest(c)
 			return
-		prog["coins"] = int(prog["coins"]) - 22
-		p.hp = minf(p.max_hp, p.hp + p.max_hp * 0.45)
-		sfx("coin")
-		_add_text(p.x, p.y, 66.0, "+灯油", "#ffe0a8", 15.0)
-		events.append({"type": "toast", "text": "掌灯人：灯油灌进去了，走稳点。"})
+	if not merchant_prop.is_empty() and Proj.dist(p.x, p.y, float(merchant_prop["x"]), float(merchant_prop["y"])) < 76.0:
+		# 第一次交谈：先让守灯人自己说两句（走对白），谈完 main 再开商店
+		if not bool(prog.get("keeper_talked", false)):
+			prog["keeper_talked"] = true
+			events.append({"type": "dialogue", "key": "keeper"})
+		events.append({"type": "shop"})
 		return
 	if not goal_prop.is_empty() and Proj.dist(p.x, p.y, float(goal_prop["x"]), float(goal_prop["y"])) < 110.0:
 		if bool(goal_prop["lit"]):

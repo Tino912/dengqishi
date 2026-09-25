@@ -71,6 +71,22 @@ var draft_cards: Array = []
 var draft_hint: Label
 var draft_arm: ArmBar
 
+## 背包栏（右下角）：手持 / 备用武器、武器词条、灯油存量、X·C 提示
+var bag_panel: PanelContainer
+var bag_equip: Label
+var bag_alt: Label
+var bag_potion: Label
+var bag_hint: Label
+var bag_affix: HFlowContainer
+
+## 守灯人的商店
+var shop_layer: Control
+var shop_title: Label
+var shop_sub: Label
+var shop_rows: Array = []
+var shop_hint: Label
+var shop_arm: ArmBar
+
 var _toasts := []
 ## 面板装填进度（三选一）：HUD 自己计时，好让"还不能确认"这件事看得见
 var _arm_t := 0.0
@@ -81,6 +97,11 @@ var _combo_pop := 0.0
 var _combo_last := 0
 ## 恩赐徽章的签名（变了才重建）
 var _boon_sig := ""
+## 背包词条的签名缓存 —— refresh 每步都跑，别每步都 free+new
+var _affix_sig := ""
+## 商店自己的装填计时（与 main 的 _draft_t 同步推进，两边都在 DRAFT_ARM 时刻到位）
+var _shop_arm_t := 0.0
+var _shop_arm_done := false
 ## 画面板底纹用的噪点贴图（一次生成，反复平铺）
 var _noise: ImageTexture = null
 
@@ -154,12 +175,14 @@ func _build() -> void:
 	_build_combo()
 	_build_objective()
 	_build_boss()
+	_build_bag()
 	_build_prompt()
 	_build_toasts()
 	_build_dialogue()
 	_build_flash()
 	_build_overlay()
 	_build_draft()
+	_build_shop()
 
 
 ## 后处理：暗角。用一张径向贴图，中心通透、四周压暗 ——
@@ -237,6 +260,38 @@ func _build_skills() -> void:
 		hud_box.add_child(chip)
 		chip.setup(i)
 		skill_chips.append(chip)
+
+
+## 背包栏：右下角，和左下角的技能格对称。
+## 内容 = 手持武器 + 它的词条 + 背包里那把备用武器 + 灯油存量 + X/C 提示。
+## 用户要的"增加背包栏，可以额外携带一把武器"就是这一块。
+func _build_bag() -> void:
+	bag_panel = _mk_panel(hud_box, Vector2(274, 0))
+	bag_panel.position = Vector2(Proj.VIEW_W - 292.0, Proj.VIEW_H - 208.0)
+	# 角上那盏小灯：和左上角的状态面板呼应
+	var lamp := PanelLamp.new()
+	lamp.position = bag_panel.position + Vector2(-7.0, -7.0)
+	lamp.size = Vector2(18, 18)
+	lamp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud_box.add_child(lamp)
+
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 5)
+	bag_panel.add_child(v)
+
+	var cap := _mk_label(v, 14, C_GOLD, true)
+	cap.text = "背　　包"
+	bag_equip = _mk_label(v, 15, C_GOLD_HI, true)
+	bag_affix = HFlowContainer.new()
+	bag_affix.add_theme_constant_override("h_separation", 4)
+	bag_affix.add_theme_constant_override("v_separation", 4)
+	bag_affix.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bag_affix.custom_minimum_size = Vector2(246, 0)
+	v.add_child(bag_affix)
+	bag_alt = _mk_label(v, 14, Color(0.80, 0.85, 0.98))
+	bag_potion = _mk_label(v, 14, Color(0.94, 0.88, 0.72))
+	bag_hint = _mk_label(v, 12, C_DIM, false, 3)
+	bag_hint.text = "X 换手　·　C 喝灯油"
 
 
 func _build_combo() -> void:
@@ -369,7 +424,7 @@ func _build_draft() -> void:
 	draft_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(draft_layer)
 	var ddim := ColorRect.new()
-	ddim.color = Color(0.01, 0.015, 0.03, 0.84)
+	ddim.color = Color(0.01, 0.015, 0.03, 0.90)
 	ddim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	ddim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	draft_layer.add_child(ddim)
@@ -405,6 +460,52 @@ func _build_draft() -> void:
 	draft_hint.text = "Q ◀　　▶ E　移动高亮　·　空格 / 回车 拿走　·　Esc 放弃这次"
 
 	draft_layer.visible = false
+
+
+## 守灯人的商店。行高固定 84，四行（买灯油 / 重铸 / 锤炼 / 离开）。
+## 与三选一面板长得像但**不是同一块**：商店要常驻刷新（价钱随灯火与词条变）。
+func _build_shop() -> void:
+	shop_layer = Control.new()
+	shop_layer.set_anchors_preset(Control.PRESET_FULL_RECT)
+	shop_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(shop_layer)
+	var sdim := ColorRect.new()
+	sdim.color = Color(0.01, 0.015, 0.03, 0.93)
+	sdim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	sdim.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shop_layer.add_child(sdim)
+
+	shop_title = _mk_label(shop_layer, 36, C_GOLD_HI, true, 8)
+	shop_title.position = Vector2(Proj.VIEW_W * 0.5 - 380.0, 88.0)
+	shop_title.custom_minimum_size = Vector2(760, 0)
+	shop_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	shop_title.text = "守 灯 人"
+	shop_sub = _mk_label(shop_layer, 16, Color(0.80, 0.76, 0.68), false, 4)
+	shop_sub.position = Vector2(Proj.VIEW_W * 0.5 - 380.0, 134.0)
+	shop_sub.custom_minimum_size = Vector2(760, 0)
+	shop_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+
+	for i in 4:
+		var row := ShopRow.new()
+		row.slot = i
+		row.base_pos = Vector2(Proj.VIEW_W * 0.5 - 340.0, 178.0 + float(i) * 84.0)
+		row.position = row.base_pos
+		row.custom_minimum_size = Vector2(680, 76)
+		shop_layer.add_child(row)
+		shop_rows.append(row)
+
+	var y0 := 178.0 + 4.0 * 84.0 + 4.0
+	shop_arm = ArmBar.new()
+	shop_arm.position = Vector2(Proj.VIEW_W * 0.5 - 340.0, y0)
+	shop_arm.custom_minimum_size = Vector2(680, 4)
+	shop_layer.add_child(shop_arm)
+	shop_hint = _mk_label(shop_layer, 18, C_GOLD, true, 5)
+	shop_hint.position = Vector2(Proj.VIEW_W * 0.5 - 380.0, y0 + 16.0)
+	shop_hint.custom_minimum_size = Vector2(760, 0)
+	shop_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	shop_hint.text = "Q ◀　　▶ E　移动　·　空格 / 回车 买下　·　Esc 离开"
+
+	shop_layer.visible = false
 
 
 func _bar(parent: Node, ca: Color, cb: Color, w: float, h: float) -> RBar:
@@ -497,6 +598,7 @@ func refresh(world: World) -> void:
 			float(s.get("cd", 1.0)))
 
 	_refresh_boons(world)
+	_refresh_bag(world)
 
 	if world.boss_enemy != null and not world.boss_enemy.dead and world.boss_spawned:
 		boss_box.visible = true
@@ -546,6 +648,61 @@ func _refresh_boons(world: World) -> void:
 		var l := _mk_label(chip, 13, C_OK, false, 3)
 		l.text = "%s×%d" % [str(b["name"]), int(b["count"])]
 		boon_flow.add_child(chip)
+
+
+## 背包栏刷新：手持 / 备用 / 灯油 / 词条。
+## 词条 chips 走签名缓存（和恩赐一样），只在真的变了才重建 —— refresh 每步都跑。
+func _refresh_bag(world: World) -> void:
+	var cur := str(world.prog["weapon"])
+	var bag := str(world.prog.get("bag_weapon", ""))
+	bag_equip.text = "手持　%s" % world.weapon_name(cur)
+	if bag == "":
+		bag_alt.text = "备用　（空）"
+		bag_alt.add_theme_color_override("font_color", C_DIM)
+	else:
+		bag_alt.text = "备用　%s　[X]" % world.weapon_name(bag)
+		bag_alt.add_theme_color_override("font_color", Color(0.80, 0.85, 0.98))
+	var pots := world.potion_count()
+	bag_potion.text = "灯油　×%d　[C]" % pots
+	bag_potion.add_theme_color_override("font_color",
+		Color(0.96, 0.90, 0.74) if pots > 0 else C_DIM)
+
+	var al := world.affix_list()
+	var sig := ""
+	for a in al:
+		sig += "%s%d|" % [str(a["id"]), int(a["lv"])]
+	if sig == _affix_sig:
+		return
+	_affix_sig = sig
+	for ch in bag_affix.get_children():
+		bag_affix.remove_child(ch)
+		ch.queue_free()
+	if al.is_empty():
+		var none := _mk_label(bag_affix, 12, C_DIM, false, 3)
+		none.text = "（无词条 · 找守灯人锤炼）"
+		return
+	for a in al:
+		bag_affix.add_child(_affix_chip(a))
+
+
+## 一条词条的小牌：颜色跟着词条走（和商店里的说明对得上）
+func _affix_chip(a: Dictionary) -> PanelContainer:
+	var col := Color.html(str(a["color"]))
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(col.r * 0.20, col.g * 0.20, col.b * 0.20, 0.94)
+	sb.border_color = Color(col.r, col.g, col.b, 0.78)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(8)
+	sb.content_margin_left = 7.0
+	sb.content_margin_right = 7.0
+	sb.content_margin_top = 1.0
+	sb.content_margin_bottom = 1.0
+	var chip := PanelContainer.new()
+	chip.add_theme_stylebox_override("panel", sb)
+	chip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var l := _mk_label(chip, 12, col, false, 3)
+	l.text = "%s×%d" % [str(a["name"]), int(a["lv"])]
+	return chip
 
 
 func _chip_sb() -> StyleBoxFlat:
@@ -658,6 +815,16 @@ func tick(dt: float) -> void:
 		for card in draft_cards:
 			card.armed = _arm_done
 			card.tick(dt)
+	# 商店：同样的装填进度
+	if shop_layer.visible:
+		_shop_arm_t = minf(Main.DRAFT_ARM, _shop_arm_t + dt)
+		_shop_arm_done = _shop_arm_t >= Main.DRAFT_ARM
+		shop_arm.set01(_shop_arm_t / maxf(0.001, Main.DRAFT_ARM))
+		shop_arm.ready_now = _shop_arm_done
+		shop_hint.add_theme_color_override("font_color",
+			C_GOLD_HI if _shop_arm_done else C_DIM)
+		for row in shop_rows:
+			row.tick(dt)
 	for chip in skill_chips:
 		chip.tick(dt)
 	if overlay.visible:
@@ -683,13 +850,18 @@ const EMBLEMS := {
 }
 
 
-func show_draft(items: Array, index: int, armed := true) -> void:
+## 三选一 / 宝箱共用这一个面板。title / subtitle 留空就用三选一的默认文案，
+## 开宝箱时由 main 传入"箱底的兵器"。
+func show_draft(items: Array, index: int, armed := true,
+		title := "", subtitle := "", hint := "") -> void:
 	var was_visible := draft_layer.visible
 	draft_layer.visible = true
 	if not was_visible:
 		_arm_t = 0.0
 		_arm_done = false
-	draft_title.text = "清空了一片影子"
+	draft_title.text = title if title != "" else "清空了一片影子"
+	draft_sub.text = subtitle if subtitle != "" else "Q / E 左右看，空格拿走。看清楚了再按。"
+	draft_hint.text = hint if hint != "" else "Q ◀　　▶ E　移动高亮　·　空格 / 回车 拿走　·　Esc 放弃这次"
 	draft_arm.set01(_arm_t / maxf(0.001, Main.DRAFT_ARM))
 	draft_arm.ready_now = _arm_done
 	for i in draft_cards.size():
@@ -705,6 +877,35 @@ func hide_draft() -> void:
 	draft_layer.visible = false
 	_arm_t = 0.0
 	_arm_done = false
+
+
+# ---------------------------------------------------------------- 守灯人的商店
+
+func show_shop(items: Array, index: int, coins: int, armed := true) -> void:
+	var was_visible := shop_layer.visible
+	shop_layer.visible = true
+	if not was_visible:
+		_shop_arm_t = 0.0
+		_shop_arm_done = false
+	shop_sub.text = "你身上有 %d 灯火　·　买下的东西放进背包" % coins
+	shop_arm.set01(_shop_arm_t / maxf(0.001, Main.DRAFT_ARM))
+	shop_arm.ready_now = _shop_arm_done
+	for i in shop_rows.size():
+		var row: ShopRow = shop_rows[i]
+		if i >= items.size():
+			row.visible = false
+			continue
+		row.visible = true
+		row.set_item(items[i], i, armed)
+		row.set_selected(i == index)
+	shop_hint.add_theme_color_override("font_color",
+		C_GOLD_HI if _shop_arm_done else C_DIM)
+
+
+func hide_shop() -> void:
+	shop_layer.visible = false
+	_shop_arm_t = 0.0
+	_shop_arm_done = false
 
 
 # ================================================================ 自绘控件
@@ -967,7 +1168,9 @@ class DraftCard extends Control:
 		selected = sel
 		var kind := str(it.get("kind", "boon"))
 		var tint: Color = Hud.CARD_WEAPON if kind == "weapon" else Hud.CARD_BOON
-		kind_label.text = "换武器" if kind == "weapon" else "恩赐"
+		# 开箱的武器写的是"入背包"（由 item 自己带），三选一换武器才是"换武器"
+		kind_label.text = str(it.get("kind_label",
+			"换武器" if kind == "weapon" else "恩赐"))
 		kind_label.add_theme_color_override("font_color", tint)
 		name_label.text = str(it["name"])
 		desc_label.text = str(it["desc"])
@@ -1025,6 +1228,144 @@ class DraftCard extends Control:
 		# 未装填：整张卡压暗一点，提示"还不能按"
 		if not armed:
 			draw_rect(rect, Color(0.0, 0.0, 0.0, 0.28))
+
+
+## 商店的一行：左名字 + 右价钱，下一行说明。
+## 买不起（ok=false）就整体压暗并划掉价钱 —— 与三选一的"还不能按"一个道理：
+## 把"这个现在买不了"变成看得见的东西，而不是让玩家以为是按键坏了。
+##
+## 注意行宽写死（ROW_W）而不是读 size.x：set_item 可能在布局落定之前被调用，
+## 那时 size 还是 0，价钱会飘到屏幕外。
+class ShopRow extends Control:
+	const ROW_W := 680.0
+	const ROW_H := 76.0
+
+	var slot := 0
+	var base_pos := Vector2.ZERO
+	var item: Dictionary = {}
+	var selected := false
+	var armed := true
+	var _built := false
+	var _t := 0.0
+	var _lift := 0.0
+	var name_label: Label
+	var price_label: Label
+	var desc_label: Label
+	var _sb := StyleBoxFlat.new()
+	var _bd := StyleBoxFlat.new()
+
+	func _ready() -> void:
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_bd.bg_color = Color(0, 0, 0, 0)
+		queue_redraw()
+
+	func ensure_children() -> void:
+		if _built:
+			return
+		_built = true
+		name_label = Label.new()
+		name_label.add_theme_font_override("font", Art.font_disp)
+		name_label.add_theme_font_size_override("font_size", 24)
+		name_label.add_theme_color_override("font_color", Hud.C_GOLD_HI)
+		name_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.85))
+		name_label.add_theme_constant_override("outline_size", 6)
+		name_label.position = Vector2(20, 7)
+		name_label.size = Vector2(320, 32)
+		add_child(name_label)
+
+		price_label = Label.new()
+		price_label.add_theme_font_override("font", Art.font_disp)
+		price_label.add_theme_font_size_override("font_size", 20)
+		price_label.add_theme_color_override("font_color", Hud.C_EMBER)
+		price_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.85))
+		price_label.add_theme_constant_override("outline_size", 5)
+		price_label.position = Vector2(ROW_W - 190.0, 10)
+		price_label.size = Vector2(170, 28)
+		price_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		add_child(price_label)
+
+		desc_label = Label.new()
+		desc_label.add_theme_font_override("font", Art.font)
+		desc_label.add_theme_font_size_override("font_size", 14)
+		desc_label.add_theme_color_override("font_color", Color(0.84, 0.83, 0.79))
+		desc_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.8))
+		desc_label.add_theme_constant_override("outline_size", 4)
+		desc_label.position = Vector2(22, 42)
+		desc_label.size = Vector2(ROW_W - 44.0, 30)
+		desc_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		add_child(desc_label)
+
+	func set_item(it: Dictionary, i: int, is_armed := true) -> void:
+		ensure_children()
+		item = it
+		slot = i
+		armed = is_armed
+		queue_redraw()
+
+	func set_selected(sel: bool) -> void:
+		selected = sel
+		queue_redraw()
+
+	## 高亮：上浮 + 描边（不缩放 —— 一行文本缩放会糊）
+	func tick(dt: float) -> void:
+		_t += dt
+		var ok := bool(item.get("ok", true))
+		var tint := Hud.C_GOLD_HI if ok else Hud.C_MUTE
+		name_label.text = str(item.get("name", ""))
+		name_label.add_theme_color_override("font_color",
+			Hud.C_GOLD_HI if (selected and ok) else (Hud.C_INK if ok else Hud.C_DIM))
+		var pr := int(item.get("price", 0))
+		price_label.text = "—" if pr <= 0 else "%d 灯火" % pr
+		price_label.add_theme_color_override("font_color",
+			Hud.C_EMBER if ok else Hud.C_DIM)
+		desc_label.text = str(item.get("desc", ""))
+		desc_label.modulate = Color(1, 1, 1, 1.0 if ok else 0.55)
+		var want := 1.0 if selected else 0.0
+		_lift = lerpf(_lift, want, minf(1.0, dt * 12.0))
+		position = base_pos + Vector2(0.0, -5.0 * _lift)
+
+	func _draw() -> void:
+		if item.is_empty():
+			return
+		var ok := bool(item.get("ok", true))
+		var rect := Rect2(Vector2.ZERO, Vector2(ROW_W, ROW_H))
+		var tint := Hud.C_GOLD_HI if ok else Hud.C_MUTE
+		var r := 8.0
+		# 选中：一圈辉光
+		if selected:
+			var g := 0.5 + 0.16 * sin(_t * 4.0)
+			for i in range(5, 0, -1):
+				var t := float(i) / 5.0
+				var pad := 2.0 + t * 12.0
+				_sb.bg_color = Color(tint.r, tint.g, tint.b, g * (1.0 - t) * 0.18)
+				_sb.set_corner_radius_all(int(r + pad * 0.6))
+				draw_style_box(_sb, rect.grow(pad))
+		# 行底：上浅下深的渐变
+		var bands := 14
+		for i in bands:
+			var t0 := float(i) / float(bands)
+			var c := Color(0.115, 0.135, 0.185).lerp(Color(0.040, 0.050, 0.075), t0)
+			if not ok:
+				c = c.darkened(0.28)
+			elif selected:
+				c = c.lerp(Color(0.30, 0.26, 0.16), 0.42)
+			_sb.bg_color = c
+			_sb.set_corner_radius_all(0)
+			var y0 := rect.position.y + rect.size.y * t0
+			var y1 := rect.position.y + rect.size.y * float(i + 1) / float(bands)
+			draw_rect(Rect2(rect.position.x + 1.0, y0, rect.size.x - 2.0, y1 - y0 + 0.8), c)
+		# 左侧一道色条：一眼看出"这行是干嘛的"
+		_sb.bg_color = Color(tint.r, tint.g, tint.b, 0.85 if ok else 0.35)
+		_sb.set_corner_radius_all(2)
+		draw_style_box(_sb, Rect2(rect.position.x + 6.0, rect.position.y + 8.0, 4.0, rect.size.y - 16.0))
+		# 描边
+		_bd.border_color = Color(tint.r, tint.g, tint.b, 0.95 if selected else 0.26)
+		_bd.set_border_width_all(2 if selected else 1)
+		_bd.set_corner_radius_all(int(r))
+		draw_style_box(_bd, rect)
+		# 还不能按（装填中）：压暗一层
+		if selected and not armed:
+			draw_rect(rect, Color(0.0, 0.0, 0.0, 0.26))
 
 
 ## 装填进度条：三选一面板刚弹出时，确认键故意不生效 ——

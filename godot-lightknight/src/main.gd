@@ -14,7 +14,7 @@ var manual := false
 var world: World
 var hud: Hud
 
-## title | play | dialogue | menu | draft
+## title | play | dialogue | menu | draft | shop
 var state := "title"
 
 var prog := {
@@ -22,6 +22,9 @@ var prog := {
 	"up": {"hp": 0, "light": 0, "edge": 0},
 	"shop": {"ember": 0, "brightoil": 0},
 	"weapon": "blade",
+	## 背包栏：备用武器（"" = 空）与武器词条表（{武器id: [{id,lv}]}）
+	"bag_weapon": "",
+	"waffix": {},
 	"kills": 0, "deaths": 0, "max_combo": 0,
 	## 当前关卡（0 = 灯堡外庭，1 = 灯堡深处·无芯之暗）
 	"level": 0,
@@ -38,12 +41,28 @@ var _pending_dlg := []
 var _clear_pending := false
 var _menu_kind := ""
 
-## 三选一
+## 三选一 / 宝箱（共用同一套冻结态与输入规则，只有"拿走之后干什么"不同）
 var _pending_draft := false
 var _draft_items := []
 var _draft_index := 0
+## "draft" = 清波三选一，"chest" = 开宝箱。决定 _take_draft 该调哪个 apply。
+var _panel_kind := "draft"
+## 面板被别的东西挡住时（正在播对白）先记下来
+var _pending_chest := []
+## 当前面板的文案。**必须存着**：Q/E 移动高亮时会重新调 show_draft(),
+## 不带上这三行的话，宝箱面板一按方向键就会退回三选一的默认标题。
+var _panel_title := ""
+var _panel_sub := ""
+var _panel_hint := ""
 ## 自检用：面板打开过几次（"确实走到了肉鸽循环"的可核对证据）
 var draft_opens := 0
+var chest_opens := 0
+
+## 守灯人商店
+var _shop_items := []
+var _shop_index := 0
+var _pending_shop := false
+var shop_opens := 0
 
 
 func _ready() -> void:
@@ -85,11 +104,17 @@ func show_title() -> void:
 	prog["level"] = 0
 	prog["boons"] = {}
 	hud.hide_draft()
+	hud.hide_shop()
+	_pending_chest = []
+	_pending_shop = false
+	_panel_kind = "draft"
 	hud.show_overlay(
 		"灯 骑 士",
 		"第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗\n"
 		+ "「外庭的灯还亮着，这是你最好的日子。」\n\n"
 		+ "WASD 移动　鼠标瞄准　J 挥击　Shift 冲刺　1/2/3 技能　E 交互\n"
+		+ "X 换手（手持 ↔ 背包武器）　C 喝灯油（背包里的回血道具）\n"
+		+ "地图上有宝箱，能开出带词条的武器；守灯人能重铸 / 锤炼武器、卖灯油。\n"
 		+ "清空一波会跳出三选一：Q / E 左右看，空格拿走。死了就重来一趟。\n"
 		+ "连击就是你的光：打得越顺，灯越亮；停下来，黑暗会咬住你。",
 		"按 空格 / 点击 开始"
@@ -108,7 +133,11 @@ func start_level() -> void:
 	_menu_kind = ""
 	_clear_pending = false
 	_pending_draft = false
+	_pending_chest = []
+	_pending_shop = false
+	_panel_kind = "draft"
 	hud.hide_draft()
+	hud.hide_shop()
 	hud.hide_overlay()
 	hud.show_dialogue(false)
 	if not skip_dialogue:
@@ -154,6 +183,8 @@ func advance(dt: float) -> void:
 			_menu_input()
 		"draft":
 			_draft_input(dt)
+		"shop":
+			_shop_input(dt)
 
 	if world != null:
 		_drain_events()
@@ -221,12 +252,12 @@ func _draft_input(dt: float) -> void:
 	if GameInput.just("draft_prev"):
 		_draft_index = (_draft_index - 1 + n) % n
 		Sound.play("ui")
-		hud.show_draft(_draft_items, _draft_index, _draft_armed())
+		_redraw_panel()
 		return
 	if GameInput.just("draft_next"):
 		_draft_index = (_draft_index + 1) % n
 		Sound.play("ui")
-		hud.show_draft(_draft_items, _draft_index, _draft_armed())
+		_redraw_panel()
 		return
 	if GameInput.just("pause"):
 		# 放弃这次：肉鸽里"跳过"也是一个正当选择
@@ -237,16 +268,45 @@ func _draft_input(dt: float) -> void:
 		_take_draft(_draft_index)
 
 
+## 重画当前面板（带上面存着的文案）。三选一 / 宝箱共用。
+func _redraw_panel() -> void:
+	hud.show_draft(_draft_items, _draft_index, _draft_armed(),
+		_panel_title, _panel_sub, _panel_hint)
+
+
 func _open_draft() -> void:
 	if world == null:
 		return
 	_draft_items = world.roll_draft()
 	_draft_index = 0
 	_draft_t = 0.0
+	_panel_kind = "draft"
+	_panel_title = ""
+	_panel_sub = ""
+	_panel_hint = ""
 	draft_opens += 1
 	state = "draft"
 	_menu_kind = ""
-	hud.show_draft(_draft_items, _draft_index, false)
+	_redraw_panel()
+	Sound.play("levelup")
+
+
+## 开宝箱：**和三选一共用同一个面板与同一套输入规则**（Q/E 移动、空格/回车拿走、Esc 放弃），
+## 只是"拿走之后"走的是 apply_chest（进背包）而不是 apply_draft（换手/加恩赐）。
+func _open_chest(items: Array) -> void:
+	if world == null:
+		return
+	_draft_items = items
+	_draft_index = 0
+	_draft_t = 0.0
+	_panel_kind = "chest"
+	_panel_title = "箱 底 的 兵 器"
+	_panel_sub = "Q / E 挑一把，空格放进背包。Esc 就不要了。"
+	_panel_hint = "Q ◀　　▶ E　移动高亮　·　空格 / 回车 放进背包　·　Esc 不要了"
+	chest_opens += 1
+	state = "draft"
+	_menu_kind = ""
+	_redraw_panel()
 	Sound.play("levelup")
 
 
@@ -258,10 +318,22 @@ func _request_draft() -> void:
 		_pending_draft = true
 
 
+## 宝箱的 items 由 world 在开箱那一刻 roll 好（世界只负责"箱子里有什么"）
+func _request_chest(items: Array) -> void:
+	if state == "play":
+		_open_chest(items)
+	else:
+		_pending_chest = items
+
+
 func _take_draft(i: int) -> void:
-	if i >= 0 and i < _draft_items.size() and world != null:
+	if i < 0 or i >= _draft_items.size() or world == null:
+		return
+	if _panel_kind == "chest":
+		world.apply_chest(_draft_items[i])
+	else:
 		world.apply_draft(_draft_items[i])
-		Sound.play("ui_big")
+	Sound.play("ui_big")
 	_close_draft()
 
 
@@ -269,13 +341,125 @@ func _close_draft() -> void:
 	hud.hide_draft()
 	_draft_items = []
 	_draft_index = 0
+	_panel_kind = "draft"
+	_panel_title = ""
+	_panel_sub = ""
+	_panel_hint = ""
+	_resume_play()
+
+
+## 面板（三选一 / 宝箱 / 商店）关掉之后：世界恢复推进，
+## 并接着做"刚才被面板挡住的那些事"（对白 → 三选一 → 结算）。
+## 三个面板共用这一段 —— 分成三份写必然会有某一份漏掉某个 pending。
+func _resume_play() -> void:
 	state = "play"
 	if not _pending_dlg.is_empty():
 		play_dialogue(_pending_dlg.pop_front())
 		return
+	if _pending_draft:
+		_pending_draft = false
+		_open_draft()
+		return
+	if not _pending_chest.is_empty():
+		var items: Array = _pending_chest
+		_pending_chest = []
+		_open_chest(items)
+		return
+	if _pending_shop:
+		_pending_shop = false
+		_open_shop()
+		return
 	if _clear_pending:
 		_clear_pending = false
 		_show_clear()
+
+
+# ---------------------------------------------------------------- 守灯人的商店
+#
+# 与三选一同样的输入规则（Q/E 移动、空格/回车 确认、Esc 离开），
+# **同样有装填窗口** —— 玩家是拿 E 把商店点开的，而确认键是空格，
+# 但"开商店那一刻手正按着空格在冲刺"是同一个误触路径，所以一视同仁。
+
+func _shop_input(dt: float) -> void:
+	_draft_t += dt
+	var n := _shop_items.size()
+	if n <= 0:
+		_close_shop()
+		return
+	if GameInput.just("draft_prev"):
+		_shop_index = (_shop_index - 1 + n) % n
+		Sound.play("ui")
+		_redraw_shop()
+		return
+	if GameInput.just("draft_next"):
+		_shop_index = (_shop_index + 1) % n
+		Sound.play("ui")
+		_redraw_shop()
+		return
+	if GameInput.just("pause"):
+		_close_shop()
+		return
+	if GameInput.just("confirm") and _draft_armed():
+		_buy(_shop_index)
+
+
+## 走进守灯人身边按 E 会收到 "shop" 事件；正在播对白的话先挂着
+func _request_shop() -> void:
+	if state == "play":
+		_open_shop()
+	else:
+		_pending_shop = true
+
+
+func _open_shop() -> void:
+	if world == null:
+		return
+	_shop_items = world.shop_items()
+	# "离开"由 main 补上（world 只管买卖，不管界面该有几行）
+	_shop_items.append({"id": "leave", "name": "离开", "price": 0,
+		"desc": "下次再带灯火来。", "ok": true})
+	_shop_index = 0
+	_draft_t = 0.0
+	shop_opens += 1
+	state = "shop"
+	_menu_kind = ""
+	_redraw_shop()
+	Sound.play("ui_big")
+
+
+func _redraw_shop() -> void:
+	if world == null:
+		return
+	hud.show_shop(_shop_items, _shop_index, int(prog["coins"]), _draft_armed())
+
+
+## 买 / 离开。买完**不关面板**，方便连着买；买不起只提示、不成交。
+func _buy(i: int) -> void:
+	if i < 0 or i >= _shop_items.size() or world == null:
+		return
+	var it: Dictionary = _shop_items[i]
+	if str(it["id"]) == "leave":
+		_close_shop()
+		return
+	if not bool(it["ok"]):
+		world.events.append({"type": "toast", "text": "灯火不够，先攒着。"})
+		Sound.play("ui")
+		return
+	world.buy_shop(str(it["id"]))
+	Sound.play("ui_big")
+	# 买完重算（灯油数量 / 词条 / 锤炼价钱都会变），高亮停在同一行
+	_shop_items = world.shop_items()
+	_shop_items.append({"id": "leave", "name": "离开", "price": 0,
+		"desc": "下次再带灯火来。", "ok": true})
+	_shop_index = clampi(_shop_index, 0, _shop_items.size() - 1)
+	_redraw_shop()
+
+
+func _close_shop() -> void:
+	hud.hide_shop()
+	_shop_items = []
+	_shop_index = 0
+	_resume_play()
 
 
 func restart_level() -> void:
@@ -311,6 +495,10 @@ func _drain_events() -> void:
 				Sound.play("levelup")
 			"draft":
 				_request_draft()
+			"chest":
+				_request_chest(e["items"])
+			"shop":
+				_request_shop()
 			"player_died":
 				_on_player_died()
 			_:
@@ -345,18 +533,7 @@ func _dlg_next() -> void:
 		return
 	hud.show_dialogue(false)
 	_dlg_lines = []
-	if not _pending_dlg.is_empty():
-		play_dialogue(_pending_dlg.pop_front())
-		return
-	if _pending_draft:
-		_pending_draft = false
-		_open_draft()
-		return
-	if _clear_pending:
-		_clear_pending = false
-		_show_clear()
-		return
-	state = "play"
+	_resume_play()
 
 
 func _on_player_died() -> void:
@@ -409,6 +586,11 @@ func debug_state() -> Dictionary:
 		"dialogue_open": hud.dlg_panel.visible if hud != null else false,
 		"overlay_visible": hud.overlay.visible if hud != null else false,
 		"draft_open": hud.draft_layer.visible if hud != null else false,
+		"panel_kind": _panel_kind,
+		"shop_open": hud.shop_layer.visible if hud != null else false,
+		"shop_index": _shop_index,
+		"shop_opens": shop_opens,
+		"chest_opens": chest_opens,
 		"level": int(prog["level"]),
 		"boon_count": prog["boons"].size() if typeof(prog["boons"]) == TYPE_DICTIONARY else 0,
 		"weapon": str(prog["weapon"]),
@@ -439,5 +621,16 @@ func debug_state() -> Dictionary:
 		d["respawn_count"] = world.respawn_count
 		d["has_girl"] = world.girl != null
 		d["girl_near"] = world.girl_near
+		# 背包 / 词条 / 宝箱
+		d["bag_weapon"] = str(world.prog.get("bag_weapon", ""))
+		d["potions"] = world.potion_count()
+		d["affix_count"] = world.weapon_affixes().size()
+		d["affix_lv_sum"] = world.affix_levels_sum()
+		var unopened := 0
+		for c in world.chests:
+			if not bool(c["opened"]):
+				unopened += 1
+		d["chests_left"] = unopened
+		d["chests_total"] = world.chests.size()
 	return d
 

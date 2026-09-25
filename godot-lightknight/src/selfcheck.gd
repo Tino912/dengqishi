@@ -66,6 +66,8 @@ func _run() -> void:
 	await _section_drops_death()
 	await _section_bot_playthrough()
 	await _section_level2()
+	await _section_bag_chest()
+	await _section_shop()
 	_finish()
 
 
@@ -83,13 +85,15 @@ func _num(name: String, v: float, shown := -999.0) -> void:
 
 ## 推进 n 个固定步（可同时按住若干键）。
 ##
-## 注意：有两种界面会让世界"停住"——`main.state == "dialogue"`（对白）和
-## `"draft"`（肉鸽三选一）。**两者都不调 world.step()**，所以只要有一个没被点掉，
+## 注意：有**三种**界面会让世界"停住"——`main.state == "dialogue"`（对白）、
+## `"draft"`（肉鸽三选一，**开宝箱也走这个状态**）和 `"shop"`（守灯人商店）。
+## **三者都不调 world.step()**，所以只要有一个没被点掉，
 ## 后面所有段落都会一起变红，症状是一大片看似无关的断言同时失败
 ## （敌人不动、镜头不跟、盲女不跟人走、灯不亮…），极难反查到真正的原因。
-## 所以这里默认两种都自己处理掉：对白按 confirm 翻页，三选一拿第一项。
+## 所以这里默认三种都自己处理掉：对白按 confirm 翻页，三选一/宝箱拿第一项，商店按 Esc 走人。
 ## 专门要验它们的那几段，把对应的 auto_* 关掉、自己接管输入。
-func _pump(n: int, hold := {}, auto_draft := true, auto_dialogue := true) -> void:
+func _pump(n: int, hold := {}, auto_draft := true,
+		auto_dialogue := true, auto_shop := true) -> void:
 	for k in hold.keys():
 		GameInput.set_override(str(k), hold[k])
 	for i in n:
@@ -101,6 +105,9 @@ func _pump(n: int, hold := {}, auto_draft := true, auto_dialogue := true) -> voi
 			continue
 		if auto_draft and main.state == "draft":
 			_resolve_draft(0)
+			continue
+		if auto_shop and main.state == "shop":
+			_tap("pause")     # Esc 离开商店
 			continue
 		main.advance(STEP)
 	if not hold.is_empty():
@@ -1449,6 +1456,432 @@ func _next_goal(w: World) -> Vector2:
 
 
 # ================================================================ 收尾
+
+## 等面板装填完成。**用真实步进等过去，不直接把计时器置满** ——
+## 直接置满就等于没验"装填窗口真的挡住了误触"这条规则。
+func _wait_arm() -> void:
+	var g := 0
+	while not main._draft_armed() and g < 120:
+		g += 1
+		main.advance(STEP)
+
+
+## 当前手持武器的词条签名（"变了没变"用）
+func _affix_sig_of(w: World) -> String:
+	var s := ""
+	for a in w.weapon_affixes():
+		s += "%s%d|" % [str(a["id"]), int(a["lv"])]
+	return s
+
+
+# ================================================================ 背包 / 换手 / 灯油 / 宝箱
+
+## 用户这一轮要的第一组功能：宝箱开武器、背包多带一把、X 换手、C 喝灯油。
+func _section_bag_chest() -> void:
+	# 这一段自己重开一次第一关：世界随机器全部重置，背包/词条从干净状态验。
+	# （放在所有段落之后，所以这里多推多少步都不会影响前面的断言。）
+	main.prog["level"] = 0
+	main.restart_level()
+	_pump(4)
+	var w := _w()
+	var p := _p()
+	p.invuln = 99999.0      # 只测背包，不让敌人打断
+	w.prog["bag_weapon"] = ""
+	w.prog["waffix"] = {}
+	w.prog["shop"]["oil_bank"] = 0
+	w.prog["weapon"] = "blade"
+	p.weapon_id = "blade"
+
+	# ── 宝箱：点位存在、初始是关着的 ──
+	_ok("第一关放了 2 个宝箱", w.chests.size() == 2, str(w.chests.size()))
+	var unopened := 0
+	for c in w.chests:
+		if not bool(c["opened"]):
+			unopened += 1
+	_ok("宝箱一开始都是没开过的", unopened == w.chests.size(),
+		"%d/%d" % [unopened, w.chests.size()])
+
+	# ── 走过去按 E 开箱 ──
+	var c0: Dictionary = w.chests[0]
+	w.teleport(float(c0["x"]) + 34.0, float(c0["y"]) + 30.0)
+	_pump(3)
+	_ok("靠近宝箱会出现交互提示", w.prompt.find("宝箱") >= 0, w.prompt)
+
+	# 开箱这一段**必须关掉自动处理**：要验的正是"面板真的弹出来了、里面是什么"
+	GameInput.clear_overrides()
+	_tap("interact")
+	_ok("按 E 打开宝箱（弹出选择面板）", main.state == "draft", main.state)
+	_ok("这是宝箱面板，不是清波三选一", main._panel_kind == "chest", main._panel_kind)
+	_ok("宝箱开出 3 把武器", main._draft_items.size() == 3 and _all_weapons(main._draft_items),
+		"%d 项" % main._draft_items.size())
+	var has_equipped := false
+	for it in main._draft_items:
+		if str((it as Dictionary)["id"]) == str(w.prog["weapon"]):
+			has_equipped = true
+	_ok("开出的 3 把里不含手上那把（不会开出重复的）", not has_equipped)
+	var all_affixed := true
+	for it in main._draft_items:
+		if (it as Dictionary).get("affix", []).is_empty():
+			all_affixed = false
+	_ok("开箱的武器都自带一条词条", all_affixed)
+
+	await _shot("13-chest")
+
+	# 刚踩过的坑：`_draft_input` 每次按方向键都会重调 show_draft()，
+	# 如果没把文案一起带上，宝箱面板一按 Q/E 就会退回三选一的默认标题。
+	_tap("draft_next")
+	_ok("宝箱面板按方向键移动后，标题与底部提示不会被重置成三选一",
+		main.hud.draft_title.text.find("箱") >= 0
+		and main.hud.draft_hint.text.find("背包") >= 0,
+		"%s / %s" % [main.hud.draft_title.text, main.hud.draft_hint.text])
+	_tap("draft_prev")
+
+	# ── 拿走**中间那张**：验"高亮在哪、拿走的就得是哪张" ──
+	var idx := 1
+	var target: Dictionary = main._draft_items[idx]
+	var wid := str(target["id"])
+	var mv := 0
+	while main._draft_index != idx and mv < 8:
+		mv += 1
+		_tap("draft_next")
+	_wait_arm()
+	_tap("confirm")
+	_ok("宝箱选中的就是高亮那一张", str(w.prog["bag_weapon"]) == wid,
+		"高亮第 %d 张 → 背包 %s" % [idx, str(w.prog["bag_weapon"])])
+	_ok("宝箱武器进的是**背包**，不是直接换上",
+		str(w.prog["weapon"]) == "blade", str(w.prog["weapon"]))
+	_ok("开箱后世界恢复推进", main.state == "play", main.state)
+	_ok("这个宝箱记成已开（同一个箱子不能反复刷）", bool(c0["opened"]))
+
+	# ── 空箱子不再弹面板 ──
+	_tap("interact")
+	_ok("已经开过的宝箱不会再弹出面板", main.state == "play", main.state)
+
+	# ── 背包满时：新武器换掉旧的，旧的被搁下 ──
+	var bag_before := str(w.prog["bag_weapon"])
+	var c1: Dictionary = w.chests[1]
+	w.teleport(float(c1["x"]) + 30.0, float(c1["y"]) + 26.0)
+	_pump(3)
+	_tap("interact")
+	_ok("第二个宝箱能开", main.state == "draft" and main._panel_kind == "chest", main.state)
+	var wid2 := str((main._draft_items[0] as Dictionary)["id"])
+	_wait_arm()
+	_tap("confirm")
+	_ok("背包已满时，开箱会把新的放进去、旧的换下来",
+		str(w.prog["bag_weapon"]) == wid2 and bag_before != wid2,
+		"%s -> %s" % [bag_before, str(w.prog["bag_weapon"])])
+
+	# ── X 换手 ──
+	_ok("两把武器不是同一把（换手才验得出来）",
+		str(w.prog["weapon"]) != str(w.prog["bag_weapon"]),
+		"%s / %s" % [str(w.prog["weapon"]), str(w.prog["bag_weapon"])])
+	var hand_before := str(w.prog["weapon"])
+	var bag_now := str(w.prog["bag_weapon"])
+	_tap("swap_weapon")
+	_ok("按 X 与背包武器互换",
+		str(w.prog["weapon"]) == bag_now and str(w.prog["bag_weapon"]) == hand_before,
+		"%s/%s -> %s/%s" % [hand_before, bag_now,
+			str(w.prog["weapon"]), str(w.prog["bag_weapon"])])
+	_ok("换手后玩家手上真的换了武器（不只是改字典）", p.weapon_id == bag_now, p.weapon_id)
+	# 换手要能影响派生属性：词条是挂在武器 id 上的
+	w.prog["waffix"] = {"blade": [{"id": "edge", "lv": 1}], bag_now: []}
+	_tap("swap_weapon")
+	_ok("换手换回原来那把，且它的词条跟着回来（词条挂在武器上，不是挂在「手上」）",
+		str(w.prog["weapon"]) == hand_before and w.affix_lv("edge") == 1,
+		"weapon=%s edge_lv=%d" % [str(w.prog["weapon"]), w.affix_lv("edge")])
+	_tap("swap_weapon")
+	_ok("手持那把没词条的武器时，「锋」的等级回到 0", w.affix_lv("edge") == 0,
+		str(w.affix_lv("edge")))
+
+	# ── 背包空时按 X 不该把自己缴械 ──
+	w.prog["bag_weapon"] = ""
+	var w3 := str(w.prog["weapon"])
+	_tap("swap_weapon")
+	_ok("背包是空的时候按 X 不换手（不会把自己缴械）",
+		str(w.prog["weapon"]) == w3 and str(w.prog["bag_weapon"]) == "",
+		"%s / bag=%s" % [str(w.prog["weapon"]), str(w.prog["bag_weapon"])])
+
+	# ── C 喝灯油 ──
+	p.hp = p.max_hp * 0.30
+	_tap("use_potion")
+	_ok("背包里没有灯油时按 C 不回血", w.potion_count() == 0
+		and is_equal_approx(p.hp, p.max_hp * 0.30), "hp=%.1f" % p.hp)
+
+	w.prog["shop"]["oil_bank"] = 2
+	var hp_low := p.hp
+	_tap("use_potion")
+	var healed := p.hp - hp_low
+	_ok("按 C 喝灯油会回血", healed > 1.0, "%.1f -> %.1f" % [hp_low, p.hp])
+	_ok("回血量正好是 45% 最大生命",
+		is_equal_approx(snappedf(healed, 0.01), snappedf(p.max_hp * 0.45, 0.01)),
+		"%.2f vs %.2f" % [healed, p.max_hp * 0.45])
+	_ok("喝一件灯油，背包里的数量 -1（2 -> 1）", w.potion_count() == 1, str(w.potion_count()))
+
+	p.hp = p.max_hp
+	_tap("use_potion")
+	_ok("满血按 C 不会白白浪费灯油", w.potion_count() == 1 and is_equal_approx(p.hp, p.max_hp),
+		"药=%d hp=%.1f" % [w.potion_count(), p.hp])
+
+	# ── 背包栏截图（右下角：手持 + 词条 + 备用 + 灯油）──
+	w.prog["waffix"]["blade"] = [{"id": "edge", "lv": 2}, {"id": "vamp", "lv": 1}]
+	w.prog["weapon"] = "blade"
+	p.weapon_id = "blade"
+	w.prog["bag_weapon"] = "staff"
+	w.prog["shop"]["oil_bank"] = 3
+	_pump(2)
+	_ok("背包栏的三个数都对得上（手持 / 备用 / 灯油）",
+		w.affix_list().size() == 2 and w.potion_count() == 3 and str(w.prog["bag_weapon"]) == "staff",
+		"词条%d 药%d 备用%s" % [w.affix_list().size(), w.potion_count(), str(w.prog["bag_weapon"])])
+	report["samples"]["bag"] = {
+		"weapon": str(w.prog["weapon"]), "bag_weapon": str(w.prog["bag_weapon"]),
+		"potions": w.potion_count(), "affix": _affix_sig_of(w),
+	}
+	report["samples"]["chest"] = {
+		"per_level": w.chests.size(),
+		"weapon_pool": Content.WEAPONS.size(),
+		"equipped_excluded": true,
+		"affix_per_chest_weapon": 1,
+	}
+	await _shot("14-bag")
+
+
+## 把 items 全判成武器
+func _all_weapons(items: Array) -> bool:
+	for it in items:
+		if str((it as Dictionary).get("kind", "")) != "weapon":
+			return false
+	return not items.is_empty()
+
+
+# ================================================================ 守灯人：重铸 / 锤炼 / 买灯油
+
+## 用户这一轮要的第二组功能：守灯人能给武器加词条（重铸 / 锤炼），以及卖灯油。
+func _section_shop() -> void:
+	var w := _w()
+	var p := _p()
+	p.invuln = 99999.0
+	p.dead = false
+	var m: Dictionary = w.merchant_prop
+	_ok("第一关有守灯人", not m.is_empty())
+	if m.is_empty():
+		return
+	w.teleport(float(m["x"]) + 30.0, float(m["y"]) + 30.0)
+	_pump(3)
+	_ok("靠近守灯人会提示可以交谈", w.prompt.find("守灯人") >= 0, w.prompt)
+
+	# 钱给够方便验买卖；词条清零，从"裸武器"开始
+	w.prog["coins"] = 400
+	w.prog["waffix"] = {}
+	w.prog["weapon"] = "blade"
+	p.weapon_id = "blade"
+	# 第一次交谈的判定要确定：显式清掉"已经聊过"的标记
+	w.prog.erase("keeper_talked")
+
+	# ── 第一次交谈：先讲故事，讲完才开商店 ──
+	GameInput.clear_overrides()
+	_tap("interact")
+	_ok("第一次和守灯人交谈会先讲两句", main.state == "dialogue", main.state)
+	var g := 0
+	while main.state == "dialogue" and g < 60:
+		g += 1
+		_tap("confirm")
+	_ok("对白讲完自动打开商店（对白挡住的面板会补开）", main.state == "shop", main.state)
+	_ok("商店四行：买灯油 / 重铸 / 锤炼 / 离开",
+		main._shop_items.size() == 4, str(main._shop_items.size()))
+	_ok("商店的三个服务项与 world.shop_items() 一致",
+		str((main._shop_items[0] as Dictionary)["id"]) == "oil"
+		and str((main._shop_items[1] as Dictionary)["id"]) == "reforge"
+		and str((main._shop_items[2] as Dictionary)["id"]) == "temper"
+		and str((main._shop_items[3] as Dictionary)["id"]) == "leave")
+
+	# ── ① 买灯油：扣灯火，进背包（不是当场回血）──
+	_wait_arm()
+	var pots0 := w.potion_count()
+	var coins_a := int(w.prog["coins"])
+	p.hp = p.max_hp * 0.4
+	var hp_before_buy := p.hp
+	main._shop_index = 0
+	_tap("confirm")
+	_ok("在守灯人处买灯油会扣掉 22 灯火",
+		int(w.prog["coins"]) == coins_a - w.shop_oil_price(),
+		"%d -> %d" % [coins_a, int(w.prog["coins"])])
+	_ok("买到的灯油是**放进背包**（当场不回血）",
+		w.potion_count() == pots0 + 1 and is_equal_approx(p.hp, hp_before_buy),
+		"药 %d->%d hp=%.1f" % [pots0, w.potion_count(), p.hp])
+	_ok("买完商店还开着（可以连着买）", main.state == "shop", main.state)
+
+	# ── ② 灯火不够时买不成 ──
+	var pots1 := w.potion_count()
+	w.prog["coins"] = 3
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	main._shop_index = 0
+	_tap("confirm")
+	_ok("灯火不够时买灯油不成，也不扣钱",
+		w.potion_count() == pots1 and int(w.prog["coins"]) == 3,
+		"药=%d 灯火=%d" % [w.potion_count(), int(w.prog["coins"])])
+	# 面板的 ok 标记可能来自上一次刷新，所以 world 自己必须再拦一道 ——
+	# 直接调世界层的入口验一次（这才是真正的钱包守卫）
+	_ok("world 层自己也拦一道：灯火不够时 buy_oil() 直接拒绝",
+		not w.buy_oil() and w.potion_count() == pots1 and int(w.prog["coins"]) == 3,
+		"药=%d 灯火=%d" % [w.potion_count(), int(w.prog["coins"])])
+
+	# ── ③ 重铸：词条全部推倒重来 ──
+	w.prog["coins"] = 400
+	w.prog["waffix"]["blade"] = [{"id": "edge", "lv": 3}]
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	var sig_before := _affix_sig_of(w)
+	var coins_b := int(w.prog["coins"])
+	main._shop_index = 1
+	_tap("confirm")
+	_ok("重铸扣掉 45 灯火",
+		int(w.prog["coins"]) == coins_b - w.reforge_price(),
+		"%d -> %d" % [coins_b, int(w.prog["coins"])])
+	_ok("重铸之后词条真的变了（不是原样留着）",
+		_affix_sig_of(w) != sig_before, "%s -> %s" % [sig_before, _affix_sig_of(w)])
+	var af := w.weapon_affixes()
+	_ok("重铸后词条条数在 1~3 之间", af.size() >= 1 and af.size() <= Content.AFFIX_MAX,
+		str(af.size()))
+	var lv1 := true
+	for a in af:
+		if int(a["lv"]) != 1:
+			lv1 = false
+	_ok("重铸把词条等级全部归 1", lv1, _affix_sig_of(w))
+	var uniq := {}
+	for a in af:
+		uniq[str(a["id"])] = true
+	_ok("重铸出的词条不重复", uniq.size() == af.size(), _affix_sig_of(w))
+
+	# ── ④ 锤炼：没满就加一条；价钱随等级之和上涨 ──
+	w.prog["coins"] = 400
+	w.prog["waffix"]["blade"] = []
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	var base_price := w.temper_price()
+	var coins_c := int(w.prog["coins"])
+	main._shop_index = 2
+	_tap("confirm")
+	_ok("锤炼给裸武器添上第一条词条", w.weapon_affixes("blade").size() == 1,
+		_affix_sig_of(w))
+	_ok("锤炼扣掉应付的灯火（30 + 15×已有等级和）",
+		int(w.prog["coins"]) == coins_c - base_price, "%d -> %d" % [coins_c, int(w.prog["coins"])])
+	_ok("练过之后价钱变贵（不是固定价）",
+		w.temper_price() > base_price, "%d -> %d" % [base_price, w.temper_price()])
+
+	# ── ⑤ 满 3 条时：锤炼改为"升一级"，而不是加第四条 ──
+	w.prog["coins"] = 4000
+	w.prog["waffix"]["blade"] = [
+		{"id": "edge", "lv": 1}, {"id": "swift", "lv": 1}, {"id": "reach", "lv": 1}]
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	main._shop_index = 2
+	_tap("confirm")
+	_ok("词条满 3 条后，锤炼改成升一级（不再加第四条）",
+		w.weapon_affixes("blade").size() == 3 and w.affix_levels_sum("blade") == 4,
+		"%d 条 / 等级和 %d" % [w.weapon_affixes("blade").size(), w.affix_levels_sum("blade")])
+
+	# ── ⑥ 全部练到等级上限后：不再受理，也不再收钱 ──
+	w.prog["waffix"]["blade"] = [
+		{"id": "edge", "lv": Content.AFFIX_LV_MAX},
+		{"id": "swift", "lv": Content.AFFIX_LV_MAX},
+		{"id": "reach", "lv": Content.AFFIX_LV_MAX}]
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	main._shop_index = 2
+	var temper_ok := bool((main._shop_items[2] as Dictionary)["ok"])
+	var coins_d := int(w.prog["coins"])
+	_tap("confirm")
+	_ok("词条全部到上限后，锤炼不可点了（也标注为买不了）", not temper_ok)
+	_ok("练满之后按确认不会扣钱（不收冤枉钱）",
+		int(w.prog["coins"]) == coins_d, str(int(w.prog["coins"])))
+
+	# ── 商店截图（高亮停在"锤炼"上）──
+	main._shop_items = w.shop_items()
+	main._shop_items.append({"id": "leave", "name": "离开", "price": 0, "desc": "", "ok": true})
+	main._shop_index = 2
+	main._redraw_shop()
+	await _shot("15-shop")
+
+	# ── ⑦ 词条真的进了派生属性（不是只躺在字典里）──
+	# 把别的倍率来源全部清零，只留下词条这一个变量
+	w.prog["waffix"] = {}
+	w.prog["boons"] = {}
+	w.boons = w.prog["boons"]
+	w.prog["up"] = {"hp": 0, "light": 0, "edge": 0}
+	w.prog["shop"]["brightoil"] = 0
+	w.prog["weapon"] = "blade"
+	p.weapon_id = "blade"
+	p.combo = 0.0
+	p.glow = 0.0
+	p.shield_t = 0.0
+	var d0 := w.damage_mul()
+	var cd0 := w.attack_cd_mul()
+	var rc0 := w.reach_mul()
+	var cr0 := w.crit_chance()
+	var lr0 := w.player_light_radius()
+	var cb0 := w.combo_bonus()
+	var sc0 := w.skill_cost(4)
+
+	w.prog["waffix"]["blade"] = [{"id": "edge", "lv": 2}]
+	_ok("词条「锋」真的进了伤害倍率（+24%）",
+		is_equal_approx(snappedf(w.damage_mul(), 0.001), snappedf(d0 * 1.24, 0.001)),
+		"%.4f -> %.4f" % [d0, w.damage_mul()])
+	w.prog["waffix"]["blade"] = [{"id": "swift", "lv": 1}]
+	_ok("词条「疾」真的减了挥击冷却（×0.90）",
+		is_equal_approx(snappedf(w.attack_cd_mul(), 0.001), snappedf(cd0 * 0.90, 0.001)),
+		"%.4f -> %.4f" % [cd0, w.attack_cd_mul()])
+	w.prog["waffix"]["blade"] = [{"id": "reach", "lv": 1}]
+	_ok("词条「远」真的加了攻击范围（+0.12）",
+		is_equal_approx(snappedf(w.reach_mul(), 0.001), snappedf(rc0 + 0.12, 0.001)),
+		"%.4f -> %.4f" % [rc0, w.reach_mul()])
+	w.prog["waffix"]["blade"] = [{"id": "crit", "lv": 1}]
+	_ok("词条「锐」真的加了暴击率（+0.08）",
+		is_equal_approx(snappedf(w.crit_chance(), 0.001), snappedf(cr0 + 0.08, 0.001)),
+		"%.4f -> %.4f" % [cr0, w.crit_chance()])
+	w.prog["waffix"]["blade"] = [{"id": "shine", "lv": 1}]
+	_ok("词条「明」真的加了光照半径（+22）",
+		is_equal_approx(snappedf(w.player_light_radius(), 0.01), snappedf(lr0 + 22.0, 0.01)),
+		"%.2f -> %.2f" % [lr0, w.player_light_radius()])
+	w.prog["waffix"]["blade"] = [{"id": "ember", "lv": 1}]
+	_ok("词条「火」真的给了额外连击（+0.15）",
+		is_equal_approx(snappedf(w.combo_bonus(), 0.001), snappedf(cb0 + 0.15, 0.001)),
+		"%.4f -> %.4f" % [cb0, w.combo_bonus()])
+	w.prog["waffix"]["blade"] = [{"id": "frugal", "lv": 1}]
+	_ok("词条「省」真的减了技能连击消耗（4 -> 3）",
+		w.skill_cost(4) == sc0 - 1 and w.skill_cost(4) == 3,
+		"%d -> %d" % [sc0, w.skill_cost(4)])
+
+	# 词条「噬」：击杀真的回血
+	w.prog["waffix"]["blade"] = [{"id": "vamp", "lv": 1}]
+	p.hp = p.max_hp - 40.0
+	var e := w.spawn_enemy("shade", p.x + 46.0, p.y)
+	_force_kill(w, e)
+	_ok("词条「噬」击杀真的回血 3 点",
+		is_equal_approx(snappedf(p.hp, 0.01), snappedf(p.max_hp - 37.0, 0.01)),
+		"%.2f（应为 %.2f）" % [p.hp, p.max_hp - 37.0])
+
+	# 收尾：这一段的数字写进报告
+	report["samples"]["shop"] = {
+		"oil_price": w.shop_oil_price(),
+		"reforge_price": w.reforge_price(),
+		"temper_price_now": w.temper_price(),
+		"temper_base": Content.SHOP["temper_base"],
+		"temper_step": Content.SHOP["temper_step"],
+		"affix_max": Content.AFFIX_MAX,
+		"affix_lv_max": Content.AFFIX_LV_MAX,
+		"affix_pool": Content.AFFIX_ORDER.size(),
+	}
+	_num("重铸价钱", 0.0, w.reforge_price())
+	_num("锤炼基础价钱", 0.0, Content.SHOP["temper_base"])
+	_ok("词条池一共 8 条", Content.AFFIX_ORDER.size() == 8, str(Content.AFFIX_ORDER.size()))
+
+	# 截图之后商店一直是开着的 —— 按 Esc 走人，顺便验"能正常离开"
+	_tap("pause")
+	_ok("按 Esc 离开商店，世界恢复推进", main.state == "play", main.state)
+	_pump(2)
+	_ok("离开后商店面板确实藏起来了（遮罩不会留着）", not main.hud.shop_layer.visible)
+
 
 func _finish() -> void:
 	# 肉鸽循环的总体证据：整趟跑下来确实反复发生了三选一
