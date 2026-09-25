@@ -180,7 +180,8 @@
 - 仓库原来**没有 `.gitignore`**，`.godot/` 缓存、`node_modules/`、`.Trash-0/`（桌面回收站）
   全被跟踪，是噪音与冲突的主要来源。已加 `.gitignore` 并把这三类**移出跟踪**
   （`git rm -r --cached`，磁盘文件未删）。`shots/` 与 `dist/` **保持跟踪**（是给人看的产物）。
-- 提交历史：`7b95646`（基线）→ `c5e8ed2`（宝箱/背包/守灯人那轮）→ `64886d7`（清理 + .gitignore）。
+- 提交历史：`7b95646`（基线）→ `c5e8ed2`（宝箱/背包/守灯人那轮）→ `64886d7`（清理 + .gitignore）
+  → `e9c6ba6`（修回全屏闪光残留 ×2 + 三选一徽记错位，+8 断言）→ **`9d6d361`（宝箱与敌人落点每局随机生成，+9 断言）**。
 - ✅ **那三个 bug 我们已自己重新实现**（2026-09-25，不是 cherry-pick；PR 的 diff 套不上，
   因为宝箱那轮改过同样的 4 个文件）。原 PR = fork `maxlen727/LightKnight-rev@fix/godot-fx-residual`，
   提交 `55cb837`，原合并提交 `1a9f2a8`（已被强推掉，但 GitHub 永久保留 `refs/pull/1/head`，
