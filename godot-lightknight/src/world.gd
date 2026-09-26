@@ -1199,6 +1199,17 @@ func step(dt_raw: float) -> void:
 	# 迷雾在光照之后同步：它要读这一帧灯的位置（`light_rig.src_*`）。
 	if fog != null:
 		fog.sync(self, dt)
+	mark_redraw()
+
+
+## 标脏两个绘制层（世界 + 叠加层）。
+##
+## ⚠️ **手动模式下（`main.manual = true`）世界不会自己重绘** —— `_process` 直接返回。
+## 所以"改了状态要让画面跟上"必须显式叫醒它。自检里那种"冻结世界、只改一个变量
+## 再取图"的对照探针全靠这个：漏了它，每一帧取到的都是同一张画 ——
+## 而且差异会是**精确的 0.0000**（不是"差不多一样"）。
+## 看到两个应当不同的画面差异为 0，先怀疑这里，别去怀疑姿态算错了。
+func mark_redraw() -> void:
 	queue_redraw()
 	# 叠加层是独立的 CanvasItem，它的内容完全由世界状态决定，
 	# 不显式标脏它就会一直停在最后一次重绘的画面（表现为"玩家脚下那圈光池
@@ -1302,6 +1313,10 @@ func _update_player(dt: float) -> void:
 		p.attack_cd -= dt
 	if p.attack_t > 0.0:
 		p.attack_t -= dt
+	# 技能姿态计时（只喂给绘制层，不参与判定）。与 attack_t 一样是**纯 dt 递减**，
+	# 所以固定步长下逐帧可复现。
+	if p.cast_t > 0.0:
+		p.cast_t -= dt
 	if p.invuln > 0.0:
 		p.invuln -= dt
 	if p.hurt_flash > 0.0:
@@ -1428,6 +1443,10 @@ func use_skill(index: int) -> void:
 	# 技能消耗连击——灯是有代价的
 	p.combo -= cost
 	p.skill_cd[sid] = float(sk["cd"]) * skill_cd_mul()
+	# 施法姿态：纯表现层，只给 Art 看，不参与任何战斗判定。
+	# 类别由技能 id 推出来（Pose.cast_kind_of），不用给 19 个技能各加一个字段。
+	p.cast_t = Pose.CAST_DUR
+	p.cast_kind = Pose.cast_kind_of(sid)
 	cast_skill(sid)
 	sfx("skill")
 	shake = minf(shake + 5.0, 14.0)

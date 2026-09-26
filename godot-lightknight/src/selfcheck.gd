@@ -90,6 +90,7 @@ func _run() -> void:
 	await _section_level3_art()
 	# 迷雾 / 夜色排在**最末**：这一段会重建世界、搬动玩家、还会把这一关的雾放掉。
 	await _section_fog_night()
+	await _section_pose_anim()
 	_finish()
 
 
@@ -3455,3 +3456,564 @@ func _finish() -> void:
 	print("[selfcheck] 截图与报告 -> ", ProjectSettings.globalize_path(OUT_DIR))
 	print("[selfcheck] 断言 %d/%d 通过" % [passed, _checks.size()])
 	get_tree().quit(0 if report["checks_all_pass"] else 1)
+
+# ================================================================ 姿态动画
+#
+# 这一段回答一个问题：**角色和武器真的「动「起来了吗** —— 而不是「看起来像在动」。
+# 四条判据其实全是数学命题，所以先直接问姿态求解器 `Pose`：
+#   ① 两条腿是不是**严格反相**（对侧步态），幅度是不是零（零 = 只是整体平移）；
+#   ② 挥击的角度是不是「先拉后扫」，且转折点就是武器表里的前摇占比；
+#   ③ 挥出的**峰值**角速度是不是远大于前摇、末尾是不是趋零（急停 = 打击感）；
+#   ④ 换武器 / 换技能，姿态是不是真的跟着变。
+# 然后再**用像素确认一遍**：算出来的姿态确实画到了屏幕上。
+# 算对了却没画出来（坐标错、被别的层盖住）是另一种失败，前四条全绿也抓不到。
+
+func _section_pose_anim() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	_pump(40)
+	var w := _w()
+	var p := _p()
+
+	# 清成「只有玩家和地板」。这一段必须**只有主角一个人**：盲女手里的引路灯
+	# 正好会叠在玩家身上，墙和道具会挡住或给玩家补光 —— 那样像素差异就说不清
+	# 是「姿态变了「还是「别的东西动了」。
+	for e in w.enemies:
+		e.dead = true
+	w.enemies.clear()
+	w.drops.clear()
+	w.projs.clear()
+	w.effects.clear()
+	w.props.clear()
+	w.walls.clear()
+	w.texts.clear()
+	w.girl = null
+	w.shake = 0.0
+	w.set_fog_enabled(false)      # 雾会把远处糊掉，画廊里只看角色
+	_pump(30)
+	# ⚠️ 这里**不要** teleport：`world.teleport()` 只搬玩家、**并不钉相机**，
+	# 于是人跑到屏幕外，下面裁出来的窗口里只有地板 —— 而"两帧完全一样"
+	# 会伪装成"姿态没变"（实测差异是精确的 0.0000，正是这个病的签名）。
+	# 改成：留在出生点（相机本来就在人身上），并且**按玩家的实际屏幕位置**算窗口。
+	var foot := Vector2(Proj.sx(p.x, w.draw_cam.x), Proj.sy(p.y, 0.0, w.draw_cam.y))
+	_num("玩家在屏幕上的 x", foot.x)
+	_num("玩家在屏幕上的 y", foot.y)
+	_ok("★ 玩家落在画面里（后面所有像素采样都建立在这一点上）",
+		foot.x > 100.0 and foot.x < 1180.0 and foot.y > 120.0 and foot.y < 660.0,
+		"(%.0f, %.0f)" % [foot.x, foot.y])
+	# 采样区域一律写成"相对脚底"的偏移，换位置也不用重算
+	# 裁剪窗既要有武器挥出去的空间，又要让 46px 高的人看得清骨架 ——
+	# 放大 3 倍后人物约 140px 高，腿、手臂、武器各自都分得出来。
+	var crop := Rect2i(int(foot.x) - 74, int(foot.y) - 108, 148, 132)
+	# 走路采样区：**只框膝以下**，判据才真的在盯腿。
+	# ⚠️ 第一版取的是 y ≥ −26（56×30），把斗篷下摆（最低 y = −13.0）与躯干底
+	# （y = −17.5）都框了进来 —— 于是"**把腿冻住**"的变异**打不红它**：
+	# 斗篷与躯干自己还在动，窗里照样有差异。判据要盯哪一层，采样区就得只装那一层。
+	# 现在取 y ≥ −12：这一段里只有小腿、脚、影子与地板
+	# （空手臂最低只到 y ≈ −20.5，武器在 y ≈ −23 附近，都够不进来）。
+	var r_legs := Rect2i(int(foot.x) - 16, int(foot.y) - 12, 32, 17)
+	var r_weapon := Rect2i(int(foot.x) - 44, int(foot.y) - 96, 156, 96)
+	# 武器**可能落到的**范围。这一块是量出来的，不是拍的：把「只翻挥向」的两帧
+	# 相减、打一张变化图，变化的像素全部落在「相对脚底 x ∈ [+2, +35]、y ∈ [-48, -9]」
+	# 这个 34×40 的带子里（刀、朝右、攻击进度 0.85 时）。窗越小，细长的武器在里面
+	# 的占比越高，判据越不容易被空地稀释（见 `_region_moved` 的注释）。
+	var r_swing := Rect2i(int(foot.x), int(foot.y) - 50, 40, 46)
+	# 对照用的地面区：脚**左下**方。挥击是朝右挥的，武器只会在手的右边扫，
+	# 所以这一块里只有地板、影子与灯光 —— 换挥向时它必须**一点不动**。
+	var r_floor_ctrl := Rect2i(int(foot.x) - 40, int(foot.y) - 14, 38, 18)
+	var r_body := Rect2i(int(foot.x) - 40, int(foot.y) - 92, 148, 106)
+	var r_skill := Rect2i(int(foot.x) - 44, int(foot.y) - 102, 156, 112)
+
+	# ══ ① 对账：姿态层与世界层必须是同一条时间轴 ══
+	# `Pose.ATTACK_DUR` 与 world 里的 `p.attack_t = 0.2` 分居两个文件。
+	# 只改一边的话，「攻击进度」会按另一条曲线算，而画面照样能跑 ——
+	# 这种错只能靠对账抓，任何单侧断言都看不见它。
+	p.attack_cd = 0.0
+	p.attack_t = 0.0
+	GameInput.set_override("attack", true)
+	_pump(1)
+	var at0 := p.attack_t
+	GameInput.set_override("attack", false)
+	_pump(2)
+	_num("普通攻击的实际时长", at0)
+	_ok("★ 姿态层与世界对账：Pose.ATTACK_DUR == 攻击实际时长",
+		is_equal_approx(Pose.ATTACK_DUR, at0),
+		"Pose %.4f vs world %.4f" % [Pose.ATTACK_DUR, at0])
+	_ok("★ 技能施法时长明显长于一次普攻（技能要有起手与收势的余地）",
+		Pose.CAST_DUR > Pose.ATTACK_DUR * 2.0,
+		"%.2f vs %.2f" % [Pose.CAST_DUR, Pose.ATTACK_DUR])
+
+	# ══ ② 走路：两条腿严格反相、幅度不为零、站定回中立 ══
+	p.attack_t = 0.0
+	p.vx = 140.0
+	p.vy = 0.0
+	var hip_max := 0.0
+	var anti_ok := true
+	var arm_anti_ok := true
+	var knee_both := false
+	var bob_hi := -99.0
+	var bob_lo := 99.0
+	var sq_lo := 9.0
+	var sq_hi := -9.0
+	for i in 128:
+		p.walk_t = TAU * float(i) / 128.0
+		var st := Pose.walk(p)
+		var a := float(st["hip"])
+		var b := float(st["hip_b"])
+		hip_max = maxf(hip_max, absf(a))
+		if absf(a + b) > 1e-9:
+			anti_ok = false
+		if absf(float(st["arm_free"]) + a * 0.68) > 1e-9:
+			arm_anti_ok = false
+		# 两条腿不能同时屈膝（同时抬脚 = 在地上蹦）
+		if float(st["knee_a"]) > 1e-9 and float(st["knee_b"]) > 1e-9:
+			knee_both = true
+		bob_hi = maxf(bob_hi, float(st["bob"]))
+		bob_lo = minf(bob_lo, float(st["bob"]))
+		sq_lo = minf(sq_lo, float(st["squash"]))
+		sq_hi = maxf(sq_hi, float(st["squash"]))
+	_num("走路_腿的最大摆角(rad)", hip_max)
+	_num("走路_起伏幅度(px)", bob_hi - bob_lo)
+	_ok("★ 走路时两条腿**严格反相**（对侧步态：一条前摆多少，另一条就后摆多少）",
+		anti_ok)
+	_ok("★ 腿真的在摆（摆角不是零 —— 是零就意味着只是整体平移）",
+		hip_max > 0.45, "%.3f rad" % hip_max)
+	_ok("★ 空手臂与同侧腿反相（标准步态，不是两只手一起甩）", arm_anti_ok)
+	_ok("★ 两条腿不会同时屈膝（不会在地上蹦）", not knee_both)
+	_ok("★ 走路有起伏与落地压扁（有重量，不是飘）",
+		bob_hi - bob_lo > 1.0 and sq_lo < 0.995 and sq_hi > sq_lo,
+		"起伏 %.2f　压扁 %.4f~%.4f" % [bob_hi - bob_lo, sq_lo, sq_hi])
+	# 站定：腿必须**收回中立位**，而不是僵在某个走路相位上
+	p.vx = 0.0
+	p.vy = 0.0
+	p.walk_t = 1.1           # 故意停在「半迈步「的相位上
+	var st0 := Pose.walk(p)
+	_ok("★ 站定时两条腿回到中立位（不是僵在某个走路相位上）",
+		absf(float(st0["hip"])) < 1e-6 and absf(float(st0["hip_b"])) < 1e-6
+		and absf(float(st0["bob"])) < 1e-6,
+		"hip=%.6f bob=%.6f" % [float(st0["hip"]), float(st0["bob"])])
+
+	# ══ ③ 挥舞：先拉后扫、扫过范围跟着 arc、挥出比前摇快、末尾急停 ══
+	var arc_b := float(Content.WEAPONS["blade"]["arc"])
+	var wind_b := float(Content.WEAPONS["blade"]["wind"])
+	var wf := clampf(wind_b / Pose.ATTACK_DUR, 0.15, 0.55)
+	var N := 80
+	var ang := []
+	for i in N + 1:
+		var s := Pose.swing("slash", arc_b, wind_b, float(i) / float(N), false, 0.0)
+		ang.append(float(s["ang"]))
+	# 转折点 = 前摇与挥出的分界：之前角度往一个方向走，之后往反方向扫
+	var turn := -1
+	for i in range(1, N):
+		if ang[i] - ang[i - 1] > 0.0 and ang[i + 1] - ang[i] < 0.0:
+			turn = i
+			break
+	_num("挥舞的转折点(攻击进度)", float(turn) / float(N))
+	_ok("★ 挥舞是「先拉后扫」：角度有且仅有一个转折点（前摇与挥出的分界）",
+		turn > 0, "转折点下标 %d" % turn)
+	_ok("★ 转折点就是武器表里的前摇占比（wind 真的决定了前摇多长）",
+		turn > 0 and absf(float(turn) / float(N) - wf) < 0.02,
+		"转折 %.3f vs wind 占比 %.3f" % [float(turn) / float(N), wf])
+	var span_b := absf(ang[N] - ang[turn])
+	_num("挥舞扫过的角度(rad)", span_b)
+	_ok("★ 扫过的角度跟武器的 arc 成比例（换把武器幅度真的不一样）",
+		absf(span_b - arc_b * 1.45) < 0.05,
+		"实测 %.3f　arc*1.45 = %.3f" % [span_b, arc_b * 1.45])
+	# 角速度（对攻击进度求导）。⚠️ 比的是**峰值**不是平均值：
+	# ease_out_quint 起步极快、末尾拖长，平均下来不一定更快，
+	# 真正决定手感的是峰值有多高、以及末尾有多慢。
+	var v_pre := 0.0
+	var v_post := 0.0
+	var v_tail := 0.0
+	for i in range(1, N + 1):
+		var t01 := float(i) / float(N)
+		var sp := absf((ang[i] - ang[i - 1]) * float(N))
+		if i <= turn:
+			v_pre = maxf(v_pre, sp)
+		else:
+			v_post = maxf(v_post, sp)
+			if (t01 - wf) / (1.0 - wf) > 0.85:
+				v_tail = maxf(v_tail, sp)
+	_num("挥舞_前摇峰值角速度", v_pre)
+	_num("挥舞_挥出峰值角速度", v_post)
+	_num("挥舞_挥出末段角速度", v_tail)
+	_ok("★ 挥出的峰值角速度远大于前摇（是「挥过去」，不是「慢慢挪过去」）",
+		v_post > v_pre * 1.5, "%.2f vs %.2f" % [v_post, v_pre])
+	_ok("★ 挥出末尾急停（末段角速度掉到峰值的 25% 以下）—— 打击感就在这个急停上",
+		v_tail < v_post * 0.25, "%.2f vs 峰值 %.2f" % [v_tail, v_post])
+	# 左右交替：连续攻击时下一次挥向另一边（`p.attack_alt` 每次出手翻转）
+	var sA := Pose.swing("slash", arc_b, wind_b, 0.75, false, 0.0)
+	var sB := Pose.swing("slash", arc_b, wind_b, 0.75, true, 0.0)
+	_ok("★ 连续攻击左右交替（第二刀挥向另一边，不是重复同一刀）",
+		signf(float(sA["ang_rel"])) != signf(float(sB["ang_rel"]))
+		and absf(float(sA["ang_rel"]) + float(sB["ang_rel"])) < 1e-9,
+		"%.4f vs %.4f" % [float(sA["ang_rel"]), float(sB["ang_rel"])])
+	# 换武器：姿态真的跟着变（不然「八把武器「在动画上就是同一把）
+	var sig := {}
+	for wid in Content.WEAPONS.keys():
+		var wd: Dictionary = Content.WEAPONS[wid]
+		var s2 := Pose.swing(str(wd["style"]), float(wd["arc"]), float(wd["wind"]),
+			0.75, false, 0.0)
+		sig["%.4f|%.4f" % [float(s2["ang"]), float(s2["ext"])]] = true
+	_num("八把武器在同一攻击进度下的不同姿态数", float(sig.size()))
+	_ok("★ 八把武器的挥舞姿态两两不同（武器的差异真的进了动画）",
+		sig.size() == Content.WEAPONS.size(),
+		"%d/%d" % [sig.size(), Content.WEAPONS.size()])
+
+	# ══ ④ 技能：五类姿态互异，且每一类都有「起手 -> 放出 -> 收势」 ══
+	# 收势必须是**独立的一段**：技能放完人立刻弹回站姿是最常见的偷工减料，
+	# 而它恰恰是「流畅「与否的关键。
+	var sig2 := {}
+	for k in Pose.CAST_KINDS:
+		var peak := 0.0
+		var mid := 0.0
+		var last := 0.0
+		for i in 33:
+			var c := Pose.cast(str(k), float(i) / 32.0)
+			var m := absf(float(c["arm"])) + absf(float(c["ext"])) \
+				+ absf(float(c["spin"])) * 0.3 + absf(float(c["lean"])) + absf(float(c["rush"]))
+			peak = maxf(peak, m)
+			if i == 16:
+				mid = m
+			if i == 32:
+				last = m
+		sig2["%.4f|%.4f" % [peak, mid]] = true
+		_ok("技能[%s]：有起手与放出（幅度够大）并且收势回到静姿" % str(k),
+			peak > 0.35 and mid > 0.1 and last < 1e-6,
+			"峰值 %.3f　中段 %.3f　末段 %.6f" % [peak, mid, last])
+	_num("五类技能的不同姿态数", float(sig2.size()))
+	_ok("★ 五类技能的施法姿态两两不同（不是五个技能同一个动作）",
+		sig2.size() == Pose.CAST_KINDS.size())
+	var kinds := {}
+	var n_sk := 0
+	for wid in Content.WEAPONS.keys():
+		for sk in Content.WEAPONS[wid]["skills"]:
+			var kk := Pose.cast_kind_of(str(sk["id"]))
+			kinds[kk] = int(kinds.get(kk, 0)) + 1
+			n_sk += 1
+	_num("技能总数", float(n_sk))
+	_ok("★ 每一个技能都能归类到某种施法姿态，而且五类全都用得上",
+		n_sk == 19 and kinds.size() == 5,
+		"%d 个技能 -> %s" % [n_sk, str(kinds.keys())])
+	report["cases"]["pose"] = {
+		"attack_dur": Pose.ATTACK_DUR, "cast_dur": Pose.CAST_DUR,
+		"hip_max": snappedf(hip_max, 0.0001),
+		"swing_turn": snappedf(float(turn) / float(N), 0.0001),
+		"swing_span": snappedf(span_b, 0.0001),
+		"v_pre": snappedf(v_pre, 0.001), "v_post": snappedf(v_post, 0.001),
+		"v_tail": snappedf(v_tail, 0.001),
+		"weapon_poses": sig.size(), "cast_kinds": Pose.CAST_KINDS.size(),
+	}
+
+	# ══ ⑤ 像素：算出来的姿态必须真的画到了屏幕上 ══
+	# 相机钉住、世界冻结：后面每一帧除了「姿态「没有任何别的变量在动。
+	# （要证明是在比较姿态，就得把别的都冻住 —— 这是本站一贯的做法。）
+	p.vx = 140.0
+	p.vy = 0.0
+	p.attack_t = 0.0
+	p.cast_t = 0.0
+	var tiles := []
+	var img_a: Image = null
+	var img_b: Image = null
+	for i in 8:
+		p.walk_t = TAU * float(i) / 8.0
+		w.mark_redraw()
+		var im := await _grab()
+		tiles.append(_pose_tile(im, crop))
+		# ⚠️ 要取的是**真正的反相两帧**：相位 π/2 与 3π/2（即 i = 2 与 6）。
+		# 第一版取的是 0 与 4（相差半周期，看着"像是"反相），但 `hip = sin(ph)*AMP`
+		# 在这两个相位上**都等于 0** —— 两条腿都停在**中立位**，画出来一模一样！
+		# 于是那条断言测到的其实是左右摆动（sway）与斗篷（cloak）的差别，
+		# 跟腿一点关系都没有（"把腿冻住"的变异打不红它、而"把夜色拧暗"却能打红它，
+		# 两个反常现象都是同一个根因）。
+		if i == 2:
+			img_a = im
+		elif i == 6:
+			img_b = im
+	_write_png(_grid(tiles, 4), "30-walk-cycle")
+	# 第 2 与第 6 帧是**真反相**的两个极端（相位 π/2 vs 3π/2，左右腿正好互换，
+	# 见上面循环里的注释），腿部那块像素必须明显不同；相同就说明腿根本没画出来、
+	# 或者压根没在摆。
+	# ⚠️ 判据用**按亮度归一化**的差，不用绝对差：绝对差会随地图明暗成比例缩放，
+	# 基线只在阈值上方 16% —— 结果"把夜色拧到最暗"这种完全无关的变异也能打红它
+	# （变异表里表现为"连带误伤"，会把人引到错误的那一层去找 bug）。
+	# 原值仍然记进报告，用来对照两者对明暗的敏感度差别。
+	var d_leg := _region_diff(img_a, img_b, r_legs)
+	var d_leg_n := _region_diff_norm(img_a, img_b, r_legs)
+	_num("走路_反相两帧的腿部像素差", d_leg)
+	_num("走路_反相两帧的腿部差（按亮度归一化）", d_leg_n)
+	_ok("★ 走路的两个反相相位在屏幕上确实不一样（腿真的画出来、并且摆了）",
+		d_leg_n > 0.03, "归一化 %.4f（原值 %.4f）" % [d_leg_n, d_leg])
+
+	# 挥击：8 个相位（前摇 3 帧 + 挥出 5 帧）
+	p.vx = 0.0
+	p.vy = 0.0
+	p.walk_t = 0.0
+	var tiles2 := []
+	var img_p0: Image = null
+	var img_p1: Image = null
+	for i in 8:
+		p.attack_t = Pose.ATTACK_DUR * (1.0 - float(i) / 7.0)
+		w.mark_redraw()
+		var im2 := await _grab()
+		tiles2.append(_pose_tile(im2, crop))
+		if i == 1:
+			img_p0 = im2
+		elif i == 6:
+			img_p1 = im2
+	p.attack_t = 0.0
+	_write_png(_grid(tiles2, 4), "31-swing-arc")
+	# 前摇（武器在身侧蓄势）与挥出（已扫到身前）两帧必须明显不同。
+	# ⚠️ 这条**只是粗糙的烟测**，措辞必须跟它真正量到的东西对齐（变异测试抓过一次）：
+	# 把绘制层里武器的 ang/ext/lean 全部按回基准值（画面上武器根本不动），
+	# 它**照样绿** —— 因为有两层各能单独满足它：
+	#   ① `Art.player()` 的 `sw["lean"]` 会带着躯干 / 头 / 斗篷一起动，
+	#      而采样窗（156×96）把上半身整个框进去了；
+	#   ② `world.gd` 里还有一道跟着 `attack_t` 扫的刀光弧 + 月牙斩，
+	#      它同样落在窗里。
+	# 也就是"整帧不一样"很容易被满足，而"武器转没转"根本没被测到。
+	# 真正管"武器在转"的是下面那条**只拧一个变量**的对照（alt 只进 `dir`），
+	# 不是把这条的阈值调松。这条留着当"攻击到底有没有动画"的烟测。
+	var d_sw := _region_diff(img_p0, img_p1, r_weapon)
+	_num("挥击_前摇与挥出的像素差", d_sw)
+	_ok("★ 挥击的前摇与挥出画出来不一样（粗糙烟测：整帧层面，世界层的刀光弧也在扫）",
+		d_sw > 0.02, "%.4f" % d_sw)
+
+	# ── 单变量对照：**同一个攻击进度、同一个身体姿势**，只翻「挥向哪边」
+	# （`p.attack_alt`）。`Pose.swing` 里 alt 只进 `dir`，所以躯干 / 腿 / 斗篷 /
+	# 屈膝 / 起伏**一个都不变**；手的位置只吃 `ext`（两帧相同），也不动。
+	#
+	# ⚠️ 判据不能用 `_region_diff` 的均值：武器是根细线，在地面底色里被稀释到
+	# 0.0094（第一版就是这么红的）。它**确实动了**，只是动的地方少 ——
+	# 所以改用 `_region_moved` 的「动了多少」（占比），并且配两个对照：
+	#   ① 同一对图里的**地面**区域（左下角，挥击扫不到）—— 必须一点不动；
+	#   ② **同一姿态连取两帧**（两个不同的 Image，不是自己比自己）—— 必须一点不动。
+	# 有这两个 0 垫底，"武器区动了"才是一句有意义的话。
+	p.attack_t = Pose.ATTACK_DUR * 0.15          # 攻击进度 0.85：已经扫到身前
+	p.attack_alt = false
+	w.mark_redraw()
+	var im_l := await _grab()
+	p.attack_alt = false                          # 对照②：什么都不改，再取一帧
+	w.mark_redraw()
+	var im_same := await _grab()
+	p.attack_alt = true
+	w.mark_redraw()
+	var im_r := await _grab()
+	p.attack_alt = false
+	p.attack_t = 0.0
+	_write_png(_grid([_pose_tile(im_l, crop), _pose_tile(im_r, crop)], 2), "34-swing-alt")
+	var mv := _region_moved(im_l, im_r, r_swing)
+	var mv_floor := _region_moved(im_l, im_r, r_floor_ctrl)     # 对照①
+	var mv_null := _region_moved(im_l, im_same, r_swing)        # 对照②
+	_num("挥击_只翻挥向时武器区动了的占比", mv)
+	_num("挥击_对照①同一对图里地面区的占比", mv_floor)
+	_num("挥击_对照②同一姿态连取两帧的占比", mv_null)
+	_ok("★ 两个对照都是 0（同一姿态连取两帧、以及挥击扫不到的地面区）",
+		mv_floor < 1e-9 and mv_null < 1e-9,
+		"地面 %.6f　重取 %.6f" % [mv_floor, mv_null])
+	_ok("★ 同一攻击进度下左挥与右挥画出来不一样（只拧了「挥向哪边」这一个变量）",
+		mv > 0.08, "%.4f（对照：地面 %.6f / 重取 %.6f）" % [mv, mv_floor, mv_null])
+	# 像素层的结论汇总进报告（`cases.pose` 在上面就写好了，这里补进去 ——
+	# 上面那几个量要跑完像素段才算得出来）
+	report["cases"]["pose"]["pixels"] = {
+		"walk_leg_diff": snappedf(d_leg, 0.0001),
+		"swing_phase_diff": snappedf(d_sw, 0.0001),
+		# 「只翻挥向」这一对：武器区动了的占比 + 两个必须为 0 的对照
+		# （同一对图里的地面区 / 同一姿态连取两帧）。三者摆在一起才说明
+		# 「动的就是武器」；单独一个 0.17 什么都说明不了。
+		"swing_alt_moved": snappedf(mv, 0.0001),
+		"swing_alt_ctrl_floor": snappedf(mv_floor, 0.0001),
+		"swing_alt_ctrl_reframe": snappedf(mv_null, 0.0001),
+	}
+
+	# 八把武器的待机姿态
+	var tiles3 := []
+	var sig3 := {}
+	p.facing = 0.0
+	for wid in Content.WEAPONS.keys():
+		p.weapon_id = str(wid)
+		p.attack_t = 0.0
+		p.cast_t = 0.0
+		w.mark_redraw()
+		var im3 := await _grab()
+		tiles3.append(_pose_tile(im3, crop))
+		sig3[_region_fingerprint(im3, r_body)] = true
+	_write_png(_grid(tiles3, 4), "32-weapon-poses")
+	_num("八把武器待机姿态的不同指纹数", float(sig3.size()))
+	_ok("★ 八把武器的待机姿态两两不同（不是八根一样的棍子）",
+		sig3.size() == Content.WEAPONS.size(),
+		"%d/%d" % [sig3.size(), Content.WEAPONS.size()])
+
+	# 五类技能各取一帧「放出「的瞬间
+	p.weapon_id = "blade"
+	var tiles4 := []
+	var sig4 := {}
+	for k in Pose.CAST_KINDS:
+		p.cast_kind = str(k)
+		p.cast_t = Pose.CAST_DUR * 0.45      # 攻击进度 0.55 -> 放出的中段
+		w.mark_redraw()
+		var im4 := await _grab()
+		tiles4.append(_pose_tile(im4, crop))
+		sig4[_region_fingerprint(im4, r_skill)] = true
+	p.cast_t = 0.0
+	_write_png(_grid(tiles4, 5), "33-skill-poses")
+	_num("五类技能施法姿态的不同指纹数", float(sig4.size()))
+	_ok("★ 五类技能的施法姿态画出来各不相同（不是五个技能同一个动作）",
+		sig4.size() == Pose.CAST_KINDS.size(),
+		"%d/%d" % [sig4.size(), Pose.CAST_KINDS.size()])
+
+	# ══ ⑥ 端到端：上面全部问的是"姿态算得对不对""算出来的画到屏幕上没有"。
+	# 还差最后一环：**游戏真的会去调它吗**？
+	# 只手动设 `cast_t` / `walk_t`，只能证明"给了它就会画"，
+	# 证明不了"玩的时候真的会给" —— 那一环得靠驱动真实输入。
+	# 这一段放在最后：它会真的推世界、真的把玩家挪走，
+	# 提前做的话上面按 `foot` 算出来的采样窗口就全错位了。
+	var wt0 := p.walk_t
+	GameInput.set_override("move_right", true)
+	_pump(14)
+	GameInput.set_override("move_right", false)
+	_num("端到端_按 14 步移动键的走路相位推进", p.walk_t - wt0)
+	_ok("★ 真的移动时走路相位在推进（走路动画不是只有自检里才动）",
+		p.walk_t > wt0 + 0.5, "%.3f" % (p.walk_t - wt0))
+	# 真放一个技能：姿态计时与类别必须由 `use_skill` 设上。
+	# ⚠️ 摆拍残留必须清干净，否则这个断言的**两侧**都会骗人：
+	#   · cast_t / cast_kind 不清 → 上一段手工设的值看起来像"use_skill 设的"
+	#     （第一版就是这么骗过自己的 —— 残留值恰好是 raise）；
+	#   · skill_cd 不清 → `use_skill` 在 CD 那道闸门直接 return，
+	#     cast_t 根本没机会被设上，于是断言红得**莫名其妙**
+	#     （第二版踩的就是这个：盯着 skill_cd 里那条新写入的 CD 看了半天，
+	#      其实它恰好证明 use_skill 跑完了，只差没人赋值 cast_t）。
+	p.weapon_id = "blade"
+	p.combo = 99.0
+	p.cast_t = 0.0
+	p.cast_kind = ""
+	p.skill_cd = {}
+	w.events.clear()
+	var skills: Array = p.skills()
+	var sid := "" if skills.is_empty() else str(skills[0]["id"])
+	var kind_want := Pose.cast_kind_of(sid)
+	w.use_skill(0)
+	# 被前置条件拦下时会往 events 里塞一条 toast —— 把它捞出来，
+	# 否则"技能没放出来"就只能靠猜（连击不够？CD？技能表是空的？）
+	var toasts := []
+	for ev in w.events:
+		if str(ev.get("type", "")) == "toast":
+			toasts.append(str(ev.get("text", "")))
+	_num("端到端_放技能后的 cast_t", p.cast_t)
+	_num("端到端_技能表里的技能数", float(skills.size()))
+	_ok("★ 真的放技能会触发施法姿态（cast_t 与类别是游戏设的，不是自检摆拍）",
+		p.cast_t > 0.0 and p.cast_kind == kind_want,
+		"cast_t=%.3f　kind=%s　期望=%s　被拦=%s" % [
+			p.cast_t, p.cast_kind, kind_want, str(toasts)])
+	# 而且它必须**自己走完** —— 卡在施法姿势是很常见的"技能动画"翻车方式
+	_pump(45)
+	_num("端到端_45 步之后的 cast_t", p.cast_t)
+	_ok("★ 施法姿态会自己结束（走到 0，不会卡在施法姿势上）",
+		p.cast_t <= 0.0, "%.4f" % p.cast_t)
+	report["cases"]["pose"]["e2e"] = {
+		"skill_id": sid, "cast_kind": kind_want, "skill_count": skills.size(),
+		"walk_phase_14_steps": snappedf(p.walk_t - wt0, 0.001),
+	}
+
+
+## 从整屏截图里裁出玩家特写并放大 2 倍（对照图用）
+func _pose_tile(im: Image, r: Rect2i) -> Image:
+	var t := im.get_region(r)
+	t.resize(r.size.x * 3, r.size.y * 3, Image.INTERPOLATE_NEAREST)
+	return t
+
+
+## 把若干张同尺寸小图拼成网格（4 列或 5 列），存成一张对照图
+func _grid(tiles: Array, cols: int) -> Image:
+	if tiles.is_empty():
+		return Image.create_empty(1, 1, false, Image.FORMAT_RGBA8)
+	var tw: int = tiles[0].get_width()
+	var th: int = tiles[0].get_height()
+	var rows := int(ceil(float(tiles.size()) / float(cols)))
+	var gap := 4
+	var out := Image.create_empty(cols * (tw + gap) + gap, rows * (th + gap) + gap,
+		false, Image.FORMAT_RGBA8)
+	out.fill(Color(0.05, 0.06, 0.09))
+	for i in tiles.size():
+		out.blit_rect(tiles[i], Rect2i(0, 0, tw, th),
+			Vector2i(gap + (i % cols) * (tw + gap), gap + (i / cols) * (th + gap)))
+	return out
+
+
+## 两块区域的**平均**逐通道差（0 = 一模一样）。step 用来降采样、控制成本。
+## 用平均差而不是「有差异的像素占比」：后者对单个抗锯齿像素太敏感。
+func _region_diff(a: Image, b: Image, r: Rect2i, step := 2) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var ca := a.get_pixel(r.position.x + x, r.position.y + y)
+			var cb := b.get_pixel(r.position.x + x, r.position.y + y)
+			acc += absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)
+			n += 3
+	return acc / maxf(float(n), 1.0)
+
+
+## 同样的逐通道平均差，但**按这块区域的平均亮度归一化**（差 / 平均亮度）。
+##
+## 为什么要归一化：**像素差是随亮度成比例缩放的**。同一组姿态，地图越暗，
+## 绝对差越小 —— 于是"这条断言擦着阈值过"。实测过：`★ 走路的两个反相相位在屏幕上
+## 确实不一样` 基线 0.0233 / 阈值 0.02（只差 16%），结果**两个完全无关的变异**
+## （`夜色永远压到最暗一档`、`挥击灯的半径不再跟攻击距离挂钩`）都把它顺带打红了。
+## 那正是变异表里最忌讳的"连带误伤"：将来真出回归时，红的那条会把人引到错误的层。
+## 归一化之后判据只对"结构动了多少"敏感，对整体明暗免疫。
+##
+## ⚠️ 它也不是万能的：全黑画面（平均亮度 → 0）会让比值爆掉。所以分母夹了个下限，
+## 且这条只用在"两帧同一光照"的对照上（归一化能消掉的只有**两帧共同**的明暗缩放）。
+func _region_diff_norm(a: Image, b: Image, r: Rect2i, step := 2) -> float:
+	var diff := 0.0
+	var lum := 0.0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var ca := a.get_pixel(r.position.x + x, r.position.y + y)
+			var cb := b.get_pixel(r.position.x + x, r.position.y + y)
+			diff += absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)
+			lum += ca.r + ca.g + ca.b          # 分子分母都是"三通道之和"，量纲一致
+	return diff / maxf(lum, 1e-6)
+
+
+## 一个区域里「**动了**的采样点占比」：逐点三通道差之和超过 `eps` 才算动了。
+##
+## 为什么另外还要这个度量（`_region_diff` 的均值不够用）：
+## 均值会被"窗里有多少空地"稀释。武器是根细线，在 156×96 的窗里只占一两个百分点，
+## 于是"只翻挥向"这一对**明明动了**，均值却只有 0.0094 —— 卡在 0.02 阈值下面，
+## 看着像"武器没动"。占比这个度量对"动的地方有多少"免疫。
+## 它当然也有自己的盲区：**整片轻微变亮**会让所有点都"动"，占比直接拉满。
+## 所以它只用在"同一帧只拧一个变量、且已配了 0 对照"的地方，不当作通用判据。
+func _region_moved(a: Image, b: Image, r: Rect2i, eps := 0.10, step := 2) -> float:
+	var moved := 0
+	var n := 0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var ca := a.get_pixel(r.position.x + x, r.position.y + y)
+			var cb := b.get_pixel(r.position.x + x, r.position.y + y)
+			if absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b) > eps:
+				moved += 1
+			n += 1
+	return float(moved) / maxf(float(n), 1.0)
+
+
+## 把一个区域降采样成 6x6 的亮度指纹，用来判「两个姿态是不是同一个」。
+## 逐像素比太敏感（抗锯齿差一点就判不同）；降采样之后比的是**形状与明暗分布**，
+## 正好是「这把武器和那把武器看起来不一样吗「想问的东西。
+func _region_fingerprint(img: Image, r: Rect2i, k := 6) -> String:
+	var s := ""
+	for gy in k:
+		for gx in k:
+			var acc := 0.0
+			var n := 0
+			for y in range(r.size.y * gy / k, r.size.y * (gy + 1) / k):
+				for x in range(r.size.x * gx / k, r.size.x * (gx + 1) / k):
+					var c := img.get_pixel(r.position.x + x, r.position.y + y)
+					acc += (c.r + c.g + c.b) / 3.0
+					n += 1
+			s += "%02x" % int(clampf(acc / maxf(float(n), 1.0) * 255.0, 0.0, 255.0))
+	return s

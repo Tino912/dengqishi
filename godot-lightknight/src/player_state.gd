@@ -24,6 +24,13 @@ var dash_cd := 0.0
 var dash_dx := 0.0
 var dash_dy := 0.0
 
+## 技能施法姿态：剩余时间（秒）与类别（spin/slam/thrust/toss/raise，见 Pose）。
+## ⚠️ **纯表现**：只被绘制层读，不参与伤害、判定、连击或任何数值计算。
+## 存在这里而不是 world，是为了让"世界推进"和"画出来"共用同一份状态 ——
+## 分开存两份时间的话，暂停/冻结界面里两者会走散（本项目踩过这个坑）。
+var cast_t := 0.0
+var cast_kind := ""
+
 var invuln := 0.0
 var hurt_flash := 0.0
 

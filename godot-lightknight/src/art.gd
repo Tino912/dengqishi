@@ -411,11 +411,25 @@ static func _wall_face_river(ci: CanvasItem, x0: float, x1: float, tS: float, yS
 
 # ---------------------------------------------------------------- 玩家
 
+# ---------------------------------------------------------------- 玩家
+#
+# 玩家是**程序化骨架**：腿 / 躯干 / 双臂 / 兜帽 / 斗篷分层，姿态全部由 `Pose` 求解
+# （Pose.walk 走路循环、Pose.swing 武器挥舞、Pose.cast 技能起手）。这里只负责
+# "拿着姿态把线画出来" —— 一条角度都不硬编码在绘制里，否则动画对不对就只能靠像素猜。
+#
+# 坐标约定：身体各部位一律写成**相对脚底**的局部坐标 (dx, dy)，再交给 _bx() 搬到屏幕。
+# 一次解决三件事：左右镜像（flip 只乘 dx）、整体旋转（回身技能把坐标系转一下，
+# 头脚一起转）、以及"脚始终踩在地上"（压扁只作用于 dy）。
+#
+# 层序（远 → 近、后 → 前）：远腿 → 远臂 → 后斗篷 → 近腿 → 躯干 → 腰带 → 前斗篷
+# → 兜帽/眼光 → 持械臂 → 武器。
+# ⚠️ 斗篷下摆到 y = -9 就收住（膝盖以上）、并且**前襟开衩** —— 这是为了让腿露出来。
+# 上一版斗篷一直垂到脚面，盖住了整条腿，于是"走路动画"根本无从谈起：
+# 画了也看不见。**动画要先保证它能被看见。**
+
 static func player(ci: CanvasItem, p: PlayerState, cam: Vector2, brightness: float,
 		dead: bool, t: float, weapon_id: String) -> void:
 	var px := Proj.sx(p.x, cam.x)
-	var bob := absf(sin(p.walk_t)) * 2.2
-	var py := Proj.sy(p.y, p.z + bob, cam.y)
 	var gy := Proj.sy(p.y, 0.0, cam.y)
 
 	if dead:
@@ -432,109 +446,283 @@ static func player(ci: CanvasItem, p: PlayerState, cam: Vector2, brightness: flo
 	if p.dash_t > 0.0:
 		for i in range(1, 5):
 			var bx := px - p.dash_dx * float(i) * 12.0
-			var by := py - p.dash_dy * float(i) * 12.0 * Proj.YSQUASH
+			var by := gy - p.dash_dy * float(i) * 12.0 * Proj.YSQUASH
 			ground_circle(ci, bx, by - 20.0, 11.0 - float(i), Color(1.0, 0.86, 0.63, 0.16))
 
 	var flip := 1.0 if cos(p.facing) >= 0.0 else -1.0
 	var hurt := p.hurt_flash > 0.0
+	var base := Pose.face_angle(p.facing, Proj.YSQUASH)
+	var wp: Dictionary = p.weapon()
 
-	# 斗篷
-	var cloak := PackedVector2Array([
-		Vector2(-13.0, 0.0), Vector2(-14.0, -22.0), Vector2(-8.0, -32.0),
-		Vector2(8.0, -32.0), Vector2(14.0, -22.0), Vector2(13.0, 0.0),
-		Vector2(0.0, 4.0),
+	# ── 三套姿态：走路（常驻）+ 技能（与普攻互斥，优先）+ 普通攻击的挥舞
+	var st := Pose.walk(p)
+	var casting := p.cast_t > 0.0
+	var cs := {"arm": 0.0, "off": 0.0, "lean": 0.0, "spin": 0.0, "ext": 0.0, "rush": 0.0}
+	if casting:
+		cs = Pose.cast(p.cast_kind, 1.0 - p.cast_t / Pose.CAST_DUR)
+	var attacking := p.attack_t > 0.0 and not casting
+	var sw := {"ang": base, "ext": 0.0, "lean": 0.0, "phase": 0}
+	if attacking:
+		sw = Pose.swing(str(wp.get("style", "slash")), float(wp.get("arc", 1.5)),
+			float(wp.get("wind", 0.1)), 1.0 - p.attack_t / Pose.ATTACK_DUR,
+			p.attack_alt, base)
+
+	# ── "回身"类技能（旋斩 / 双旋 / 环链 / 回旋）在 2.5D 侧视里**不能真的绕脚底转**：
+	# 人绕着自己的脚转 327°，头会转到地板下面去，看着像摔倒（第一版就是）。
+	# 侧视里的"原地转身"要靠**镜像翻转**：转过 90° 就把左右翻过来，
+	# 转完一整圈正好回到正面；再叠一点侧倾当作转身的中间态。
+	# 环绕的那道斩击特效由技能本身给（world 的 ring effect），不归这里管。
+	var turn := float(cs["spin"])                  # 0 → TAU 的转身相位
+	var mirror := 1.0 if cos(turn) >= 0.0 else -1.0
+	var face_f := flip * mirror
+	var turn_lean := sin(turn) * 0.10
+	# ── 身体坐标系：原点在脚底（随起伏抬起）
+	var xf := {
+		"x": px + float(cs["rush"]) * face_f, "y": gy - float(st["bob"]),
+		"c": 1.0, "s": 0.0, "f": face_f, "sq": float(st["squash"]),
+	}
+	var lean := float(st["lean"]) + float(sw["lean"]) + float(cs["lean"]) + turn_lean
+	var lx := lean * 30.0                      # 前倾 → 肩/头往前移的量
+	var hem := float(st["cloak"])              # 斗篷下摆的摆动
+	var body_col := Color("#8d5a52") if hurt else Color("#333d54")
+	var cloak_back := Color("#6d443f") if hurt else Color("#171c2a")
+	var cloak_front := Color("#8d5a52") if hurt else Color("#2a3346")
+	var line_col := Color("#c08a80") if hurt else Color("#5b6a8c")
+	# 统一的描边色。**强光下能不能读出轮廓，全看这条线** ——
+	# 程序化造型没有贴图细节，一旦被照明洗白，就只能靠外缘这道暗线分辨结构。
+	var stroke := Color("#0b0e16")
+
+	# ① 远侧腿（暗一档 → 有纵深）
+	_draw_leg(ci, xf, -3.2, -16.0, float(st["hip_b"]), float(st["knee_b"]),
+		Color("#161b28"), 5.0)
+	# ② 远侧手臂（空手，与同侧腿反相摆）
+	_draw_arm(ci, xf, -4.5 + lx * 0.3, -31.5, float(st["arm_free"]),
+		cloak_back.lightened(0.10), 4.2)
+	# ③ 后斗篷。下摆停在**膝上**（y = -14）—— 整个下盘要留给腿：
+	# 上一版斗篷一直垂到脚面，腿画了也看不见，"走路"就无从谈起。
+	var bk := PackedVector2Array([
+		_bx(xf, -11.0, -33.0), _bx(xf, -15.0, -20.0),
+		_bx(xf, -13.5 + hem, -14.0), _bx(xf, 13.5 + hem, -14.0),
+		_bx(xf, 15.0, -20.0), _bx(xf, 11.0, -33.0),
 	])
-	var pts := PackedVector2Array()
-	for q in cloak:
-		pts.append(Vector2(px + q.x * flip, py + q.y))
-	var body_col := Color("#2f3749") if not hurt else Color("#8d5a52")
-	ci.draw_colored_polygon(pts, body_col)
-	# 斗篷上缘提亮
-	ci.draw_line(Vector2(px - 8.0 * flip, py - 32.0), Vector2(px + 8.0 * flip, py - 32.0),
-		Color("#4a5670"), 3.0, true)
+	ci.draw_colored_polygon(bk, cloak_back)
+	ci.draw_polyline(bk + PackedVector2Array([bk[0]]), stroke, 2.0, true)
+	# ④ 近侧腿（亮）
+	_draw_leg(ci, xf, 2.0, -16.0, float(st["hip"]), float(st["knee_a"]),
+		Color("#2e374b"), 5.4)
+	# ⑤ 躯干 + 肩线
+	var td := PackedVector2Array([
+		_bx(xf, -6.5 + lx, -33.0), _bx(xf, 6.5 + lx, -33.0),
+		_bx(xf, 5.0, -17.5), _bx(xf, -5.0, -17.5),
+	])
+	ci.draw_colored_polygon(td, body_col)
+	ci.draw_polyline(td + PackedVector2Array([td[0]]), stroke, 2.0, true)
+	ci.draw_line(_bx(xf, -6.0 + lx, -32.0), _bx(xf, 6.0 + lx, -32.0), line_col, 2.6, true)
+	# ⑥ 腰带 + 扣（一点暖色，把上下身分开）
+	ci.draw_line(_bx(xf, -5.0, -18.6), _bx(xf, 5.0, -18.6), Color("#6b5a3e"), 3.0, true)
+	ci.draw_circle(_bx(xf, 0.5, -18.6), 1.9, Color("#d8b06a"))
+	# ⑦ 前斗篷：**开衩两片**、下摆也只到膝上，中间整条腿露出来
+	for sd in [-1.0, 1.0]:
+		var s := float(sd)
+		var fp := PackedVector2Array([
+			_bx(xf, 2.2 * s + lx, -31.5), _bx(xf, 10.0 * s + lx, -32.5),
+			_bx(xf, 12.5 * s + hem * s, -14.5), _bx(xf, 3.4 * s + hem * 0.7 * s, -13.0),
+		])
+		ci.draw_colored_polygon(fp, cloak_front)
+		ci.draw_polyline(fp + PackedVector2Array([fp[0]]), stroke, 2.0, true)
+	# ⑧ 兜帽
+	var hd := lx * 0.9
+	var hood := PackedVector2Array([
+		_bx(xf, -7.4 + hd, -36.0), _bx(xf, -6.2 + hd, -42.4), _bx(xf, 0.0 + hd, -45.8),
+		_bx(xf, 6.2 + hd, -42.4), _bx(xf, 7.4 + hd, -36.0), _bx(xf, 0.0 + hd, -33.0),
+	])
+	ci.draw_colored_polygon(hood, Color("#404b68"))
+	ci.draw_polyline(hood + PackedVector2Array([hood[0]]), stroke, 2.0, true)
+	# 帽檐内里的暗面 —— 让兜帽"有深度"而不是一顶贴片
+	ci.draw_colored_polygon(PackedVector2Array([
+		_bx(xf, -6.9 + hd, -37.4), _bx(xf, 6.9 + hd, -37.4),
+		_bx(xf, 5.6 + hd, -33.8), _bx(xf, -5.6 + hd, -33.8),
+	]), Color("#0e1119"))
+	# 面罩缝 + 两点眼光：亮度跟着灯火走（越亮，眼睛越亮）
+	var eye_a := 0.30 + clampf(brightness, 0.0, 1.0) * 0.62
+	ci.draw_line(_bx(xf, -5.6 + hd, -39.8), _bx(xf, 4.4 + hd, -39.8),
+		Color(0.05, 0.06, 0.10, 0.85), 1.8, true)
+	ci.draw_circle(_bx(xf, -3.4 + hd, -39.6), 1.5, Color(1.0, 0.86, 0.56, eye_a))
+	ci.draw_circle(_bx(xf, 0.5 + hd, -39.6), 1.5, Color(1.0, 0.86, 0.56, eye_a))
 
-	# 头盔
-	ci.draw_circle(Vector2(px, py - 36.0), 8.6, Color("#3d4761"))
-	ci.draw_circle(Vector2(px - 2.4 * flip, py - 38.5), 4.4, Color("#59657f"))
-	# 面罩缝
-	ci.draw_line(Vector2(px - 5.0 * flip, py - 34.0), Vector2(px + 4.0 * flip, py - 34.0),
-		Color(0.05, 0.06, 0.10, 0.8), 2.0, true)
+	# ⑨ 持械臂 + 武器。**手是武器旋转的圆心** —— 挥舞感来自武器绕这里转，
+	# 而不是整把武器沿一条直线平移（那是上一版，看着像"贴图在滑"）。
+	var hx_ := 6.5 + float(sw["ext"]) * 2.4 + float(cs["off"]) * 0.5
+	var hy_ := -23.0 - float(cs["arm"]) * 11.0
+	var hand := _bx(xf, hx_, hy_)
+	_draw_arm_to(ci, xf, 5.5 + lx * 0.5, -31.0, hand, body_col.lightened(0.16), 5.2)
+	# 沿武器自身方向推出去的力度：突刺/甩链靠"推"，挥砍类靠"转"
+	var push := 12.0
+	var stl := str(wp.get("style", "slash"))
+	if stl != "thrust" and stl != "whip":
+		push = 4.5
+	# 武器角要跟着"额外那次镜像"翻 —— `_bx` 的镜像只作用于位置，
+	# 角度得自己关于竖直轴翻（屏幕 y 向下，所以是 PI - a）。
+	var wang := float(sw["ang"])
+	if mirror < 0.0:
+		wang = PI - wang
+	_draw_weapon(ci, hand, wang, weapon_id,
+		float(sw["ext"]) + float(cs["ext"]), push, face_f, t)
 
-	# 武器：8 把各自的轮廓差异要一眼看得出来。
-	# wind/swing 是挥击的动画进度（0 → 1 → 0 的一个隆起）。
-	var wind := 1.0 - clampf(p.attack_t / 0.2, 0.0, 1.0)
-	var swing := sin(wind * PI)
-	var hx0 := px + 8.0 * flip
-	var hy0 := py - 24.0
+
+## 把"相对脚底"的局部坐标搬到屏幕。xf 里：
+##   x/y = 脚底在屏幕上的位置，c/s = 整体旋转的 cos/sin，
+##   f = 左右镜像（±1），sq = 竖直缩放（落地压扁）。
+## ⚠️ **有且只有这一个入口** —— 身体部位一律不接受屏幕绝对坐标。
+## 否则"回身技能整体旋转"一定会漏掉几个部位（转到一半发现头盔没跟着转），
+## 而这种错在静止帧里完全看不出来。
+static func _bx(xf: Dictionary, dx: float, dy: float) -> Vector2:
+	var x := dx * float(xf["f"])
+	var y := dy * float(xf["sq"])
+	var c := float(xf["c"])
+	var s := float(xf["s"])
+	return Vector2(float(xf["x"]) + x * c - y * s, float(xf["y"]) + x * s + y * c)
+
+
+## 一条腿：髋 → 膝 → 脚。两段正向运动学；屈膝只发生在**后摆**那半程（抬脚）。
+static func _draw_leg(ci: CanvasItem, xf: Dictionary, hipx: float, hipy: float,
+		hip_a: float, knee: float, col: Color, w: float) -> void:
+	var l1 := 8.0
+	var l2 := 8.2
+	var kx := hipx + sin(hip_a) * l1
+	var ky := hipy + cos(hip_a) * l1
+	var bend := hip_a - knee * 0.95          # 屈膝 → 小腿往回（往后、往上）
+	var fx := kx + sin(bend) * l2
+	var fy := ky + cos(bend) * l2
+	# 先描边再上色：**两条腿在强光下要能分开，全靠各自外缘这道暗线**
+	ci.draw_line(_bx(xf, hipx, hipy), _bx(xf, kx, ky), Color("#0b0e16"), w + 2.4, true)
+	ci.draw_line(_bx(xf, kx, ky), _bx(xf, fx, fy), Color("#0b0e16"), w + 1.8, true)
+	ci.draw_line(_bx(xf, hipx, hipy), _bx(xf, kx, ky), col, w, true)
+	ci.draw_line(_bx(xf, kx, ky), _bx(xf, fx, fy), col, w - 0.6, true)
+	# 靴子（横着一小段 —— 有了它，脚才是"踩"在地上而不是"戳"进地里）
+	ci.draw_line(_bx(xf, fx - 4.0, fy + 0.6), _bx(xf, fx + 3.4, fy + 0.6),
+		Color("#0b0e16"), w + 2.6, true)
+	ci.draw_line(_bx(xf, fx - 3.4, fy + 0.4), _bx(xf, fx + 2.8, fy + 0.4),
+		col.darkened(0.25), w + 0.8, true)
+
+
+## 一条**自由摆动**的手臂（肩 → 肘 → 手），用于空手那侧。
+static func _draw_arm(ci: CanvasItem, xf: Dictionary, shx: float, shy: float,
+		ang: float, col: Color, w: float) -> void:
+	var l1 := 7.0
+	var l2 := 6.8
+	var ex := shx + sin(ang) * l1
+	var ey := shy + cos(ang) * l1 * 0.9
+	var hx := ex + sin(ang * 1.35) * l2
+	var hy := ey + cos(ang * 1.35) * l2 * 0.9
+	ci.draw_line(_bx(xf, shx, shy), _bx(xf, ex, ey), Color("#0b0e16"), w + 2.0, true)
+	ci.draw_line(_bx(xf, ex, ey), _bx(xf, hx, hy), Color("#0b0e16"), w + 1.4, true)
+	ci.draw_line(_bx(xf, shx, shy), _bx(xf, ex, ey), col, w, true)
+	ci.draw_line(_bx(xf, ex, ey), _bx(xf, hx, hy), col.lightened(0.06), w - 0.8, true)
+	ci.draw_circle(_bx(xf, hx, hy), w * 0.44, col.lightened(0.16))
+
+
+## 肩 → 手（端点已由武器姿态给出）。肘用手臂中垂线外推一点，
+## 保证手臂是**弯**的 —— 一根直棍会把"手在哪儿"这件事暴露得太明显。
+static func _draw_arm_to(ci: CanvasItem, xf: Dictionary, shx: float, shy: float,
+		hand: Vector2, col: Color, w: float) -> void:
+	var sh := _bx(xf, shx, shy)
+	var d := hand - sh
+	var el := sh.lerp(hand, 0.5)
+	if d.length() > 0.001:
+		el += Vector2(-d.y, d.x).normalized() * 2.6
+	ci.draw_line(sh, el, col, w, true)
+	ci.draw_line(el, hand, col.lightened(0.08), w - 0.9, true)
+	ci.draw_circle(hand, w * 0.5, col.lightened(0.22))
+
+
+## 武器：先进入"武器局部空间"（原点在手、+x 沿武器指向、含每把武器自己的握持偏角），
+## 之后每把武器只描述**自己的形状** —— 于是旋转动画是免费的，不必逐把武器手算三角函数。
+##
+## `grip` 是握持偏角。它不只是审美：灯杖是**竖着**握的、弩是端平的、镰是垂的，
+## 少了它，所有武器都会"指着敌人"，一眼看过去全是同一根棍子。
+## `t` 只喂给链子那类需要行波的形状（纯正弦，不碰 RNG）。
+static func _draw_weapon(ci: CanvasItem, hand: Vector2, ang: float, weapon_id: String,
+		ext: float, push: float, flip: float, t: float) -> void:
+	var grip := 0.0
+	match weapon_id:
+		"staff":
+			grip = -1.42          # 竖握
+		"scythe":
+			grip = -0.52          # 垂下
+		"hammer":
+			grip = -0.38
+		"blade":
+			grip = -0.26
+		"twin":
+			grip = -0.22
+		"chain":
+			grip = -0.16
+		"spear":
+			grip = -0.20
+		_:
+			grip = 0.0            # crossbow：端平
+	var a := ang + grip
+	# 沿武器自身方向推出去（突刺/甩链的主要动作；挥砍类几乎不动，靠旋转）
+	ci.draw_set_transform(hand + Vector2(ext * push, 0.0).rotated(a), a, Vector2(1.0, 1.0))
 	match weapon_id:
 		"twin":
-			# 双灯刃：左右手各一把短刃
-			for side_v in [-1.0, 1.0]:
-				var side := float(side_v)
-				var bx := px + (14.0 + swing * 7.0) * flip * side
-				ci.draw_line(Vector2(px + 7.0 * flip * side, py - 23.0),
-					Vector2(bx, py - 25.0 - swing * 7.0), Color("#c9d3ea"), 2.6, true)
+			# 双灯刃：一前一后两把短刃（左右手各一）
+			for sd in [1.0, -1.0]:
+				var o := Vector2(0.0, float(sd) * 5.0)
+				ci.draw_line(o + Vector2(-8.0, 0.0), o + Vector2(2.0, 0.0), Color("#6d7488"), 2.8, true)
 				ci.draw_colored_polygon(PackedVector2Array([
-					Vector2(bx, py - 30.0 - swing * 7.0),
-					Vector2(bx + 13.0 * flip * side, py - 25.0 - swing * 7.0),
-					Vector2(bx, py - 20.0 - swing * 7.0),
+					o + Vector2(2.0, -4.2), o + Vector2(21.0, 0.0), o + Vector2(2.0, 4.2),
 				]), Color("#e8eeff"))
+				ci.draw_line(o + Vector2(2.0, 0.0), o + Vector2(19.0, 0.0), Color(1, 1, 1, 0.9), 1.2, true)
 		"spear":
-			var sx0 := px + 10.0 * flip
-			var tx := px + (72.0 + swing * 14.0) * flip
-			ci.draw_line(Vector2(sx0, py - 22.0), Vector2(tx, py - 26.0), Color("#6d7488"), 3.0, true)
+			ci.draw_line(Vector2(-14.0, 0.0), Vector2(38.0, 0.0), Color("#6d7488"), 3.0, true)
+			ci.draw_line(Vector2(2.0, -3.4), Vector2(2.0, 3.4), Color("#8a7f66"), 2.2, true)
 			ci.draw_colored_polygon(PackedVector2Array([
-				Vector2(tx, py - 30.0), Vector2(tx + 12.0 * flip, py - 26.0), Vector2(tx, py - 22.0),
+				Vector2(38.0, -4.6), Vector2(56.0, 0.0), Vector2(38.0, 4.6),
 			]), Color("#cfd8ee"))
 		"chain":
-			# 锁灯：一串渐远的链环，末端挂一盏小灯
-			var links := 5
-			for i in links:
-				var lt := float(i) / float(links - 1)
-				var lx := px + (16.0 + 84.0 * lt + swing * 16.0 * lt) * flip
-				var ly := py - 24.0 - sin(lt * PI) * 10.0 - swing * 6.0
-				ci.draw_arc(Vector2(lx, ly), 4.2, 0.0, TAU, 10, Color("#8e8577"), 1.8, true)
-			var ax := px + (108.0 + swing * 18.0) * flip
-			var ay := py - 24.0 - swing * 6.0
-			ci.draw_circle(Vector2(ax, ay), 6.0, Color("#4a4436"))
-			ci.draw_circle(Vector2(ax, ay), 3.2, Color("#ffd98a"))
+			# 锁灯：链环沿武器方向排开，带**行波**（相位随下标递增 → 像被甩出去的鞭）
+			var n := 6
+			var ex := 4.0 + 76.0 + ext * 10.0
+			for i in n:
+				var lt := float(i) / float(n - 1)
+				var lx := 4.0 + lt * (76.0 + ext * 10.0)
+				ci.draw_arc(Vector2(lx, sin(t * 7.0 + lt * 5.2) * lt * 3.4), 3.8,
+					0.0, TAU, 10, Color("#8e8577"), 1.7, true)
+			var ey := sin(t * 7.0 + 5.2) * 3.4
+			ci.draw_circle(Vector2(ex, ey), 6.2, Color("#4a4436"))
+			ci.draw_circle(Vector2(ex, ey), 3.2, Color("#ffd98a"))
 		"hammer":
-			var hx := px + (14.0 + swing * 10.0) * flip
-			ci.draw_line(Vector2(px + 6.0 * flip, py - 24.0), Vector2(hx, py - 10.0 - swing * 8.0),
-				Color("#6b5a44"), 4.0, true)
-			ci.draw_rect(Rect2(hx - 7.0, py - 16.0 - swing * 8.0, 14.0, 12.0), Color("#8a7a5e"))
+			ci.draw_line(Vector2(-18.0, 0.0), Vector2(6.0, 0.0), Color("#6b5a44"), 4.2, true)
+			ci.draw_rect(Rect2(6.0, -8.5, 20.0, 17.0), Color("#6e6047"))
+			ci.draw_rect(Rect2(6.0, -8.5, 20.0, 4.0), Color("#8a7a5e"))
+			ci.draw_line(Vector2(25.0, -8.5), Vector2(25.0, 8.5), Color("#c9b48c"), 2.0, true)
 		"scythe":
-			# 灯镰：长柄 + 一道冷色弯刃（刃朝外的一小段圆弧）
-			var scx := px + (14.0 + swing * 12.0) * flip
-			ci.draw_line(Vector2(px + 4.0 * flip, py - 26.0), Vector2(scx, py - 14.0 - swing * 10.0),
-				Color("#5c5568"), 3.4, true)
-			var arc_c := Vector2(scx + 13.0 * flip, py - 30.0 - swing * 10.0)
-			var a_from := -1.35 if flip > 0.0 else (PI - 1.35)
-			ci.draw_arc(arc_c, 19.0, a_from, a_from + 2.7, 16, Color("#c9f0dc"), 3.0, true)
+			ci.draw_line(Vector2(-20.0, 0.0), Vector2(10.0, 0.0), Color("#5c5568"), 3.6, true)
+			# 弯刃：一道朝侧向勾出去的圆弧（flip 决定勾向哪边）
+			var a0 := -0.5 if flip > 0.0 else (PI + 0.5)
+			var sweep := 2.4 if flip > 0.0 else -2.4
+			ci.draw_arc(Vector2(10.0, 0.0), 22.0, a0, a0 + sweep, 18, Color("#c9f0dc"), 3.2, true)
 		"crossbow":
-			# 灯弩：弩身 + 张开的弓臂 + 一支待发的光矢
-			var cx0 := px + (10.0 + swing * 5.0) * flip
-			ci.draw_line(Vector2(px + 2.0 * flip, py - 22.0), Vector2(cx0 + 16.0 * flip, py - 24.0),
-				Color("#6b6350"), 3.2, true)
-			var bx1 := cx0 + 12.0 * flip
-			ci.draw_line(Vector2(bx1, py - 32.0), Vector2(bx1, py - 16.0), Color("#8e8577"), 2.4, true)
-			ci.draw_line(Vector2(cx0 + 2.0 * flip, py - 24.0), Vector2(bx1 + 8.0 * flip, py - 24.0),
-				Color("#bfe4ff"), 2.0, true)
+			ci.draw_line(Vector2(-8.0, 0.0), Vector2(16.0, 0.0), Color("#6b6350"), 3.2, true)
+			ci.draw_line(Vector2(10.0, -12.0), Vector2(10.0, 12.0), Color("#8e8577"), 2.6, true)
+			ci.draw_line(Vector2(10.0, -11.0), Vector2(20.0, 0.0), Color("#bfe4ff"), 1.6, true)
+			ci.draw_line(Vector2(10.0, 11.0), Vector2(20.0, 0.0), Color("#bfe4ff"), 1.6, true)
+			ci.draw_line(Vector2(20.0, 0.0), Vector2(34.0, 0.0), Color("#e8f4ff"), 2.2, true)
 		"staff":
-			# 灯杖：竖着的长杖，顶端一颗光球
-			var topy := py - 38.0 - swing * 4.0
-			ci.draw_line(Vector2(px + 9.0 * flip, py - 6.0), Vector2(px + 13.0 * flip, topy),
-				Color("#5b5170"), 3.2, true)
-			ci.draw_circle(Vector2(px + 13.0 * flip, topy - 4.0), 6.4, Color("#6d5f8a"))
-			ci.draw_circle(Vector2(px + 13.0 * flip, topy - 4.0), 3.6, Color("#e2d6ff"))
+			ci.draw_line(Vector2(-22.0, 0.0), Vector2(16.0, 0.0), Color("#5b5170"), 3.2, true)
+			ci.draw_circle(Vector2(18.0, 0.0), 6.6, Color("#6d5f8a"))
+			ci.draw_circle(Vector2(18.0, 0.0), 3.8, Color("#e2d6ff"))
 		_:
-			# blade：最初的短刃
-			var bx0 := px + (16.0 + swing * 6.0) * flip
-			ci.draw_line(Vector2(hx0, hy0), Vector2(bx0, py - 26.0 - swing * 6.0),
-				Color("#c9d3ea"), 3.0, true)
-			ci.draw_line(Vector2(px + 4.0 * flip, py - 22.0), Vector2(px + 12.0 * flip, py - 20.0),
-				Color("#5a6076"), 5.0, true)
-
+			# blade：灯刃
+			ci.draw_line(Vector2(-10.0, 0.0), Vector2(1.0, 0.0), Color("#5a6076"), 3.4, true)
+			ci.draw_line(Vector2(1.0, -4.4), Vector2(1.0, 4.4), Color("#8a8f9e"), 2.4, true)
+			ci.draw_colored_polygon(PackedVector2Array([
+				Vector2(1.0, -3.6), Vector2(27.0, 0.0), Vector2(1.0, 3.6),
+			]), Color("#dbe3f6"))
+			ci.draw_line(Vector2(1.0, 0.0), Vector2(24.0, 0.0), Color(1, 1, 1, 0.85), 1.3, true)
+	end_xf(ci)
 
 ## 盲女：看不见的同行者。斗篷偏暖白，胸口一点光比玩家更稳。
 static func girl(ci: CanvasItem, g: Dictionary, cam: Vector2, t: float) -> void:
@@ -559,14 +747,23 @@ static func girl(ci: CanvasItem, g: Dictionary, cam: Vector2, t: float) -> void:
 
 
 ## 玩家胸口灯火（叠加层）
+## ⚠️ 起伏必须取 `Pose.walk` 的 `bob`，不能自己再写一条公式 —— 上一版这里是
+## `absf(sin(p.walk_t)) * 2.2`、身体那边是 2.2 的另一个近似，两边同步漂移，
+## 走到某些相位能看出"火光和胸口错开了"。**同一个量只允许有一个来源。**
+##
+## ⚠️ 光晕半径从 23 收到了 12.5、透明度 0.85 → 0.5：那一团白光会把角色自己
+## **整个吃掉**（躯干、手臂、腿全糊在里头，"更好看的造型"根本看不见）。
+## 设定上它本来就该是"胸口的一点灯"，不是手电筒 —— 照亮地面是 LightRig 那盏
+## 会被墙挡住的 PointLight2D 的活，这里只管**看得见人**。
 static func player_core(ci: CanvasItem, p: PlayerState, cam: Vector2, brightness: float, t: float) -> void:
 	if p.dead:
 		return
+	var st := Pose.walk(p)
 	var px := Proj.sx(p.x, cam.x)
-	var py := Proj.sy(p.y, p.z + absf(sin(p.walk_t)) * 2.2, cam.y)
+	var py := Proj.sy(p.y, p.z + float(st["bob"]), cam.y)
 	var core := 0.6 + brightness * 0.4 + sin(t * 5.0) * 0.06
-	glow(ci, Vector2(px, py - 20.0), 22.0 * core, Color("#ffbe64"), 0.85, 6)
-	ci.draw_circle(Vector2(px, py - 20.0), 3.4 * core, Color("#fff4d6"))
+	glow(ci, Vector2(px, py - 21.0), 12.5 * core, Color("#ffbe64"), 0.5, 6)
+	ci.draw_circle(Vector2(px, py - 21.0), 2.8 * core, Color("#fff4d6"))
 
 
 # ---------------------------------------------------------------- 敌人
