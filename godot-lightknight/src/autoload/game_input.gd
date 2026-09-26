@@ -23,6 +23,13 @@ const ACTIONS := [
 	"draft_prev", "draft_next",
 	## 背包：X 换手（手持 ↔ 背包武器）、C 喝灯油（背包里的回血道具）
 	"swap_weapon", "use_potion",
+	## F11 全屏。**任何界面都要生效**（标题 / 暂停 / 三选一 / 商店 / 对白），
+	## 所以它由 main.advance() 在状态分发**之前**处理，而不是挂在某个状态里。
+	##
+	## ⚠️ 加新动作**必须同时**加进这张表：只 `_register()` 进 InputMap 是不够的 ——
+	## 采样只看这张表，漏了它 `just()` 就永远是 false，键按下去毫无反应
+	## （而且不会报任何错）。本项目这条已经踩过第二次了。
+	"fullscreen",
 ]
 
 ## 瞄准方式：mouse = 鼠标指向（默认）；move = 跟随移动方向（无鼠标/自检时用）
@@ -57,6 +64,7 @@ func _ready() -> void:
 	_register("draft_next", [KEY_E])
 	_register("swap_weapon", [KEY_X])
 	_register("use_potion", [KEY_C])
+	_register("fullscreen", [KEY_F11])
 
 
 func _register(action: String, keys: Array, buttons: Array = []) -> void:

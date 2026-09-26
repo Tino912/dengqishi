@@ -7,7 +7,7 @@
   · 没有连带误伤（别的断言不该无故变红 —— 那说明它们互相耦合，将来会误导人）。
 
 **怎么用**
-    tools/godot-mutate.py              # 跑全部变异（43 个，一个约 1 分钟）
+    tools/godot-mutate.py              # 跑全部变异（50 个，一个约 1 分钟）
     tools/godot-mutate.py 迷雾          # 只跑名字里含「迷雾」的
     tools/godot-mutate.py --list       # 只列出变异清单
     tools/godot-mutate.py --restore-only   # 从备份还原 src（中途崩了用这个）
@@ -775,6 +775,134 @@ MUTATIONS: list[dict] = [
         ],
         "forbid": [
             "★ 换成近战武器（灯镰）总闸就是开的",
+        ],
+    },
+    {
+        "name": "退出全屏时立刻设尺寸（不等窗口模式落定）",
+        # 这是"最自然的写法"，也正是本机（XWayland）会栽的那个坑：
+        # 实测 window_set_mode(WINDOWED) 之后，窗口尺寸**当帧**还报着全屏的
+        # 2560×1600，下一帧才被 WM 改成它自己的 1270×1528。同一步里 set_size
+        # 会被那次覆盖整个吃掉 —— 决策层看不出来，只有真窗口端到端会红。
+        # ⚠️ 与下面「算出来的尺寸不下发」同理：这两条尺寸断言的牙齿依赖
+        # **本机 WM 不会自己把窗口尺寸还回来**。哪天它开始自动还原，
+        # 该改的是判据（断言"我们确实调用过 set_size"），而不是删掉这条变异。
+        "edits": [
+            (
+                "window_mode.gd",
+                "\t\tleft = RESTORE_DELAY if want.x > 0 else 0\n",
+                "\t\tleft = 0\n",
+            ),
+        ],
+        "expect": [
+            "★ 【本机时序陷阱的判据】退出全屏后**恰好**先等 RESTORE_DELAY 步",
+            "★ 退出全屏后窗口尺寸真的被**我们**设回按下之前那个",
+            "★ 标题界面这一轮也把尺寸还原干净了",
+        ],
+    },
+    {
+        "name": "is_fullscreen 只认 FULLSCREEN（漏掉独占全屏）",
+        # 「只认一种全屏」的后果不是"退不出来"这么轻：独占全屏下 F11 会以为
+        # 自己当前不在全屏，于是**再进一次全屏**，玩家就再也出不来了。
+        "edits": [
+            (
+                "window_mode.gd",
+                "\treturn mode == DisplayServer.WINDOW_MODE_FULLSCREEN \\\n"
+                "\t\tor mode == DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN\n",
+                "\treturn mode == DisplayServer.WINDOW_MODE_FULLSCREEN\n",
+            ),
+        ],
+        "expect": [
+            "★ 【只认 FULLSCREEN 是个坑】两种全屏模式都算全屏",
+            "★ 独占全屏下按 F11 是「退出来」",
+        ],
+    },
+    {
+        "name": "进全屏时把「当前报的尺寸」当成窗口尺寸（不看待还原的）",
+        # "刚退出全屏就又按回来"时，那一帧报的还是**全屏尺寸** —— 照抄就会把
+        # 2560×1600 记成"窗口尺寸"，下次退出全屏得到一个占满屏幕的窗口。
+        # 这条只有"把两个动作挤到同一帧"才暴露，所以自检里专门有这么一段。
+        "edits": [
+            (
+                "window_mode.gd",
+                "\tsaved_size = pending if pending.x > 0 else cur_size\n",
+                "\tsaved_size = cur_size\n",
+            ),
+        ],
+        "expect": [
+            "★ 刚退出全屏就又按 F11：不能把这一帧的**全屏尺寸**当成窗口尺寸记下来",
+            "★ 快按两下之后，最终还原的尺寸还是最初那个 1280×720",
+        ],
+    },
+    {
+        "name": "tick 不再核对尺寸是否已经对上（会一直重复设）",
+        # 去掉"已经对了就收工"那一半。掉的是**幂等性**：
+        # 收工之后每步还在设尺寸，等于一直跟 WM 抢。
+        "edits": [
+            (
+                "window_mode.gd",
+                "\tif cur_size == pending:\n"
+                "\t\t# 已经是对的了（WM 自己还原成功，或者上一次设生效了）→ 收工\n"
+                "\t\tpending = Vector2i.ZERO\n"
+                "\t\treturn Vector2i.ZERO\n",
+                "",
+            ),
+        ],
+        "expect": [
+            "★ 设过一次就收工",
+            "★ 收工之后彻底没有待办",
+            "★ 一旦尺寸真的对上就立刻停手",
+        ],
+    },
+    {
+        "name": "F11 只在游戏中生效（等价于把它挪进 play 那个分支）",
+        # 把处理挂进某个状态分支是很自然的写法，代价是**标题界面按不动** ——
+        # 而玩家最先想按 F11 的地方恰恰是标题界面。
+        "edits": [
+            (
+                "main.gd",
+                '\tif GameInput.just("fullscreen"):\n',
+                '\tif GameInput.just("fullscreen") and state == "play":\n',
+            ),
+        ],
+        "expect": [
+            "★ 【界面无关】在**标题界面**（state=title）按 F11 一样生效",
+        ],
+    },
+    {
+        "name": "F11 漏在采样表外面（ACTIONS 里没登记）",
+        # 本轮**真的踩过这个**：新动作只 `_register()` 进 InputMap、忘了加进
+        # ACTIONS，`just()` 就永远是 false —— 键按下去毫无反应，而且**不报任何错**。
+        # 决策层那十几条断言全绿，只有端到端那两条会红。
+        # 留这条变异的意义：这个坑一旦再犯，机器会立刻指出来。
+        "edits": [
+            (
+                "autoload/game_input.gd",
+                '\t"fullscreen",\n]',
+                ']',
+            ),
+        ],
+        "expect": [
+            "★ 【用户要的这条】F11 真的把窗口切成全屏",
+            "★ 【界面无关】在**标题界面**",
+        ],
+    },
+    {
+        "name": "tick 算出来的尺寸不下发（记了不用）",
+        # 决策层算得完全正确，只是**忘了真的去设** —— 这正是"接线"那一层的缺陷。
+        # 条件写成一个永远不成立的式子（而不是删掉整行），是为了让改动尽量局部。
+        # ⚠️ 这条变异的 `expect` 依赖一件事：**本机 WM 不会自己把窗口尺寸还回来**。
+        # 如果哪天它开始自动还原，这两条尺寸断言就同时失去牙齿 ——
+        # 那时应该改的是判据（比如断言"我们确实调用过 set_size"），别把变异删掉了事。
+        "edits": [
+            (
+                "main.gd",
+                "\tif want.x > 0 and want.y > 0:\n\t\tDisplayServer.window_set_size(want)\n",
+                "\tif want.x < 0 and want.y < 0:\n\t\tDisplayServer.window_set_size(want)\n",
+            ),
+        ],
+        "expect": [
+            "★ 退出全屏后窗口尺寸真的被**我们**设回按下之前那个",
+            "★ 标题界面这一轮也把尺寸还原干净了",
         ],
     },
 ]

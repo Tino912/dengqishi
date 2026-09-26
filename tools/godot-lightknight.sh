@@ -107,6 +107,17 @@ echo "▸ 工程:  $PROJ"
 if [ ! -d "$PROJ/.godot" ]; then
   echo "▸ 首次导入…"
   "$GODOT_BIN" --headless --path "$PROJ" --import >/dev/null 2>&1
+else
+  # ⚠️ `.godot` 存在**不代表**它是最新的：`class_name X` 的脚本清单
+  # （global_script_class_cache.cfg）只在工程被扫描时重建。新加了带 class_name
+  # 的脚本却直接跑，引擎会报 **Parse Error: Identifier "xxx" not declared** ——
+  # 看起来像代码写错了（"变量没声明"），其实是缓存旧，极难反查。
+  # 所以这里用"源码比缓存新"当判据，过期就先刷一遍（约 10 秒）。
+  CACHE="$PROJ/.godot/global_script_class_cache.cfg"
+  if [ ! -f "$CACHE" ] || [ -n "$(find "$PROJ/src" -name '*.gd' -newer "$CACHE" -print -quit 2>/dev/null)" ]; then
+    echo "▸ 脚本比类缓存新 → 刷新全局类缓存…"
+    "$GODOT_BIN" --headless --path "$PROJ" --import >/dev/null 2>&1
+  fi
 fi
 
 echo "▸ 运行自检（真实渲染，全程约 1 分钟）…"

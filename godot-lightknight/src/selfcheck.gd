@@ -95,6 +95,10 @@ func _run() -> void:
 	await _section_swing_cone()
 	# 伤害数字的可读性（不重建世界，接着上一段的世界用）
 	await _section_text_readability()
+	# F11 全屏。**排在最末**：这一段会真去切真实窗口（全屏 ↔ 窗口），
+	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
+	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
+	await _section_fullscreen()
 	_finish()
 
 
@@ -4379,6 +4383,219 @@ func _section_text_readability() -> void:
 	report["cases"]["text"] = {
 		"hit": t_hit, "crit": t_crit, "px_small": n_small, "px_big": n_big,
 	}
+
+
+# ================================================================ F11 全屏
+#
+# 这一段回答两件事，因为这一处缺陷有两层，**必须分开验**：
+#   ① 决策对不对 —— 纯状态机 `WindowMode`，逐条钉，**全程不碰真窗口**；
+#   ② 真窗口上管不管用 —— 只在最后端到端按一次，按完还原。
+#
+# 为什么非拆不可：本机（XWayland）有一条**时序陷阱** —— 调完
+# `window_set_mode(WINDOWED)` 之后，窗口尺寸在当帧还报着全屏的尺寸，
+# 下一帧才被 WM 改成它自己的主意（实测 1270×1528）。于是最自然的写法
+# 「切模式 + 立刻 set_size」会被 WM 整个吃掉，退出全屏得到一个陌生尺寸的窗口。
+# 也就是说：**决策错在"什么时候设"上，而这一点只有真窗口才暴露**；
+# 反过来真窗口没法在断言里反复切，所以决策必须能被单独驱动。
+func _section_fullscreen() -> void:
+	const F := DisplayServer.WINDOW_MODE_FULLSCREEN
+	const EF := DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN
+	const WD := DisplayServer.WINDOW_MODE_WINDOWED
+	const MX := DisplayServer.WINDOW_MODE_MAXIMIZED
+	const ZERO := Vector2i.ZERO
+	var want := Vector2i(1280, 720)
+	## 退出全屏那一帧窗口尺寸**还是全屏的**（本机实测 2560×1600），下一帧变成 1270×1528
+	const FS_SIZE := Vector2i(2560, 1600)
+	const WM_SIZE := Vector2i(1270, 1528)
+
+	# ── ① 什么算"已经全屏" ──────────────────────────────────────────
+	_num("全屏_模式号_WINDOWED", float(WD))
+	_num("全屏_模式号_FULLSCREEN", float(F))
+	_ok("★ 【只认 FULLSCREEN 是个坑】两种全屏模式都算全屏 —— 独占全屏（EXCLUSIVE）"
+		+ "如果被当成「不是全屏」，F11 会再进一次全屏，玩家就再也退不出来",
+		WindowMode.is_fullscreen(F) and WindowMode.is_fullscreen(EF)
+			and not WindowMode.is_fullscreen(WD) and not WindowMode.is_fullscreen(MX))
+
+	# ── ② 进全屏：该切模式、该记住现状、**不该设尺寸** ──────────────
+	var m := WindowMode.new()
+	var to_fs := m.press(WD, want)
+	_ok("★ 窗口模式下按 F11 → 切到全屏", to_fs == F, str(to_fs))
+	_num("全屏_进全屏后记下的模式（退出时要还原回它）", float(m.saved_mode))
+	_ok("★ 进全屏时记下了「进之前是什么样」（模式 + 尺寸），退出时才还原得回去",
+		m.saved_mode == WD and m.saved_size == want,
+		"%d / %s" % [m.saved_mode, str(m.saved_size)])
+	_ok("★ 进全屏时不设尺寸（全屏尺寸由 WM 决定，硬设一个反而会被拒）",
+		m.tick(F, FS_SIZE) == ZERO and m.pending == ZERO)
+
+	# ── ③ 退出全屏：**先等落定，再动尺寸** ─────────────────────────
+	var to_wd := m.press(F, FS_SIZE)
+	_ok("★ 全屏下按 F11 → 切回进全屏之前那个模式", to_wd == WD, str(to_wd))
+	_num("全屏_退出后要等几步才动尺寸", float(WindowMode.RESTORE_DELAY))
+	var waited := 0
+	for i in WindowMode.RESTORE_DELAY:
+		if m.tick(WD, WM_SIZE) == ZERO:
+			waited += 1
+	var first_set := m.tick(WD, WM_SIZE)
+	_ok("★ 【本机时序陷阱的判据】退出全屏后**恰好**先等 RESTORE_DELAY 步、"
+		+ "第 RESTORE_DELAY+1 步才设尺寸（实测同一步内设 = 被 WM 吃掉 → 1270×1528）",
+		waited == WindowMode.RESTORE_DELAY and first_set == want,
+		"前 %d 步动了 %d 次；第 %d 步设的是 %s" % [WindowMode.RESTORE_DELAY,
+			WindowMode.RESTORE_DELAY - waited, WindowMode.RESTORE_DELAY + 1, str(first_set)])
+	_ok("★ 设过一次就收工（尺寸已经对了就别再跟 WM 抢）",
+		m.tick(WD, want) == ZERO and m.pending == ZERO)
+	_ok("★ 收工之后彻底没有待办（再 tick 也不许冒出个尺寸来）",
+		m.pending == ZERO and m.tick(WD, Vector2i(800, 600)) == ZERO)
+	_num("全屏_这段纯状态机被按下的次数", float(m.toggles))
+
+	# ── ④ 设一次没生效（被 WM 吃掉）要重试，但有上限 ────────────────
+	var r := WindowMode.new()
+	r.press(WD, want)
+	r.press(F, FS_SIZE)
+	for i in WindowMode.RESTORE_DELAY:
+		r.tick(WD, WM_SIZE)
+	var a1 := r.tick(WD, WM_SIZE)
+	var a2 := r.tick(WD, WM_SIZE)
+	_ok("★ 尺寸没设上会重试（不赌「设一次就生效」）", a1 == want and a2 == want,
+		"%s / %s" % [str(a1), str(a2)])
+	_ok("★ 一旦尺寸真的对上就立刻停手", r.tick(WD, want) == ZERO and r.pending == ZERO)
+	var t := WindowMode.new()
+	t.press(WD, want)
+	t.press(F, FS_SIZE)
+	var tries := 0
+	for i in 300:
+		if t.tick(WD, WM_SIZE) != ZERO:
+			tries += 1
+	_num("全屏_一直设不上时重试了几次", float(tries))
+	_ok("★ 一直设不上也不会无限重试（上限 MAX_TRIES 步，免得每帧跟 WM 抢）",
+		tries == WindowMode.MAX_TRIES and t.pending == ZERO,
+		"%d（上限 %d）" % [tries, WindowMode.MAX_TRIES])
+
+	# ── ⑤ 独占全屏 / 最大化：也要能正确来回 ─────────────────────────
+	var e := WindowMode.new()
+	var e_back := e.press(EF, FS_SIZE)
+	_ok("★ 独占全屏下按 F11 是「退出来」，不是「再进一次全屏」", e_back == WD, str(e_back))
+	var mx := WindowMode.new()
+	mx.press(MX, Vector2i(1600, 900))
+	var mx_back := mx.press(F, FS_SIZE)
+	_ok("★ 从最大化进的 F11，退出后回最大化（不是一律拍成普通窗口）",
+		mx_back == MX, str(mx_back))
+	var mx_zero := 0
+	for i in WindowMode.RESTORE_DELAY + 2:
+		if mx.tick(WD, Vector2i(800, 450)) == ZERO:
+			mx_zero += 1
+	_ok("★ 回最大化时不设尺寸 —— 硬设会把窗口从最大化里拽出来",
+		mx.pending == ZERO and mx_zero == WindowMode.RESTORE_DELAY + 2, str(mx_zero))
+	# 退出全屏必须还原**当时的**模式，而不是写死 WINDOWED
+	_ok("★ 还原用的是「进全屏前记下的模式」，不是写死的 WINDOWED",
+		mx.saved_mode == MX)
+
+	# ── ⑥ 退出全屏后**马上**又按回来（窗口尺寸那一帧还是假的）──────
+	var q := WindowMode.new()
+	q.press(WD, want)
+	q.press(F, FS_SIZE)
+	# 就在这一帧（尺寸报的还是全屏的 2560×1600）又按一次 F11：
+	# 照抄这个尺寸的话，就把它当成了"窗口尺寸"，下次退出全屏会得到一个占满屏幕的窗口。
+	var q_to_fs := q.press(WD, FS_SIZE)
+	_ok("★ 刚退出全屏就又按 F11：不能把这一帧的**全屏尺寸**当成窗口尺寸记下来",
+		q.saved_size == want, str(q.saved_size))
+	_ok("★ 而且这次进全屏要取消那个待还原的尺寸（否则会在全屏里被自己设成窗口尺寸）",
+		q.pending == ZERO and q_to_fs == F)
+	var q_back := q.press(F, FS_SIZE)
+	var q_fix := ZERO
+	for i in WindowMode.RESTORE_DELAY + 2:
+		var s := q.tick(WD, WM_SIZE)
+		if s != ZERO:
+			q_fix = s
+	_ok("★ 快按两下之后，最终还原的尺寸还是最初那个 1280×720",
+		q_back == WD and q_fix == want, "%s / %s" % [str(q_back), str(q_fix)])
+
+	# ── ⑦ 端到端：真窗口上按一次 F11（本段最后，按完全部还原）────────
+	# 前面全在验"决策"，这里必须真按一次 —— 决策对而"下发"漏了，玩家一样没全屏。
+	#
+	# ⚠️ **为什么先刻意把窗口设成一个"谁都不会自己选"的尺寸**（1024×640）：
+	# 实测本机 WM 记着的窗口态尺寸恰好是 1270×1528，而"按 F11 之前的窗口尺寸"
+	# 也正是它 —— 于是"我们还原成功"和"WM 自己把它还回去"是**同一个值**，
+	# `size_back == size0` 就恒真了。实测：把"下发布尺寸"那一步改坏的变异
+	# **打不红它**（等于没牙）。先改成 1024×640，两者才分得开：
+	# 下发了 → 1024×640；没下发 → WM 把它带回 1270×1528。
+	# 补上这一步之后，同一条变异立刻把它打红（见 godot-mutate.py 里的
+	# 「tick 算出来的尺寸不下发」）。
+	const TEST_SIZE := Vector2i(1024, 640)
+	var size_ambient := DisplayServer.window_get_size()
+	DisplayServer.window_set_size(TEST_SIZE)
+	await _settle()
+	await _settle()
+	var size0 := DisplayServer.window_get_size()
+	var mode0 := DisplayServer.window_get_mode()
+	var toggles0 := main.fs.toggles
+	_num("全屏_端到端那轮按下时主状态机在 play 吗", 1.0 if main.state == "play" else 0.0)
+	_num("全屏_按下前的窗口宽度（刻意设成 1024）", float(size0.x))
+	_num("全屏_按下前的窗口高度（刻意设成 640）", float(size0.y))
+	_ok("★ 前提：真窗口能被设成测试尺寸 —— 设不上，下面两条尺寸断言就无从谈起",
+		size0 == TEST_SIZE, str(size0))
+	_tap("fullscreen")
+	await _settle()
+	await _settle()
+	var mode_fs := DisplayServer.window_get_mode()
+	_tap("fullscreen")
+	await _settle()
+	await _settle()
+	var mode_back := DisplayServer.window_get_mode()
+	# 让状态机走完"等落定 → 设尺寸"，再给真帧一点时间
+	_pump(WindowMode.RESTORE_DELAY + WindowMode.MAX_TRIES + 4)
+	await _settle()
+	var size_back := DisplayServer.window_get_size()
+	_num("全屏_按下前窗口是不是全屏", 1.0 if WindowMode.is_fullscreen(mode0) else 0.0)
+	_num("全屏_按下后窗口是不是全屏", 1.0 if WindowMode.is_fullscreen(mode_fs) else 0.0)
+	_num("全屏_再按一次之后是不是还在全屏", 1.0 if WindowMode.is_fullscreen(mode_back) else 0.0)
+	_num("全屏_退出后尺寸是否回到原值", 1.0 if size_back == size0 else 0.0)
+	_num("全屏_退出后的窗口宽度", float(size_back.x))
+	_num("全屏_退出后的窗口高度", float(size_back.y))
+	_num("全屏_这一段真按下的次数", float(main.fs.toggles - toggles0))
+	_ok("★ 【用户要的这条】F11 真的把窗口切成全屏（走的是输入表，不是绕过输入直接调函数）",
+		not WindowMode.is_fullscreen(mode0) and WindowMode.is_fullscreen(mode_fs)
+			and main.fs.toggles == toggles0 + 2,
+		"按下前 %d → 按下后 %d，按下次数 %d" % [mode0, mode_fs, main.fs.toggles - toggles0])
+	_ok("★ 再按一次 F11 真的退出全屏，并且还原成**按下之前那个模式**",
+		not WindowMode.is_fullscreen(mode_back) and mode_back == mode0,
+		"按下前 %d → 还原后 %d" % [mode0, mode_back])
+	_ok("★ 退出全屏后窗口尺寸真的被**我们**设回按下之前那个（1024×640）—— "
+		+ "把「把算出来的尺寸下发出去」那步改坏，这条立刻红",
+		size_back == size0, "%s vs %s" % [str(size_back), str(size0)])
+
+	# ── ⑧ F11 与界面无关：**标题界面上也得生效** ────────────────────
+	# 玩家最先想按 F11 的地方恰恰是标题界面与暂停菜单。把这段处理挂进
+	# 某个状态分支（"play" 里最自然）是很常见的写法，而那样标题界面就按不动。
+	# 这里只改 `state` 这一个变量、不重建世界，验完立刻改回去。
+	var state_keep := main.state
+	main.state = "title"
+	var toggles_t := main.fs.toggles
+	_tap("fullscreen")
+	await _settle()
+	var mode_title := DisplayServer.window_get_mode()
+	var taps_title := main.fs.toggles - toggles_t
+	_tap("fullscreen")
+	await _settle()
+	_pump(WindowMode.RESTORE_DELAY + WindowMode.MAX_TRIES + 2)
+	await _settle()
+	var size_title := DisplayServer.window_get_size()
+	main.state = state_keep
+	_num("全屏_标题界面按下后是不是全屏", 1.0 if WindowMode.is_fullscreen(mode_title) else 0.0)
+	_num("全屏_标题界面按下时记到几次", float(taps_title))
+	_ok("★ 【界面无关】在**标题界面**（state=title）按 F11 一样生效 —— "
+		+ "处理放在状态机分发之前才有这个性质，挂进某个分支就会漏掉",
+		taps_title == 1 and WindowMode.is_fullscreen(mode_title),
+		"记到 %d 次，模式 %d" % [taps_title, mode_title])
+	_ok("★ 标题界面这一轮也把尺寸还原干净了（免得后面的人接手一个陌生窗口）",
+		size_title == size0, "%s vs %s" % [str(size_title), str(size0)])
+	_num("全屏_标题界面那轮退出后的窗口宽度", float(size_title.x))
+	_num("全屏_标题界面那轮退出后的窗口高度", float(size_title.y))
+
+	# 收尾：把窗口还成进来时那个尺寸 —— 别给下一个人留一个 1024×640 的窗口。
+	# 这一句不参与断言，所以**不进报告**（记进去会让 report.json 依赖"环境进来时多大"，
+	# 确定性就没了：同一份代码两次跑会因为 WM 记着上次的尺寸而写出不同的报告）。
+	DisplayServer.window_set_size(size_ambient)
+	await _settle()
 
 
 ## 从整屏截图里裁出玩家特写并放大 k 倍（对照图用）

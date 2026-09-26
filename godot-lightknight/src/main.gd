@@ -49,6 +49,10 @@ var run_seed := 0
 var waves_off := false
 
 var _acc := 0.0
+## F11 全屏的状态机。**决策在 WindowMode 里**（纯逻辑、可逐条断言），
+## 这里只负责把它的结论下发给真实窗口 —— 窗口操作没法在断言里反复做。
+var fs := WindowMode.new()
+
 var _dlg_lines := []
 var _dlg_i := 0
 var _pending_dlg := []
@@ -127,7 +131,7 @@ func show_title() -> void:
 		"第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗　→　第三关 · 灯河渡口\n"
 		+ "「外庭的灯还亮着，这是你最好的日子。」\n\n"
 		+ "WASD 移动　鼠标瞄准　J 挥击　Shift 冲刺　1/2/3 技能　E 交互\n"
-		+ "X 换手（手持 ↔ 背包武器）　C 喝灯油（背包里的回血道具）\n"
+		+ "X 换手（手持 ↔ 背包武器）　C 喝灯油（背包里的回血道具）　F11 全屏\n"
 		+ "每开一局，八把武器各随机带一种元素（火/冰/雷/毒/光），攻击会上状态。\n"
 		+ "地图上有宝箱，能开出带词条的武器；守灯人能重铸 / 锤炼武器、卖灯油。\n"
 		+ "清空一波会跳出三选一：Q / E 左右看，空格拿走。死了就重来一趟。\n"
@@ -200,6 +204,18 @@ func _free_world() -> void:
 ## 一次固定步进：采样输入 → 推进世界 → 路由事件 → 刷新界面
 func advance(dt: float) -> void:
 	GameInput.sample()
+
+	# F11 全屏 —— **放在状态分发之前**，所以标题 / 对白 / 暂停 / 三选一 / 商店
+	# 里按 F11 都有效。挂在某个状态分支里就做不到这一点（玩家最先想按 F11 的
+	# 地方恰恰是标题界面）。
+	if GameInput.just("fullscreen"):
+		DisplayServer.window_set_mode(fs.press(DisplayServer.window_get_mode(),
+			DisplayServer.window_get_size()))
+	# 退出全屏后要等窗口模式落定才敢设尺寸（时序陷阱见 WindowMode 的注释），
+	# 所以这里每步都问一次状态机"现在该不该设、设成多少"。
+	var want := fs.tick(DisplayServer.window_get_mode(), DisplayServer.window_get_size())
+	if want.x > 0 and want.y > 0:
+		DisplayServer.window_set_size(want)
 
 	match state:
 		"title":
@@ -685,4 +701,3 @@ func debug_state() -> Dictionary:
 		d["chests_left"] = unopened
 		d["chests_total"] = world.chests.size()
 	return d
-
