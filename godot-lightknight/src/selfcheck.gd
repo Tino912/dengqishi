@@ -4171,6 +4171,90 @@ func _section_swing_cone() -> void:
 		"band_back": snappedf(band_back, 0.0001), "band_null": snappedf(band_null, 0.0001),
 	}
 
+	# ── ⑤ 远程武器（灯弩）开火时**不该有**任何挥击视觉 ────────────────
+	# 用户报的现象：灯弩"开枪"会顺带甩出一道很宽的亮弧。
+	# 成因不是几何算错，而是 ③月牙刃漏在了"这把武器到底有没有扇面"这道门外 ——
+	# ①范围线被拦住了、③没有，于是远程武器照样画刀弧：半径 = cone_r × 1.34，
+	# 而灯弩的 cone_r（456）是八把武器里最远的，所以那道弧又宽又远、特别显眼。
+	#
+	# 三条断言一层比一层"有牙"：
+	#   ① 逻辑 —— 直接问绘制层的总闸 `swing_visual_on()`，灯弩必须关着；
+	#   ② 对照 —— 同一条件换近战武器（灯镰）必须开着，否则①是恒真式；
+	#   ③ 像素 —— 同一把武器、同一朝向、同一 `attack_t`，**只翻**「亮弧 + 月牙刃」
+	#      这个开关：灯弩身上一件挥击视觉都没有，所以两帧必须一模一样；
+	#      同样的操作换灯镰则必须有明显差别（否则等于旋钮失灵，②就没人替它作证）。
+	p.weapon_id = "crossbow"
+	p.facing = 0.0
+	p.swing_cone = w.swing_cone(Content.WEAPONS["crossbow"], 1.0, 1.0)
+	p.attack_t = Pose.ATTACK_DUR
+	var xb_r: float = float(p.swing_cone["r"])
+	var xb_on := w.swing_visual_on()
+	_num("灯弩_这一次挥击的半径（八把里最远）", xb_r)
+	_ok("★ 【用户报的这条】灯弩开火时绘制层的总闸是关的（范围线 / 亮弧 / 月牙刃一个都不画）",
+		not xb_on, "cone_r=%.1f" % xb_r)
+	report["cases"]["cone"]["xbow"] = {
+		"cone_r": snappedf(xb_r, 0.01), "visual_on": xb_on,
+	}
+	w.set_swing_guide_only(true)
+	w.mark_redraw()
+	var im_xb_guide := await _grab()
+	w.mark_redraw()
+	var im_xb_guide2 := await _grab()       # 同一状态重取一帧（判据干净度对照）
+	w.set_swing_guide_only(false)
+	w.mark_redraw()
+	var im_xb_full := await _grab()
+	# 对照武器：同样设上 attack_t，换成灯镰 —— 总闸必须是开的。
+	p.weapon_id = "scythe"
+	p.swing_cone = w.swing_cone(Content.WEAPONS["scythe"], 1.0, 1.0)
+	_ok("★ 换成近战武器（灯镰）总闸就是开的 —— 上面那条不是「永远返回 false」",
+		w.swing_visual_on())
+	w.set_swing_guide_only(true)
+	w.mark_redraw()
+	var im_sc_guide := await _grab()
+	w.set_swing_guide_only(false)
+	w.mark_redraw()
+	var im_sc_full := await _grab()
+	# 采样窗**分两种尺寸**，各有各的理由：
+	#   · "必须精确为 0" 那两条用**大窗**（600×420）—— 覆盖越广，越不容易漏掉误画出来的东西。
+	#     而"精确为 0"这个判据天然不受窗大小影响（什么都没画就是 0），所以大窗是纯赚。
+	#   · "必须看得出来"那条用**小窗**（400×280）—— 它测的是占比，窗越大被空地稀释得越狠。
+	#     大窗实测只有 2.06%，离 1% 的阈值只有两倍余量；小窗能到 13% 上下，稳得多。
+	#     （月牙刃画在玩家左上 108 像素处、贴图 224 像素，小窗正好把它整个装进去。）
+	var r_win := Rect2i(int(foot.x) - 300, int(foot.y) - 220, 600, 420)
+	var r_ctl := Rect2i(int(foot.x) - 200, int(foot.y) - 220, 400, 280)
+	r_win = r_win.intersection(Rect2i(0, 0, im_xb_guide.get_width(), im_xb_guide.get_height()))
+	r_ctl = r_ctl.intersection(Rect2i(0, 0, im_sc_guide.get_width(), im_sc_guide.get_height()))
+	var d_xb := _region_diff(im_xb_guide, im_xb_full, r_win)
+	var d_xb_null := _region_diff(im_xb_guide, im_xb_guide2, r_win)
+	# ⚠️ 控制组用**动了多少占比**、不用均值。均值会被窗里的空地稀释 ——
+	# 大窗只有 0.0056，拿它当"看得出来"的判据会误判成"旋钮失灵"。
+	# （0 那两条仍然用均值："精确为 0"是均值天然就擅长的判据，不受稀释影响。）
+	var m_sc := _region_moved(im_sc_guide, im_sc_full, r_ctl)
+	var d_sc := _region_diff(im_sc_guide, im_sc_full, r_win)
+	_num("灯弩_翻「亮弧+月牙刃」开关前后的画面差（必须为 0）", d_xb)
+	_num("灯弩_同一状态重取一帧的画面差（必须为 0）", d_xb_null)
+	_num("灯镰_同一个开关前后的画面差（小窗均值，仅供参考）", d_sc)
+	_num("灯镰_同一个开关前后「动了的像素」占比（对照：必须看得出来）", m_sc)
+	_ok("★ 【用户报的这条】灯弩「开枪」时翻掉亮弧与月牙刃的开关，画面**一模一样**（它本来就没有这些东西）",
+		d_xb < 1e-9, "%.6f" % d_xb)
+	_ok("★ 上面那条的判据是干净的（同一状态重取一帧，差必须精确为 0）",
+		d_xb_null < 1e-9, "%.6f" % d_xb_null)
+	_ok("★ 这个开关对近战武器是有效的（灯镰关掉亮弧 + 月牙刃，画面明显不同）",
+		m_sc > 0.01, "占比 %.4f / 均值 %.4f" % [m_sc, d_sc])
+	# 对照图：左 = 灯弩开火（**什么都没有**），中 = 灯镰但把亮弧与月牙刃关了（只剩范围线），
+	# 右 = 灯镰照常画（范围线 + 月牙刃）。三格连起来看，"总闸"到底管了哪几件东西一目了然。
+	# 取景比 35 那张大一号：月牙刃会甩到玩家左上方 ~190 像素处，窗小了会把刃切掉一半。
+	var r_shot := Rect2i(int(foot.x) - 180, int(foot.y) - 200, 360, 300).intersection(
+		Rect2i(0, 0, im_xb_full.get_width(), im_xb_full.get_height()))
+	_write_png(_grid([_pose_tile(im_xb_full, r_shot, 2), _pose_tile(im_sc_guide, r_shot, 2),
+		_pose_tile(im_sc_full, r_shot, 2)], 3), "37-xbow-vs-melee")
+	report["cases"]["cone"]["xbow"]["d_full"] = snappedf(d_xb, 0.0001)
+	report["cases"]["cone"]["xbow"]["d_null"] = snappedf(d_xb_null, 0.0001)
+	report["cases"]["cone"]["xbow"]["d_melee"] = snappedf(d_sc, 0.0001)
+	report["cases"]["cone"]["xbow"]["m_melee"] = snappedf(m_sc, 0.0001)
+	w.set_swing_guide_only(false)
+	p.attack_t = 0.0
+
 
 ## 沿"地面上的一圈/一扇"采样，返回两帧的平均通道差。
 ##
@@ -4242,14 +4326,15 @@ func _section_text_readability() -> void:
 	var t_crit: float = float(Art.TEXT_SIZE["crit"])
 	_num("飘字_普通命中的字号", t_hit)
 	_num("飘字_暴击的字号", t_crit)
-	_ok("★ 命中字号 ≥ 20（原来的 14 就是用户说的「看不清」）", t_hit >= 20.0, "%.1f" % t_hit)
+	_ok("★ 命中字号 ≥ 28（初版 14、上一版 22 —— 用户两次都说小，所以这次抬到 30）",
+		t_hit >= 28.0, "%.1f" % t_hit)
 	_ok("★ 暴击字号 > 普通命中字号（暴击要一眼分得出来）", t_crit > t_hit,
 		"%.1f vs %.1f" % [t_crit, t_hit])
 	var too_small := ""
 	for k in Art.TEXT_SIZE.keys():
-		if float(Art.TEXT_SIZE[k]) < 15.0:
+		if float(Art.TEXT_SIZE[k]) < 20.0:
 			too_small += "%s=%.1f " % [k, float(Art.TEXT_SIZE[k])]
-	_ok("★ 每一个飘字键的字号都 ≥ 15（元素刻字 / DoT 也别回到「看不清」）",
+	_ok("★ 每一个飘字键的字号都 ≥ 20（元素刻字 / DoT 也别回到「看不清」）",
 		too_small == "", too_small)
 	# 衬底辉光必须是**显式标记**出来的，不能是"字号够大就发光"这种隐式规则 ——
 	# 字号一调，隐式规则会把暴击与普通命中划到同一边去。
@@ -4296,10 +4381,10 @@ func _section_text_readability() -> void:
 	}
 
 
-## 从整屏截图里裁出玩家特写并放大 2 倍（对照图用）
-func _pose_tile(im: Image, r: Rect2i) -> Image:
+## 从整屏截图里裁出玩家特写并放大 k 倍（对照图用）
+func _pose_tile(im: Image, r: Rect2i, k := 3) -> Image:
 	var t := im.get_region(r)
-	t.resize(r.size.x * 3, r.size.y * 3, Image.INTERPOLATE_NEAREST)
+	t.resize(r.size.x * k, r.size.y * k, Image.INTERPOLATE_NEAREST)
 	return t
 
 

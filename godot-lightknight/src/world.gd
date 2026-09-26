@@ -536,6 +536,20 @@ static func has_swing_sector(w: Dictionary) -> bool:
 	return str(w.get("style", "slash")) != "shot"
 
 
+## 这一次挥击要不要画「近战挥击的那套视觉」—— ①范围线 / ②扫过的亮弧 / ③月牙刃。
+##
+## `attack_t > 0` 只说明"正在出招"，**不说明这把武器会挥**：灯弩也是
+## `attack_t = 0.2`，但它射的是光矢。所以三件视觉的**总闸**是这里，而不是
+## 各自在 `_draw` 里各判一次 —— 上一轮只把 ① 拦住了，③ 漏在门外，
+## 于是灯弩"开枪"会顺带甩出一道又宽又远的刀弧（半径 = cone_r × 1.34，
+## 而灯弩的 cone_r 是八把武器里最远的），这就是用户报的那个现象。
+##
+## 抽成函数是为了让自检能直接问"灯弩这一次到底该不该画"，
+## 而不是靠读 `_draw` 的缩进层级去猜。
+func swing_visual_on() -> bool:
+	return player.attack_t > 0.0 and not player.dead and has_swing_sector(player.weapon())
+
+
 ## 挥击范围线的**顶点表**（纯函数，不负责画）。
 ##
 ## `cone_hits` 回答"这个点在不在形状里"，这里把同一个形状描出来。
@@ -3424,7 +3438,7 @@ func draw_bloom(ci: CanvasItem) -> void:
 		var sweep := a0 + (a1 - a0) * t01
 		var px2 := Proj.sx(player.x, c.x)
 		var gy2 := Proj.sy(player.y, 0.0, c.y)
-		if has_swing_sector(w) and not player.dead:
+		if swing_visual_on():
 			# ① **标出来的线**：这一刀真正能打到的形状，一笔描出来。
 			#    形状由 `World.cone_polygon` 生成 —— 与判定用的 `cone_hits`
 			#    是同一个形状，自检里用 is_point_in_polygon 逐点比对。
@@ -3441,20 +3455,26 @@ func draw_bloom(ci: CanvasItem) -> void:
 				var tail := minf(0.9, float(cone["arc"]))
 				Art.ground_arc(ci, px2, gy2, cone_r, maxf(a0, sweep - tail), sweep,
 					Color(1.0, 0.95, 0.82, 0.55 * (1.0 - t01)), 4.0)
-		# 月牙斩：一道有弧度的亮刃跟着扫过去 —— 打击感主要来自这一下。
-		# 位置与朝向都在**屏幕空间**（贴图是用 draw_set_transform 转的），
-		# 所以 y 要按 YSQUASH 压一下、角度也要换算，才能和地面上那道弧严丝合缝。
-		# 半径也换成 cone 的：原来用 `range * reach_mul() * 1.34`，
-		# 既漏了 `range_mul`（连刺时刃会甩到判定之外），又比判定远 34%。
-		if not swing_guide_only:
+		# ③ 月牙斩：一道有弧度的亮刃跟着扫过去 —— 打击感主要来自这一下。
+		#    位置与朝向都在**屏幕空间**（贴图是用 draw_set_transform 转的），
+		#    所以 y 要按 YSQUASH 压一下、角度也要换算，才能和地面上那道弧严丝合缝。
+		#    半径也换成 cone 的：原来用 `range * reach_mul() * 1.34`，
+		#    既漏了 `range_mul`（连刺时刃会甩到判定之外），又比判定远 34%。
+		#
+		#    ⚠️ 它的条件里**必须**re-问一次 `swing_visual_on()`。上一轮只把 ① 拦住了、
+		#    ③ 漏在外面，于是灯弩开火会甩出一道几百像素宽的刀弧（那条 bug 的成因
+		#    与复现都在这里）。这一句看着与外层重复，其实是**变异锚点**：
+		#    `tools/godot-mutate.py` 把它改回 `if not swing_guide_only:` 就是原样复现。
+		if not swing_guide_only and swing_visual_on():
 			var rad := cone_r * 1.34
 			var sxp := px2 + cos(sweep) * rad * 0.70
 			var syp := gy2 - 24.0 + sin(sweep) * rad * 0.70 * Proj.YSQUASH
 			var scr := atan2(sin(sweep) * Proj.YSQUASH, cos(sweep))
 			# 月牙形状按武器挑一个：重武器宽、突刺类窄，八把武器一眼能看出差别。
 			# 朝左时竖直镜像 —— 镜像一次加旋转正好等于水平镜像，朝向就对上了。
+			# （原来这里还挂着灯弩，现在它到不了这儿了 —— 到得了就是有 bug。）
 			var sn := "01"
-			if player.weapon_id == "spear" or player.weapon_id == "crossbow":
+			if player.weapon_id == "spear":
 				sn = "03"
 			elif player.weapon_id == "hammer" or player.weapon_id == "scythe":
 				sn = "02"
