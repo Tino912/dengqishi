@@ -85,6 +85,10 @@ var dev_spawned := false
 
 var light_rig: LightRig
 var bloom: Bloom
+var fog: Fog
+## 迷雾开关（默认开）。像素类断言要能关掉它，否则量到的是雾而不是世界层
+## —— 与 HUD 那层暗角的 `set_post_enabled(false)` 同一个道理。
+var fog_enabled := true
 ## 这一帧实际用于绘制的相机（含震屏偏移）。光照层也用它，否则影子会与画面脱开。
 var draw_cam := Vector2.ZERO
 
@@ -274,6 +278,15 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 	bloom.world = self
 	add_child(bloom)
 
+	# 迷雾层：**画在 Bloom 之后**（树的顺序就是绘制顺序），HUD 是独立的 CanvasLayer，
+	# 所以它盖住世界、但不盖界面。见 fog.gd 类头那三条设计决定。
+	fog = Fog.new()
+	fog.name = "Fog"
+	fog.world = self
+	add_child(fog)
+	fog.setup(level)
+	fog.set_enabled(fog_enabled)
+
 	Art.ensure_font()
 	_update_objective()
 	emit_hud()
@@ -415,9 +428,49 @@ func skill_cost(cost: int) -> int:
 	return maxi(1, cost - boon("cost_cut") - affix_lv("frugal"))
 
 
-## 攻击范围倍率（灯芯·远 + 词条「远」）
+## 攻击范围倍率（**基础加成** + 灯芯·远 + 词条「远」）
+##
+## 基础加成是用户要的"适当提升角色初始的攻击范围"：原来的手感是"刀太短、
+## 明明贴上了却挥空"，所以给所有武器一起抬一档（灯刃 66 → 79）。
+##
+## 写法刻意用**加法**而不是"整体乘一个系数"：`reach_mul()` 每级 +0.12 是
+## 已有的、逐级验过的断言（"点一级「远」，范围正好多 0.12"），
+## 乘系数会把 +0.12 变成 +0.12×系数，那条断言立刻失真。
+const BASE_REACH := 1.20
+
 func reach_mul() -> float:
-	return 1.0 + float(boon("reach")) * 0.12 + float(affix_lv("reach")) * 0.12
+	return BASE_REACH + float(boon("reach")) * 0.12 + float(affix_lv("reach")) * 0.12
+
+
+## 这一下挥击实际能打到的距离（世界单位）。绘制弧线、命中判定、攻击灯
+## 三处都从这里取，才不会"光甩到哪儿"与"刀能打到哪儿"对不上。
+func swing_reach() -> float:
+	return float(player.weapon()["range"]) * reach_mul()
+
+
+## 迷雾开关。像素类断言与对照实验要能关掉它（否则"墙后到底暗不暗"量到的是雾），
+## 与 HUD 那层暗角的 `set_post_enabled(false)` 是同一个道理。
+func set_fog_enabled(on: bool) -> void:
+	fog_enabled = on
+	if fog != null:
+		fog.set_enabled(on)
+
+
+## 这一点"这一刻应该"被照亮多少（1 = 雾该散尽，0 = 该是最浓的雾）。
+## **不含回填滞后** —— 用来问"这盏灯够不够得着这里"，不受"雾还没合拢"干扰。
+func fog_target_at(x: float, y: float) -> float:
+	return 0.0 if fog == null else fog.target_at(x, y)
+
+
+## 这一点**画面上现在**被照亮多少（同样 1 = 雾散尽）。含回填滞后：
+## 灯刚离开时它还是高的，要过一会儿才掉下去。
+func fog_reveal_at(x: float, y: float) -> float:
+	return 0.0 if fog == null else fog.reveal_at(x, y)
+
+
+## 雾的浓度（0 = 没雾，1 = 雾最浓）。含回填滞后，与 `fog_reveal_at` 互补。
+func fog_density_at(x: float, y: float) -> float:
+	return 1.0 - fog_reveal_at(x, y)
 
 
 ## 暴击概率（灯芯·锐 + 词条「锐」）
@@ -1108,6 +1161,9 @@ func damage_mul() -> float:
 ## 这条衰减**不消耗任何 RNG**，在冻结期间调用不会挪动随机流，所以自检的确定性不受影响。
 func tick_fx(dt: float) -> void:
 	flash_power = maxf(0.0, flash_power - dt * 2.4)
+	# 迷雾的"清关散尽"也走这条路：它同样是给玩家看的反馈，不该被面板冻住。
+	if fog != null:
+		fog.tick_fade(dt)
 
 
 ## 固定步长推进。游戏内与自检都走这一条路径。
@@ -1140,6 +1196,9 @@ func step(dt_raw: float) -> void:
 
 	if light_rig != null:
 		light_rig.sync(self)
+	# 迷雾在光照之后同步：它要读这一帧灯的位置（`light_rig.src_*`）。
+	if fog != null:
+		fog.sync(self, dt)
 	queue_redraw()
 	# 叠加层是独立的 CanvasItem，它的内容完全由世界状态决定，
 	# 不显式标脏它就会一直停在最后一次重绘的画面（表现为"玩家脚下那圈光池
@@ -2369,6 +2428,9 @@ func _on_boss_dead() -> void:
 	boss_dead = true
 	cleared = true
 	ambient = float(level.get("cleared_ambient", 0.58))
+	# 这一关的雾散尽 —— 与"抬亮天色"一起，把清关那一下做得有个交代
+	if fog != null:
+		fog.disperse()
 	events.append({"type": "boss_end"})
 	events.append({"type": "level_cleared"})
 	# 第二关：通关时盲女燃尽自己点亮灯塔 → 「盲女之灯」给你一次濒死复燃
@@ -3201,12 +3263,14 @@ func draw_bloom(ci: CanvasItem) -> void:
 		var sweep := a0 + (a1 - a0) * t01
 		var px2 := Proj.sx(player.x, c.x)
 		var gy2 := Proj.sy(player.y, 0.0, c.y)
-		Art.ground_arc(ci, px2, gy2, float(w["range"]) * 0.9, sweep - 0.9, sweep,
+		# 弧线的半径也乘 `reach_mul()`：**画出来的弧必须与打得中的范围一致**，
+		# 否则"提升攻击范围"会变成"刀还是那么短、但判定偷偷变远了"。
+		Art.ground_arc(ci, px2, gy2, float(w["range"]) * reach_mul() * 0.9, sweep - 0.9, sweep,
 			Color(1.0, 0.95, 0.82, 0.55 * (1.0 - t01)), 4.0)
 		# 月牙斩：一道有弧度的亮刃跟着扫过去 —— 打击感主要来自这一下。
 		# 位置与朝向都在**屏幕空间**（贴图是用 draw_set_transform 转的），
 		# 所以 y 要按 YSQUASH 压一下、角度也要换算，才能和地面上那道弧严丝合缝。
-		var rad := float(w["range"]) * 1.34
+		var rad := float(w["range"]) * reach_mul() * 1.34
 		var sxp := px2 + cos(sweep) * rad * 0.70
 		var syp := gy2 - 24.0 + sin(sweep) * rad * 0.70 * Proj.YSQUASH
 		var scr := atan2(sin(sweep) * Proj.YSQUASH, cos(sweep))

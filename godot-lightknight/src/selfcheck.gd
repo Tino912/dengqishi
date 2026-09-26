@@ -88,6 +88,8 @@ func _run() -> void:
 	await _section_elements()
 	await _section_attack_light()
 	await _section_level3_art()
+	# 迷雾 / 夜色排在**最末**：这一段会重建世界、搬动玩家、还会把这一关的雾放掉。
+	await _section_fog_night()
 	_finish()
 
 
@@ -267,6 +269,69 @@ func _diff_ratio(a: Image, b: Image, pa: Vector2, pb: Vector2,
 				diff += 1
 			n += 1
 	return float(diff) / maxf(1.0, float(n))
+
+
+## 把一张图里以某点为中心的那块裁下来，摊平成一串颜色。
+## 越界的位置填 (-1,-1,-1) 当占位符，好让两张图**同一个相对坐标**的采样一一对齐。
+func _crop_samples(img: Image, p: Vector2, hw := 260, hh := 200,
+		step := 4) -> PackedVector3Array:
+	var out := PackedVector3Array()
+	for dy in range(-hh, hh + 1, step):
+		for dx in range(-hw, hw + 1, step):
+			var x := int(p.x) + dx
+			var y := int(p.y) + dy
+			if x < 0 or y < 0 or x >= img.get_width() or y >= img.get_height():
+				out.append(Vector3(-1.0, -1.0, -1.0))
+				continue
+			var c := img.get_pixel(x, y)
+			out.append(Vector3(c.r, c.g, c.b))
+	return out
+
+
+## 与 `_diff_ratio` 同样的裁块比较，但**先各自减掉自己那块的平均色**。
+##
+## 为什么必须多这一个：地图整体提亮一档之后，任何两张图的逐像素差会直接顶到 ~99%
+## —— 于是「三张图不一样」那三条断言退化成恒真，全绿也不再说明任何事。
+## 减掉平均色等于把"整体明暗 / 统一色偏"这个自由度消掉，剩下的差异只可能来自
+## **结构与纹理本身**：同一张图换个滤镜会被归一化抵掉（差异 ≈ 0），
+## 真换了地图才留下差异。而且它自带对照 —— 同一关重建两次在两种度量下都该是 0。
+func _diff_ratio_norm(a: Image, b: Image, pa: Vector2, pb: Vector2,
+		hw := 260, hh := 200, step := 4, eps := 0.02) -> float:
+	var sa := _crop_samples(a, pa, hw, hh, step)
+	var sb := _crop_samples(b, pb, hw, hh, step)
+	var n := mini(sa.size(), sb.size())
+	var ma := Vector3.ZERO
+	var mb := Vector3.ZERO
+	var m := 0
+	for i in n:
+		var va := sa[i]
+		var vb := sb[i]
+		if va.x < 0.0 or vb.x < 0.0:
+			continue
+		ma += va
+		mb += vb
+		m += 1
+	if m == 0:
+		return 0.0
+	ma = ma / float(m)
+	mb = mb / float(m)
+	# ⚠️ 第二趟也必须跳过越界的占位符。第一版漏了这一步，而 `m` 只统计有效对，
+	# 于是"有效差异数"能超过"有效对数" —— 实测吐出了 101.6% / 112.0% 这种不可能的值。
+	# 越界为什么会发生：裁块以**各自图里玩家的屏幕位置**为中心，而相机是带前瞻偏移的
+	# （玩家并不总在屏幕正中），所以靠边的裁块会有一小条越界。
+	var diff := 0
+	var valid := 0
+	for i in n:
+		var va2 := sa[i]
+		var vb2 := sb[i]
+		if va2.x < 0.0 or vb2.x < 0.0:
+			continue
+		valid += 1
+		var da := va2 - ma
+		var db := vb2 - mb
+		if absf(da.x - db.x) + absf(da.y - db.y) + absf(da.z - db.z) > eps:
+			diff += 1
+	return float(diff) / maxf(1.0, float(valid))
 
 
 func _w() -> World:
@@ -592,6 +657,16 @@ func _section_light_occlusion() -> void:
 	_ok("测遮挡时已关闭 HUD 后处理（暗角），避免污染世界采样",
 		not main.hud.post.visible)
 
+	# ── 迷雾也要关掉 ──
+	# 迷雾是一层**独立于光照的全屏叠加**（见 fog.gd）：它会同时给"墙前 / 墙后 /
+	# 射程外"三个点加一层雾，把"光有没有被挡住"的差压小。这与上面那层暗角是
+	# 同一类污染，而且更隐蔽 —— 雾是跟着灯走的，看起来"像是光的一部分"。
+	# 所以世界层的像素测量一律把它关掉；迷雾本身在 `_section_fog_night()` 里单独验。
+	w.set_fog_enabled(false)
+	_pump(2)
+	_ok("测世界层亮度时已关闭迷雾层（否则量到的是雾，不是光）",
+		not w.fog.visible)
+
 	# 站在测试墙西侧、开阔处，把连击顶到 40 层并锁住（= 满亮度档）。
 	# 灯要离墙够近（x=450 → 离墙左沿 70px）：否则"墙后"本来就落在灯半径之外，
 	# 就分不清那里的"暗"是遮挡造成的、还是光根本没照到——对照组会失去意义。
@@ -679,23 +754,31 @@ func _section_light_occlusion() -> void:
 		"back_drop_pct": snappedf(100.0 * (back_off - back_on) / maxf(0.0001, back_off), 0.01),
 	}
 
-	_ok("黑暗生效：全屏平均亮度很低", mean_on < 0.30, "%.4f" % mean_on)
-	_ok("灯光生效：墙前明显亮于远处（≥3×）", front_on > far_on * 3.0,
-		"前 %.4f  远 %.4f  比 %.2f" % [front_on, far_on, front_on / maxf(1e-4, far_on)])
-	_ok("★ 遮挡成立：同一采样点，开阴影后亮度掉一半以上", back_on < back_off * 0.5,
-		"开 %.4f  关 %.4f  降幅 %.1f%%" % [back_on, back_off,
-		100.0 * (back_off - back_on) / maxf(0.0001, back_off)])
-	_ok("★ 墙后确实成了暗区（相对墙前）", back_on < front_on * 0.35,
+	# 「光在这一点的增量」= 该点亮度 − 同一帧的底噪基线（射程外、照不到的那点）。
+	#
+	# ⚠️ 这一组断言原来比的是**比值**（"墙后比远处亮 2 倍"）。地图提亮之后
+	# 那个写法就不成立了，而且**不是因为遮挡坏了**：底色本身从 0.008 涨到 ~0.17 之后，
+	# 光贡献 0.07 会被底色的除法压成 1.26 倍 —— 测的其实是底色。
+	# "光到底有没有照到那一点"本来就是**加法**的事，所以改成看增量。比值仍旧记进报告。
+	var inc_on := back_on - far_on
+	var inc_off := back_off - far_on
+	report["samples"]["back_increment_on"] = snappedf(inc_on, 0.0001)
+	report["samples"]["back_increment_off"] = snappedf(inc_off, 0.0001)
+	_num("开阴影_墙后光的增量", inc_on)
+	_num("关阴影_墙后光的增量", inc_off)
+
+	_ok("夜色生效：地图不再是纯黑（全屏平均亮度 > 0.05）", mean_on > 0.05, "%.4f" % mean_on)
+	_ok("仍然是晚上（全屏平均亮度 < 0.45，没亮成白天）", mean_on < 0.45, "%.4f" % mean_on)
+	_ok("灯光生效：墙前比射程外明显更亮（增量 ≥ 0.15）", front_on > far_on + 0.15,
+		"前 %.4f  远 %.4f  增量 %.4f" % [front_on, far_on, front_on - far_on])
+	_ok("★ 遮挡成立：开阴影后，墙后那点上「光的增量」被削掉七成以上",
+		inc_on < inc_off * 0.30, "开 %.4f  关 %.4f" % [inc_on, inc_off])
+	_ok("★ 关阴影时墙后确实被光照到（增量 ≥ 0.03，不是「本来就照不到」）",
+		inc_off >= 0.03, "%.4f" % inc_off)
+	_ok("★ 开阴影时墙后压到「照不到的远处」同一水平（增量 ≤ 0.02）",
+		inc_on <= 0.02, "%.4f" % inc_on)
+	_ok("★ 墙后确实成了暗区（相对墙前）", back_on < front_on * 0.75,
 		"后 %.4f  前 %.4f" % [back_on, front_on])
-	# 下面两条是一对，合起来才能排除「墙后本来就照不到、所以怎么测都暗」这个伪因：
-	#   开阴影 → 墙后亮度落到「射程外的远处」同一水平（被压实到地板底噪）
-	#   关阴影 → 同一个点明显亮于远处（说明光其实够得着，只是被墙挡了）
-	_ok("★ 开阴影时墙后压到「照不到的远处」同一水平（≈地板底噪）",
-		back_on <= far_on * 1.15, "后 %.4f  远 %.4f  比 %.2f" % [back_on, far_on,
-		back_on / maxf(1e-4, far_on)])
-	_ok("★ 关阴影时墙后明显亮于「照不到的远处」（光够得着，是被挡了）",
-		back_off > far_on * 2.0, "关 %.4f  远 %.4f  比 %.2f" % [back_off, far_on,
-		back_off / maxf(1e-4, far_on)])
 
 	# ── 灯的贴图是"竖压椭圆"（= 地面正圆），不是屏幕正圆 ──
 	# 地面上等距的东/北两点亮度应当接近 1:1。屏幕正圆会让北向多照约 70%。
@@ -733,6 +816,9 @@ func _section_light_occlusion() -> void:
 	w.prog["up"]["light"] = up_light0
 	# 后处理（暗角）恢复 —— 后面的截图要的是玩家真正看到的画面
 	main.hud.set_post_enabled(true)
+	# 迷雾也恢复
+	w.set_fog_enabled(true)
+	_pump(2)
 
 	# 把宝箱放回去（`append` 回末尾，props 顺序不变）
 	for c in chest_bak:
@@ -1005,8 +1091,8 @@ func _section_bot_playthrough() -> void:
 		# 肉鸽：清空一波会弹三选一，而此时**世界是冻结的**（main.state == "draft"）。
 		# 机器人也必须会选 —— 否则它会永远卡在面板上，症状是
 		# 「击杀数停在第一波、最高连击不再涨、Boss 永不出现」。
-		# 选哪一项：优先拿恩赐。机器人的走位阈值（62px 压上 / 44px 退开）是照近战写的，
-		# 随到弩或灯杖它根本不会用 —— 那才是"机器人变菜"的真正原因，不是武器不好。
+		# 选哪一项：优先拿恩赐。交手距离由武器射程推出来（见下面 rch 那段注释）——
+		# 这一条曾经是"机器人时好时坏"的根源：写死的近战阈值遇到灯弩/灯杖就废了。
 		if main.state == "draft":
 			var pick := 0
 			for j in main._draft_items.size():
@@ -1045,6 +1131,15 @@ func _section_bot_playthrough() -> void:
 			if ed < 132.0:
 				pack += Vector2(e.x - p.x, e.y - p.y) / maxf(ed, 1.0)
 				pack_n += 1
+		# 机器人的交手距离**从武器的真实攻击距离推出来**，不再写死 62/64/44。
+		# 原因是一条实测出来的"机器人变菜"：那三个常数是照近战（灯刃）写的，
+		# 一旦这局的武器是灯弩（射程 380）或灯杖，机器人就会一直贴到 60px 才出手，
+		# 等于完全不会用远程 —— 症状是"同一份代码，机器人时而清完三波、时而只清一波"。
+		# 现在它按 `swing_reach()` 出手，攻击范围一提升，它也跟着在更远处打。
+		var rch: float = w.swing_reach()
+		var keep_out: float = clampf(rch * 0.50, 30.0, 130.0)    # 贴太近就退开，别白挨刀
+		var press_in: float = clampf(rch * 0.78, 44.0, 180.0)    # 压进射程
+		var atk_at: float = clampf(rch * 0.95, 56.0, 200.0)      # 出手距离
 		var danger := pack_n >= 3 and p.hp < p.max_hp * 0.75
 		if tgt != null:
 			var to := Vector2(tgt.x - p.x, tgt.y - p.y)
@@ -1054,12 +1149,12 @@ func _section_bot_playthrough() -> void:
 				var u := to / d
 				if danger and pack.length_squared() > 0.0001:
 					dir = -pack.normalized()   # 突出包围圈
-				elif d > 62.0:
+				elif d > press_in:
 					dir = u            # 压进射程
-				elif d <= 44.0:
+				elif d <= keep_out:
 					dir = -u           # 太贴脸就退开，别白挨刀
-			want_atk = d < 64.0 and not danger
-			want_skill = d < 60.0 and p.combo >= 4.0 and not danger
+			want_atk = d < atk_at and not danger
+			want_skill = d < atk_at * 0.85 and p.combo >= 4.0 and not danger
 		else:
 			GameInput.aim_world = null
 			var aim := _next_goal(w)
@@ -1067,7 +1162,7 @@ func _section_bot_playthrough() -> void:
 			if to.length() > 0.001:
 				dir = to.normalized()
 		# 关键：攻击必须"按下—松开"交替。世界用的是 just("attack")（边沿触发），
-		# 一直按住只会挥出第一刀，之后机器人就再也不出招了。
+			# 一直按住只会挥出第一刀，之后机器人就再也不出招了。
 		pulse = not pulse
 		GameInput.set_override("attack", want_atk and pulse)
 		GameInput.set_override("skill1", want_skill and pulse)
@@ -2049,6 +2144,17 @@ func _section_shop() -> void:
 	var cb0 := w.combo_bonus()
 	var sc0 := w.skill_cost(4)
 
+	# ── 起步攻击范围：这一条必须**绝对**，不能只是相对 ──
+	# 下面每一条词条断言都是"比 rc0 多多少"。所以哪怕 `BASE_REACH` 整体退回 1.0，
+	# 那些相对断言照样全绿 —— 谁来钉住"这一轮把起步攻击范围上调了"这件事？
+	# 就是下面这两条：一条钉倍率，一条钉**真正落到刀锋上的世界距离**。
+	_ok("★ 起步攻击范围 = 基础射程 ×1.20（这一轮上调过；退回 1.0 会让「够不着」的老手感回来）",
+		is_equal_approx(snappedf(rc0, 0.001), 1.20), "%.4f" % rc0)
+	_ok("★ 起步的刀锋真的够到 79.2（刀射程 66 × 1.20，不是只改了倍率没接到武器上）",
+		is_equal_approx(snappedf(w.swing_reach(), 0.01), 79.2), "%.2f" % w.swing_reach())
+	_num("起步攻击范围倍率", rc0)
+	_num("起步刀锋够到多远", w.swing_reach())
+
 	w.prog["waffix"]["blade"] = [{"id": "edge", "lv": 2}]
 	_ok("词条「锋」真的进了伤害倍率（+24%）",
 		is_equal_approx(snappedf(w.damage_mul(), 0.001), snappedf(d0 * 1.24, 0.001)),
@@ -2614,6 +2720,11 @@ func _section_attack_light() -> void:
 	var p := _p()
 	p.hp = p.max_hp
 	p.invuln = 9999.0
+	# 迷雾关掉：这一段量的是"这一盏攻击灯加了/减了多少亮度"，
+	# 而迷雾会同时给采样点加一层、还会被灯本身驱散（两个效应混在一起）。
+	# 迷雾被攻击灯驱散这件事，在 `_section_fog_night()` 里单独验。
+	w.set_fog_enabled(false)
+	_pump(2)
 	# 把「玩家自己的光」冻住：连击与辉光都会改玩家灯的半径与亮度，
 	# 不冻住的话下面的前后对比就同时动了两个变量，测出来的差值说明不了是谁干的。
 	p.combo = 0.0
@@ -2769,6 +2880,285 @@ func _section_attack_light() -> void:
 	_pump(2)
 
 
+# ================================================================ 迷雾 · 夜色
+
+## 「迷雾」与「夜色」两件事的验收。
+##
+## 这一段**排在最后**：它会重建世界、把玩家搬来搬去、还会把这一关的雾放掉。
+## 插在中间会把后面那些依赖位置与随机流的段落整体挪位（见 `_run()` 的排序说明）。
+##
+## 三条主张，各自用**独立的证据**：
+##   ① 地图可见但像晚上 —— 全屏平均亮度落在"能看清地形"与"不是白天"之间；
+##   ② 灯照到的地方雾散、照不到的地方雾满 —— 直接读照亮场 + 像素对照；
+##   ③ 墙会把"散雾"也挡住 —— 同一盏灯、**同距离**的两个点，一个在墙后、一个在空地。
+func _section_fog_night() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	_pump(40)
+	var w := _w()
+	var p := _p()
+	# 清场：敌人自光、弹丸灯、留场光球都会往照亮场里加东西，
+	# 采样时就说不清"那一格是被谁照亮的"。这一段只想看玩家自己那盏灯。
+	for e in w.enemies:
+		e.dead = true
+	w.enemies.clear()
+	w.drops.clear()
+	w.projs.clear()
+	w.effects.clear()
+	w.shake = 0.0
+	# 站在出生点原地不动（`teleport` 会把相机也一起钉到人身上，
+	# 于是"玩家在屏幕正中"这件事是算得出来的，不是碰运气）
+	w.teleport(300.0, 1350.0)
+	_pump(30)
+
+	_ok("迷雾层随关卡一起建好、并且默认开着",
+		w.fog != null and w.fog.enabled and w.fog.visible)
+	_ok("迷雾是挂在**世界**里的子节点（所以它盖得住世界）",
+		w.fog.get_parent() == w)
+	# HUD 在自己的 CanvasLayer 上（layer 10），与世界的绘制顺序无关 ——
+	# 所以不管雾画在世界里的哪一层，都盖不到血条与三选一面板。
+	_ok("★ 界面不受迷雾影响（HUD 在自己的 CanvasLayer 上，层号高于世界）",
+		main.hud is CanvasLayer and main.hud.layer >= 1, "layer=%d" % main.hud.layer)
+	_ok("迷雾挂在世界层、而界面挂在更高的 CanvasLayer —— 两者不在同一套绘制顺序里",
+		main.hud.get_parent() == main and w.fog.get_parent() == w)
+
+	# ── ① 照亮场：脚下散、远处满 ──
+	var g := w.fog.grid_target_copy()
+	var vmax := 0.0
+	var v_dark := 0
+	for i in g.size():
+		vmax = maxf(vmax, g[i])
+		if g[i] < 0.10:
+			v_dark += 1
+	var rev_here := w.fog_reveal_at(p.x, p.y)
+	_num("玩家脚下的迷雾揭示度", rev_here)
+	_num("照亮场里最亮的一格", vmax)
+	_num("整屏全是雾的格子数", 0.0, v_dark)
+	report["cases"]["fog"] = {
+		"grid": [Fog.GRID_W, Fog.GRID_H], "rays": Fog.RAYS,
+		"mist_max": Fog.MIST_MAX, "refill_per_s": Fog.REFILL,
+		"fade_t": Fog.FADE_T, "opener_max": Fog.OPENER_MAX,
+		"player_reveal": snappedf(rev_here, 0.0001),
+		"grid_max": snappedf(vmax, 0.0001),
+		"grid_dark_cells": v_dark, "grid_cells": g.size(),
+	}
+	_ok("★ 灯照在脚下：那一格没有雾", rev_here > 0.85, "%.3f" % rev_here)
+	_ok("★ 整屏不是一层均匀的雾：既有被照亮的格子，也有满雾的格子",
+		vmax > 0.85 and v_dark > g.size() / 4,
+		"最亮 %.3f　满雾格 %d/%d" % [vmax, v_dark, g.size()])
+
+	# ── ② 像素级：同一帧、同一世界，只切「迷雾开不开」──
+	# 采样点固定的两个：玩家脚下（雾已散）和正北 480（照不到、满雾）。
+	# 后者离出生点的火盆够远（离得最近的火盆 506px，火盆光照 210）——
+	# 这一点是算过的，不是"应该没事"。
+	var spot_lit := _screen_of(w, p.x, p.y)
+	var spot_dark := _screen_of(w, p.x, p.y - 480.0)
+	_ok("两个采样点都在画面内（否则读到的格子是被夹到边上的）",
+		spot_dark.y > 20.0 and spot_dark.y < float(VIEW_H) - 20.0
+		and spot_lit.x > 20.0 and spot_lit.x < float(VIEW_W) - 20.0,
+		"亮 %.0f,%.0f　暗 %.0f,%.0f" % [spot_lit.x, spot_lit.y, spot_dark.x, spot_dark.y])
+	w.set_fog_enabled(false)
+	_pump(2)
+	var img_nofog := await _grab()
+	w.set_fog_enabled(true)
+	_pump(2)
+	var img_fog := await _grab()
+	var lit_off := _lum(img_nofog, spot_lit, 6)
+	var lit_on := _lum(img_fog, spot_lit, 6)
+	var dark_off := _lum(img_nofog, spot_dark, 6)
+	var dark_on := _lum(img_fog, spot_dark, 6)
+	var mean_off := _mean_lum(img_nofog)
+	var mean_on := _mean_lum(img_fog)
+	_num("关雾_玩家脚下亮度", lit_off)
+	_num("开雾_玩家脚下亮度", lit_on)
+	_num("关雾_远处亮度", dark_off)
+	_num("开雾_远处亮度", dark_on)
+	_num("关雾_全屏平均亮度", mean_off)
+	_num("开雾_全屏平均亮度", mean_on)
+	report["cases"]["fog"]["pixel"] = {
+		"lit_off": lit_off, "lit_on": lit_on,
+		"dark_off": dark_off, "dark_on": dark_on,
+		"mean_off": mean_off, "mean_on": mean_on,
+	}
+	# 注意采样点的亮度**含 HUD 的暗角**（这一段没关后处理，量的是玩家真看到的画面）：
+	# 暗角是径向的，所以整屏均值那一条是"整体观感"，两个定点是"同一像素的前后"。
+	_ok("★ 没被照亮的地方：雾让画面亮起来（那些角落不再是纯黑）",
+		dark_on > dark_off + 0.02, "关雾 %.4f -> 开雾 %.4f" % [dark_off, dark_on])
+	_ok("★ 灯光照亮的地方：几乎看不出有雾（雾在那儿散掉了）",
+		absf(lit_on - lit_off) < 0.05, "关雾 %.4f -> 开雾 %.4f" % [lit_off, lit_on])
+	_ok("★ 夜色：地图可见但不是白天（全屏平均亮度落在 0.05 ~ 0.45）",
+		mean_on > 0.05 and mean_on < 0.45, "%.4f" % mean_on)
+	_ok("迷雾让全屏更亮一档（「地图可见」这条主要靠它）", mean_on > mean_off + 0.01,
+		"%.4f -> %.4f" % [mean_off, mean_on])
+
+	# ── ②b 夜色旋钮必须真的接在画面上 ──
+	#
+	# ⚠️ 光断言"地图不是纯黑"**抓不到**「夜色被拧到最暗」这个失败方式：调色板提亮之后，
+	# 就算 `CanvasModulate` 一直取 `NIGHT_MIN`，画面也只是**暗掉一半**，远谈不上纯黑
+	# （三关 ambient 0.90 / 0.955 / 0.975 现在都落在 `t` 的可动区间里）。
+	# 变异测试 `夜色永远压到最暗一档` 正是拿这条**没红**暴露出来的。
+	# 所以改成"同一帧、同一世界，**只拧 `world.ambient` 这一个变量**"做前后对照 ——
+	# 这跟遮挡那组看增量的道理一样：**要证明旋钮接上了，就得让旋钮转一下**。
+	var amb0 := w.ambient
+	var mean_night := mean_on
+	w.ambient = 0.98            # d = 0.02 → t ≈ 0 → 最暗一档 NIGHT_MIN
+	_pump(1)
+	var mean_darkest := _mean_lum(await _grab())
+	w.ambient = amb0
+	_pump(1)
+	_num("夜色最暗档_全屏平均亮度", mean_darkest)
+	report["cases"]["fog"]["pixel"]["mean_darkest"] = mean_darkest
+	_ok("★ 夜色旋钮真的接在画面上（只把 ambient 拧到最暗，全屏明显变暗）",
+		mean_night > mean_darkest + 0.02,
+		"本关 %.4f -> 最暗档 %.4f" % [mean_night, mean_darkest])
+
+	_write_png(img_fog, "20-fog-on")
+	_write_png(img_nofog, "21-fog-off")
+
+	# ── ③ 墙会把"散雾"也挡住（这是遮挡的**第二个独立证人**）──
+	# 迷雾用的是自己那套射线扇求交（`Proj.ray_rect_dist`），与 `PointLight2D`
+	# 的影子系统是两套代码。同距离两点、一墙之隔，差别只可能来自那面墙。
+	var up_light0 := int(w.prog["up"]["light"])
+	w.prog["up"]["light"] = 6                 # 把灯拉大一档（半径 → 620）
+	w.teleport(450.0, 500.0)
+	p.combo = 40.0
+	p.combo_timer = 1e9
+	p.glow = 1.0
+	_pump(150)
+	w.shake = 0.0
+	_pump(1)
+	p.combo = 40.0
+	p.combo_timer = 1e9
+	p.glow = 1.0
+	_pump(2)
+	var r_big := w.player_light_radius()
+	var front := Vector2(500.0, 500.0)        # 灯与墙之间
+	var behind := Vector2(690.0, 500.0)       # 墙后（东 240）
+	var open_s := Vector2(450.0, 740.0)       # 空地（南 240）
+	var d_behind := Proj.dist(450.0, 500.0, behind.x, behind.y)
+	var d_open := Proj.dist(450.0, 500.0, open_s.x, open_s.y)
+	var rev_front := w.fog_reveal_at(front.x, front.y)
+	var rev_behind := w.fog_reveal_at(behind.x, behind.y)
+	var rev_open := w.fog_reveal_at(open_s.x, open_s.y)
+	_num("满灯光照半径", r_big)
+	_num("雾_墙前揭示度", rev_front)
+	_num("雾_墙后揭示度", rev_behind)
+	_num("雾_空地(同距离)揭示度", rev_open)
+	report["cases"]["fog"]["wall"] = {
+		"light_r": r_big, "front": rev_front, "behind": rev_behind, "open": rev_open,
+		"d_behind": snappedf(d_behind, 0.1), "d_open": snappedf(d_open, 0.1),
+	}
+	_ok("对照两点到灯的距离相同（差 < 0.5px，所以「远近」不是解释）",
+		absf(d_behind - d_open) < 0.5, "%.2f vs %.2f" % [d_behind, d_open])
+	_ok("近处（灯与墙之间）雾是散的", rev_front > 0.85, "%.3f" % rev_front)
+	_ok("★ 同距离的空地方雾散了（光够得着）", rev_open > 0.35, "%.3f" % rev_open)
+	_ok("★ 同距离的墙后雾没散（被那面墙挡住了）", rev_behind < 0.10, "%.3f" % rev_behind)
+
+	# ── ④ 雾会回填：灯不再照到那个点之后，雾慢慢合拢回来 ──
+	# `target` 是"这一刻该多亮"（瞬间归零），`reveal` 是"画面上现在多亮"
+	# （按 REFILL 每秒 1.6 慢慢掉）—— 这条尾巴就是"灯扫过去留下一道正在合拢的痕迹"。
+	#
+	# ⚠️ 这里刻意**不搬动相机**。照亮场是**屏幕空间**的（一格对应屏幕上一小块），
+	# 相机一移动，同一个世界点就落到别的格子上去了，量到的其实是"另一格的历史" ——
+	# 第一版就是把玩家传送走，结果 `reveal` 直接读到 0，看着像"雾瞬间合拢"。
+	# 改用"灯不再照那里"：连击掉光 → 光照半径从 620 缩回 150，
+	# 240px 外那一点就出了灯范围 —— 这正是玩家断连击时看到的那一幕，相机不动。
+	var g0 := Vector2(450.0, 740.0)          # 满连击时被照到（240px 外），断连击后就照不到
+	var rev0 := w.fog_reveal_at(g0.x, g0.y)
+	w.prog["up"]["light"] = up_light0        # 灯收回常规档（半径 620 → 150）
+	p.combo = 0.0
+	p.glow = 0.0
+	p.combo_timer = 0.0
+	_pump(4)                                 # 至少重建一次，`target` 才是新鲜的
+	var tgt := w.fog_target_at(g0.x, g0.y)
+	var rev1 := w.fog_reveal_at(g0.x, g0.y)
+	_pump(30)                                # 0.5 秒
+	var rev2 := w.fog_reveal_at(g0.x, g0.y)
+	_num("雾回填_灯还照着时", rev0)
+	_num("雾回填_灯不照了(目标值)", tgt)
+	_num("雾回填_之后0.07秒(画面值)", rev1)
+	_num("雾回填_之后0.57秒(画面值)", rev2)
+	report["cases"]["fog"]["refill_test"] = {
+		"lit": rev0, "target_after": tgt, "cur_after": rev1, "cur_later": rev2,
+	}
+	_ok("回填对照：灯还照着时那个点确实是亮的", rev0 > 0.45, "%.3f" % rev0)
+	_ok("回填对照：那个点周围没有别的灯（否则测不出回填）", tgt < 0.10, "%.3f" % tgt)
+	_ok("★ 灯刚不照了，画面还是亮的（雾不会瞬间糊上来）", rev1 > rev0 - 0.35,
+		"目标 %.3f 而画面 %.3f" % [tgt, rev1])
+	_ok("★ 0.5 秒后雾明显合拢回来", rev2 < rev1 - 0.25, "%.3f -> %.3f" % [rev1, rev2])
+
+	# ── ⑤ 攻击的灯也散雾 ──
+	# 朝南挥（南边是空地：东边那面测试墙会把攻击灯自己挡掉，用东向测会得到假阴性）。
+	# 前后两次只差「有没有在挥」：玩家灯的参数、位置、朝向全部冻住。
+	w.teleport(450.0, 500.0)
+	w.projs.clear()
+	w.effects.clear()
+	p.weapon_id = "crossbow"                   # 射程 380：刀锋灯甩得比玩家灯那圈雾远
+	p.attack_cd = 0.0
+	p.attack_t = 0.0
+	p.combo = 0.0
+	p.glow = 0.0
+	p.combo_timer = 0.0
+	GameInput.aim_world = Vector2(p.x, p.y + 400.0)
+	_pump(20)
+	var spot_atk := Vector2(450.0, 750.0)      # 南 250：玩家灯那圈雾（123）够不到
+	var atk_before := w.fog_reveal_at(spot_atk.x, spot_atk.y)
+	_tap("attack")
+	_pump(5)
+	var atk_after := w.fog_reveal_at(spot_atk.x, spot_atk.y)
+	var fx_n := 0
+	for i in w.light_rig.source_count():
+		if str(w.light_rig.src_kind[i]) == "fx":
+			fx_n += 1
+	_num("挥击前_南250的雾揭示度", atk_before)
+	_num("挥击后_南250的雾揭示度", atk_after)
+	report["cases"]["fog"]["attack"] = {
+		"before": atk_before, "after": atk_after, "fx_lights": fx_n,
+	}
+	_ok("挥击时确实点起了攻击类灯（否则下一条无从谈起）", fx_n > 0, str(fx_n))
+	_ok("挥击前那一点在被照亮的范围之外（对照前提）", atk_before < 0.10,
+		"%.3f" % atk_before)
+	_ok("★ 挥击的灯把刀锋那一片的雾也驱散了", atk_after > 0.40,
+		"%.3f -> %.3f" % [atk_before, atk_after])
+	await _shot("22-swing-fog")
+	GameInput.aim_world = null
+
+	# ── ⑥ 三关各有各的雾色 + 清关时雾散尽 ──
+	var mists := []
+	for i in 3:
+		mists.append(str((Content.LEVELS[i]["palette"] as Dictionary).get("mist", "")))
+	_ok("★ 三关各有自己的雾色（雾也是地图美术的一部分）",
+		mists[0] != mists[1] and mists[1] != mists[2] and mists[0] != mists[2], str(mists))
+	_ok("雾色取自关卡表的 palette.mist，不是写死的",
+		w.fog.fog_color().is_equal_approx(Color.html(mists[0])),
+		"%s vs %s" % [str(w.fog.fog_color()), mists[0]])
+	var f0 := w.fog.fade()
+	var mm0 := float(w.fog.mat.get_shader_parameter("mist_max"))
+	w.fog.disperse()
+	w.tick_fx(0.6)
+	var f1 := w.fog.fade()
+	var mm1 := float(w.fog.mat.get_shader_parameter("mist_max"))
+	_num("清关前浓淡系数", f0)
+	_num("清关0.6秒后浓淡系数", f1)
+	report["cases"]["fog"]["fade"] = {"before": f0, "after": f1, "mist_max_after": mm1}
+	_ok("★ 清关时这一关的雾会慢慢散掉", f1 < f0 - 0.30, "%.2f -> %.2f" % [f0, f1])
+	_ok("雾的浓淡真的接到了着色器上（不是只在状态里自娱自乐）",
+		absf(mm0 - Fog.MIST_MAX * f0) < 0.001 and absf(mm1 - Fog.MIST_MAX * f1) < 0.001,
+		"%.3f vs %.3f" % [mm1, Fog.MIST_MAX * f1])
+	w.fog.reset_fade()
+	w.tick_fx(2.0)
+	_ok("雾散尽之后还能重新聚起来（重开同一关要用）", w.fog.fade() > 0.95,
+		"%.2f" % w.fog.fade())
+
+	# 收尾：世界停在一个干净的正常状态（雾开着、后处理开着）
+	w.set_fog_enabled(true)
+	GameInput.aim_world = null
+	_pump(2)
+
+
 # ================================================================ 第三张地图 · 三图风格 · 敌人样貌
 
 func _section_level3_art() -> void:
@@ -2857,12 +3247,24 @@ func _section_level3_art() -> void:
 		_ok("第 %d 关的敌人倍率来自关卡表" % (i + 1),
 			is_equal_approx(float(w.level["enemy_scale"]), scales[i]),
 			"%.2f vs %.2f" % [float(w.level["enemy_scale"]), scales[i]])
+		# 比画面差异之前把迷雾关掉：这一段量的是**地图美术**（地形几何 + 配色），
+		# 而迷雾是另一层、还跟着 `world.time` 飘 —— 不关掉的话连"同一关重建两次"
+		# 都会被它飘成两张不同的图，下面那几条就失去了对照。
+		# 迷雾本身在 `_section_fog_night()` 里单独验。
+		w.set_fog_enabled(false)
+		_pump(2)
+		if i == 0:
+			_ok("三图对比时已关闭迷雾层（这一段量的是地图美术，不是雾）",
+				not w.fog.visible)
 		var img := await _grab()
 		imgs.append(img)
 		lums.append(_mean_lum(img))
 		pcs.append(_screen_of(w, w.player.x, w.player.y))
 		if i == 2:
-			_write_png(img, "16-level3")
+			# 封面照反过来带上迷雾 —— 那才是玩家真正看到的第三关
+			w.set_fog_enabled(true)
+			_pump(2)
+			await _shot("16-level3")
 			report["cases"]["level3"] = {
 				"name": str(w.level["name"]), "index": int(w.level["index"]),
 				"w": float(w.level["w"]), "h": float(w.level["h"]),
@@ -2881,12 +3283,20 @@ func _section_level3_art() -> void:
 
 	# 三张画面必须真的不一样。比的是**各自玩家周围那一片**：
 	# 整屏比会全都"一样"（这游戏的屏幕大部分是黑的），只比平均亮度又只能看出明暗。
+	#
+	# ⚠️ 但**只看原始逐像素差在提亮之后就废了**：底色从 ~0.008 涨到 ~0.17，
+	# 于是任何两张图都有 ~99% 的像素差 > eps，那三条断言变成恒真。
+	# 所以真正的判据换成 `_diff_ratio_norm`（扣掉整体明暗之后的**结构**差异），
+	# 原始值仍旧记进报告，好让"归一化是不是把该留的留下了"可以对人核对。
 	for a in 3:
 		for b in range(a + 1, 3):
 			var r := _diff_ratio(imgs[a], imgs[b], pcs[a], pcs[b])
-			_ok("★ 地图 %d 与地图 %d 在出生点周围的画面差异 > 25%%（不是同一张图换了个滤镜）"
-				% [a + 1, b + 1], r > 0.25, "%.1f%%" % (r * 100.0))
-			report["samples"]["art_diff_%d_%d" % [a + 1, b + 1]] = snappedf(r, 0.0001)
+			var rn := _diff_ratio_norm(imgs[a], imgs[b], pcs[a], pcs[b])
+			_ok("★ 地图 %d 与地图 %d 不是「同一张图换了个滤镜」（扣掉整体明暗后仍有 >15%% 的像素长得不一样）"
+				% [a + 1, b + 1], rn > 0.15,
+				"归一化 %.1f%%　原始 %.1f%%" % [rn * 100.0, r * 100.0])
+			report["samples"]["art_diff_%d_%d" % [a + 1, b + 1]] = snappedf(rn, 0.0001)
+			report["samples"]["art_raw_%d_%d" % [a + 1, b + 1]] = snappedf(r, 0.0001)
 
 	# 对照：同一关**重建两次**，画面应当几乎逐像素相同。
 	# 这一条是上面那三个百分数的地基 —— 没有它，"30% 不同"根本说明不了什么，
@@ -2900,12 +3310,18 @@ func _section_level3_art() -> void:
 	main.start_level()
 	_pump(40)
 	var w_same := _w()
+	w_same.set_fog_enabled(false)
+	_pump(2)
 	var img_same := await _grab()
 	var pc_same := _screen_of(w_same, w_same.player.x, w_same.player.y)
 	var r_same := _diff_ratio(img_same, imgs[0], pc_same, pcs[0])
-	_ok("★ 对照：同一关重建两次，画面几乎逐像素相同（差异 < 3%）",
+	var rn_same := _diff_ratio_norm(img_same, imgs[0], pc_same, pcs[0])
+	_ok("★ 对照：同一关重建两次，画面几乎逐像素相同（原始差异 < 3%）",
 		r_same < 0.03, "%.2f%%" % (r_same * 100.0))
+	_ok("★ 对照：扣掉整体明暗之后结构也一样（归一化差异 < 5%）",
+		rn_same < 0.05, "%.2f%%" % (rn_same * 100.0))
 	_num("同一关重建两次的画面差异", r_same)
+	_num("同一关重建两次的归一化差异", rn_same)
 
 	# 另外，三关的调色板也得各不同 —— 几何不同是一回事，"这张图是这个颜色"是另一回事。
 	var pal_vals := {}

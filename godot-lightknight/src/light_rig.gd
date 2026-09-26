@@ -28,6 +28,18 @@ const TEX_HALF := TEX_N / 2.0
 ## 所以宁可不点，也不能让帧率掉下去。
 const FX_LIGHT_MAX := 6
 
+## ── 夜色的两个锚点 ──
+## `NIGHT_MIN` 是最暗那档的底色（偏冷的蓝），一路 lerp 到 white = 清关/天亮。
+##
+## ⚠️ 老映射里有个**静默失效**的旋钮：`t = (d - 0.10) / 0.50`，而三关的 d 分别是
+## 0.100 / 0.045 / 0.025 —— **全部落在 t = 0 这一个点上**。于是
+## 「一关更比一关黑（ambient 递增）」只是一条数值断言，画面上三张图一样黑，
+## 而 `ambient` 这个"旋钮"实际拧不动。现在把夜色的输入区间收到关卡的**真实落点**上，
+## ambient 才真的在改画面（自检里有实测平均亮度对照）。
+const NIGHT_MIN := Color(0.42, 0.46, 0.60)
+const NIGHT_SPAN := 0.115
+const NIGHT_BASE := 0.018
+
 var cm: CanvasModulate
 var player_light: PointLight2D
 var goal_light: PointLight2D
@@ -39,6 +51,12 @@ var _enemy_lights := {}       # enemy id -> PointLight2D
 ## key 是**稳定字符串**（`"swing"` / `"proj:<pid>"` / `"fx:<id>"`）——
 ## 这样每一帧只是改已有灯的属性，而不是 new 一个（软渲染下每帧 new 灯会立刻拖垮帧率）。
 var _fx_lights := {}
+## 供迷雾层取用：这一帧所有灯的（世界坐标 / 光照半径 / 种类）。
+## 用扁平数组而不是字典数组 —— 迷雾每格都要遍历一次，字典取值太贵。
+var src_x := PackedFloat32Array()
+var src_y := PackedFloat32Array()
+var src_r := PackedFloat32Array()
+var src_kind := PackedStringArray()
 var _tex_floor: ImageTexture
 var _tex_circle: ImageTexture
 var _ready_done := false
@@ -157,11 +175,17 @@ func sync(world) -> void:
 	if not _ready_done:
 		return
 	position = Proj.cam_offset(world.draw_cam.x, world.draw_cam.y)
+	src_x.clear()
+	src_y.clear()
+	src_r.clear()
+	src_kind.clear()
 
 	# 全局压暗：ambient 越大越黑。清关后 world.ambient 降低 → 抬向白色。
-	var d := clampf(1.0 - world.ambient, 0.03, 0.65)
-	var t := clampf((d - 0.10) / 0.50, 0.0, 1.0)
-	cm.color = Color(0.05, 0.06, 0.10).lerp(Color(1.0, 1.0, 1.0), t)
+	# 夜色的输入区间必须罩住关卡的**真实落点**（0.90 / 0.955 / 0.975），
+	# 否则这张旋钮拧了也看不见 —— 见 NIGHT_SPAN 上面的注释。
+	var d := clampf(1.0 - world.ambient, 0.0, 0.90)
+	var t := clampf((d - NIGHT_BASE) / NIGHT_SPAN, 0.0, 1.0)
+	cm.color = NIGHT_MIN.lerp(Color(1.0, 1.0, 1.0), t)
 
 	# 玩家灯火：半径由连击决定，亮度由连击/辉光决定 —— 「连击就是你的光」
 	var p = world.player
@@ -170,6 +194,8 @@ func sync(world) -> void:
 	player_light.texture_scale = r / TEX_HALF
 	player_light.energy = 0.80 + world.brightness01() * 0.60
 	player_light.visible = not p.dead
+	if not p.dead:
+		_add_source(p.x, p.y, r, "player")
 
 	# 灯塔
 	var gp = world.goal_prop
@@ -177,6 +203,8 @@ func sync(world) -> void:
 		goal_light.position = Vector2(float(gp["x"]), float(gp["y"]) * Proj.YSQUASH)
 		var lit: bool = bool(gp.get("lit", false))
 		goal_light.energy = 1.05 if lit else 0.06
+		if lit:
+			_add_source(float(gp["x"]), float(gp["y"]), 300.0, "goal")
 
 	# 火盆
 	_sync_prop_lights(world)
@@ -184,6 +212,17 @@ func sync(world) -> void:
 	_sync_enemy_lights(world)
 	# 攻击/弹丸的短命灯
 	_sync_fx_lights(world)
+
+
+func _add_source(x: float, y: float, r: float, kind: String) -> void:
+	src_x.append(x)
+	src_y.append(y)
+	src_r.append(r)
+	src_kind.append(kind)
+
+
+func source_count() -> int:
+	return src_x.size()
 
 
 ## 挥击、飞行中的弹丸、留场的光球/光柱各自点一盏灯。
@@ -205,9 +244,13 @@ func _sync_fx_lights(world) -> void:
 	var p: PlayerState = world.player
 	if p.attack_t > 0.0 and not p.dead:
 		var w: Dictionary = p.weapon()
+		# 攻击距离要乘 `reach_mul()`：那才是**这一下真正能打到多远**。
+		# 少乘这一下，"光甩到哪儿"与"刀能打到哪儿"会慢慢对不上。
+		# （`world` 在 LightRig 里是无类型的，所以这里的类型要显式写出来。）
+		var rng_w: float = float(w["range"]) * float(world.reach_mul())
 		var t01 := clampf(p.attack_t / 0.2, 0.0, 1.0)
 		# 光跟着刀锋扫过去：收手时缩回身边，出手时甩到最远
-		var reach := float(w["range"]) * 0.9 * (0.30 + 0.70 * (1.0 - t01))
+		var reach: float = rng_w * 0.9 * (0.30 + 0.70 * (1.0 - t01))
 		var sweep: float = p.facing + float(w["arc"]) * 0.25 * (1.0 - 2.0 * (1.0 - t01))
 		var key := "swing"
 		live[key] = true
@@ -221,6 +264,7 @@ func _sync_fx_lights(world) -> void:
 		l.texture_scale = (reach * 0.95 + 46.0) / TEX_HALF
 		l.color = world.element_color_of()
 		l.energy = 1.05 * t01
+		_add_source(wx, wy, l.texture_scale * TEX_HALF, "fx")
 
 	# ── ② 玩家弹丸 ──
 	for q in world.projs:
@@ -238,6 +282,7 @@ func _sync_fx_lights(world) -> void:
 		l2.texture_scale = (float(q["r"]) * 7.5 + 26.0) / TEX_HALF
 		l2.color = Color.html(str(q["color"]))
 		l2.energy = 1.15
+		_add_source(float(q["x"]), float(q["y"]), l2.texture_scale * TEX_HALF, "fx")
 
 	# ── ③ 留场物（灯球 / 光柱）──
 	# 这两个是"留在原地继续照亮"的东西，用不投影的柔光就够：
@@ -260,6 +305,7 @@ func _sync_fx_lights(world) -> void:
 		l3.texture_scale = (rr3 * 1.5 + 60.0) / TEX_HALF
 		l3.color = Color.html(str(f["color"]))
 		l3.energy = (0.9 if kind == "zone" else 0.7) * (1.0 - t03 * 0.35)
+		_add_source(float(f["x"]), float(f["y"]), l3.texture_scale * TEX_HALF, "fx")
 
 	# 回收：这一帧没被点到的都熄掉
 	for k in _fx_lights.keys():
@@ -292,6 +338,8 @@ func _sync_prop_lights(world) -> void:
 		l.position = Vector2(float(pr["x"]), float(pr["y"]) * Proj.YSQUASH - 22.0)
 		var flick := 0.92 + 0.08 * sin(world.time * 7.0 + float(i) * 2.1)
 		l.energy = (1.0 if lit else 0.0) * flick
+		if lit:
+			_add_source(float(pr["x"]), float(pr["y"]), 210.0, "brazier")
 
 
 func _sync_enemy_lights(world) -> void:
@@ -310,6 +358,9 @@ func _sync_enemy_lights(world) -> void:
 		l.position = Vector2(e.x, e.y * Proj.YSQUASH - e.h * 0.45)
 		l.texture_scale = (lr * 2.6) / TEX_HALF
 		l.energy = 0.62 + (0.35 if e.state == "windup" else 0.0)
+		# 敌人自光也开雾（半径系数见 Fog.KIND_SCALE.enemy）：雾里能看见一团逼近的亮，
+		# 是这套黑暗机制里最重要的一条"预警"。
+		_add_source(e.x, e.y, lr * 2.6, "enemy")
 	# 回收死掉的
 	for id in _enemy_lights.keys():
 		if not live.has(id):

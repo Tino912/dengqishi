@@ -83,6 +83,37 @@ func circle_rect(cx: float, cy: float, r: float, rx: float, ry: float, rw: float
 	return dx * dx + dy * dy < r * r
 
 
+## 射线 vs 轴对齐矩形：返回**沿射线方向第一次撞上它的距离**。
+## 起点在矩形内 → 返回 0；永远撞不到 → 返回 -1。
+##
+## 这是「迷雾层」的几何基础：一盏灯要往各个方向问"光最远能到哪儿"，
+## 逐格沿线采样的代价是 每格×步数，而射线求交是 每方向×墙数（而且墙很少）。
+## 用标准的 slab 法（分别求 x / y 两个方向的进入-离开区间，取交集）。
+func ray_rect_dist(ox: float, oy: float, dx: float, dy: float,
+		rx: float, ry: float, rw: float, rh: float) -> float:
+	var t0 := -1.0e30
+	var t1 := 1.0e30
+	if absf(dx) < 1e-6:
+		if ox < rx or ox > rx + rw:
+			return -1.0
+	else:
+		var ta := (rx - ox) / dx
+		var tb := (rx + rw - ox) / dx
+		t0 = maxf(t0, minf(ta, tb))
+		t1 = minf(t1, maxf(ta, tb))
+	if absf(dy) < 1e-6:
+		if oy < ry or oy > ry + rh:
+			return -1.0
+	else:
+		var ta2 := (ry - oy) / dy
+		var tb2 := (ry + rh - oy) / dy
+		t0 = maxf(t0, minf(ta2, tb2))
+		t1 = minf(t1, maxf(ta2, tb2))
+	if t1 < maxf(0.0, t0):
+		return -1.0
+	return maxf(0.0, t0)
+
+
 ## 把圆推出矩形；圆心在矩形内部时朝最近的边推出。
 func push_out_rect(cx: float, cy: float, r: float, rx: float, ry: float, rw: float, rh: float) -> Vector2:
 	var nx := clampf(cx, rx, rx + rw)

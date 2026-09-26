@@ -429,9 +429,12 @@ const LEVEL1 := {
 	"start": Vector2(300.0, 1350.0),
 	"goal": {"kind": "lighthouse", "pos": Vector2(2200.0, 250.0), "name": "外庭灯塔"},
 	"palette": {
-		"floor": "#1b2030", "floor2": "#171b28",
-		"wall": "#2b3345", "wall_top": "#3b465c",
-		"rim": "#93a7cc", "fog": "#0a0e18", "accent": "#ffca70",
+		# 地面/墙体这一轮整体提亮了一档（用户要的"地图可见，但像晚上"）：
+		# 原来的 #1b2030 在地面亮度只有 0.13，夜色压暗之后几乎看不出砖缝。
+		# 色相没动，只是把明度抬到"月光下能看清地形"的位置。
+		"floor": "#2c3450", "floor2": "#252c42",
+		"wall": "#3f4a63", "wall_top": "#55617d",
+		"rim": "#93a7cc", "mist": "#464f6b", "accent": "#ffca70",
 	},
 	# x, y, w(宽), d(进深), h(立起高度)
 	"walls": [
@@ -502,9 +505,9 @@ const LEVEL2 := {
 	"start": Vector2(300.0, 1750.0),
 	"goal": {"kind": "lighthouse", "pos": Vector2(2640.0, 1830.0), "name": "深处灯塔"},
 	"palette": {
-		"floor": "#171523", "floor2": "#131120",
-		"wall": "#262034", "wall_top": "#332b45",
-		"rim": "#8b78b4", "fog": "#08060f", "accent": "#c9a6ff",
+		"floor": "#272438", "floor2": "#201d2e",
+		"wall": "#3a3150", "wall_top": "#4c4163",
+		"rim": "#8b78b4", "mist": "#4a4166", "accent": "#c9a6ff",
 	},
 	"walls": [
 		[0.0, 0.0, 2800.0, 70.0, 70.0],
@@ -581,9 +584,9 @@ const LEVEL3 := {
 	"start": Vector2(320.0, 1980.0),
 	"goal": {"kind": "lighthouse", "pos": Vector2(2680.0, 300.0), "name": "渡口灯塔"},
 	"palette": {
-		"floor": "#12292c", "floor2": "#0e2124",
-		"wall": "#22383a", "wall_top": "#2f4d4e",
-		"rim": "#7fd8cf", "fog": "#040c0e", "accent": "#ffb765",
+		"floor": "#1e4046", "floor2": "#183338",
+		"wall": "#35565a", "wall_top": "#477173",
+		"rim": "#7fd8cf", "mist": "#3d5559", "accent": "#ffb765",
 	},
 	"walls": [
 		# 外圈边界
