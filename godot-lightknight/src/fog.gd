@@ -54,12 +54,17 @@ const OPENER_MAX := 10
 ## 半径小于这个数的灯不开雾（敌人身上的小自光只是"透出一点亮"，不该整个散开）
 const MIN_OPENER_R := 24.0
 
-## 雾最浓时的 alpha。
+## 雾最浓时的 alpha。**用户要求：拉到最浓**（着色器上限就是 1.0）。
 ##
-## 这个数是**照着画面调的**：第一版取 0.58，实测把没被照亮的地方压成了一整块
-## 灰板 —— 地砖的缝、墙的轮廓全糊掉了，而用户要的是"地图可见（但像晚上）+ 有雾"，
-## 不是"用雾把地图藏起来"。0.40 的雾能把远处推远、又不吃掉地形本身。
-const MIST_MAX := 0.40
+## 来龙去脉：第一版取 0.58，实测把没被照亮的地方压成一整块灰板（地砖缝、墙轮廓全糊掉），
+## 于是按"地图可见（但像晚上）+ 有雾"调到 0.40。之后用户明确要**最浓**，
+## 所以这里取满格的 1.0 —— 代价是**没被照亮的地方基本看不见地形**，
+## 只有灯照到的那一圈是清的（`KIND_SCALE.player = 0.82` 保留了一圈柔边，
+## 所以"雾退到哪儿为止"仍然看得见）。
+##
+## ⚠️ `a *= mix(0.50, 1.25, n)` 那一步不能被去掉：取 1.0 之后若没有噪声调制，
+## 整屏就是一整块不透明的板；有噪声才有 0.5~1.0 的厚薄差，看着才是"雾"不是"墙"。
+const MIST_MAX := 1.0
 
 ## 清关时"雾散尽"用的时间（秒）
 const FADE_T := 1.2
@@ -78,7 +83,7 @@ render_mode unshaded;
 uniform sampler2D reveal_tex : filter_linear, repeat_disable, hint_default_black;
 uniform vec4 mist_lo : source_color = vec4(0.16, 0.19, 0.27, 1.0);
 uniform vec4 mist_hi : source_color = vec4(0.33, 0.38, 0.48, 1.0);
-uniform float mist_max : hint_range(0.0, 1.0) = 0.40;
+uniform float mist_max : hint_range(0.0, 1.0) = 1.0;
 uniform float mist_time = 0.0;
 uniform float mist_scale = 13.0;
 uniform float mist_speed = 0.022;

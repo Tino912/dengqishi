@@ -3002,18 +3002,40 @@ func _section_fog_night() -> void:
 	# 变异测试 `夜色永远压到最暗一档` 正是拿这条**没红**暴露出来的。
 	# 所以改成"同一帧、同一世界，**只拧 `world.ambient` 这一个变量**"做前后对照 ——
 	# 这跟遮挡那组看增量的道理一样：**要证明旋钮接上了，就得让旋钮转一下**。
+	#
+	# ⚠️⚠️ 而且这一步必须**把雾关掉**再量。雾拉到 `MIST_MAX = 1.0` 之后，
+	# 没被照到的地方是不透明的，全屏均值由雾决定 —— 把地图压暗，屏幕几乎不动
+	# （实测 0.2925 → 0.2839，只差 0.0086）。那量到的是**雾**，不是夜色。
+	# 这与 fog.gd 类头注释 ② 是同一条规矩：**量哪一层，就把别层冻住。**
 	var amb0 := w.ambient
-	var mean_night := mean_on
+	# ① 先量一次"雾开着"时的最暗档（只留痕，不做断言）
 	w.ambient = 0.98            # d = 0.02 → t ≈ 0 → 最暗一档 NIGHT_MIN
 	_pump(1)
-	var mean_darkest := _mean_lum(await _grab())
+	var mean_darkest_fog_on := _mean_lum(await _grab())
+	# ② 把雾关掉，量夜色本身（**这一对才做断言**）
 	w.ambient = amb0
+	w.set_fog_enabled(false)
+	_pump(2)
+	var mean_night := _mean_lum(await _grab())
+	w.ambient = 0.98
 	_pump(1)
-	_num("夜色最暗档_全屏平均亮度", mean_darkest)
+	var mean_darkest := _mean_lum(await _grab())
+	# ③ 还原
+	w.ambient = amb0
+	w.set_fog_enabled(true)
+	_pump(2)
+	_num("关雾_本关夜色的全屏平均亮度", mean_night)
+	_num("关雾_最暗档的全屏平均亮度", mean_darkest)
 	report["cases"]["fog"]["pixel"]["mean_darkest"] = mean_darkest
+	report["cases"]["fog"]["pixel"]["mean_night_off"] = mean_night
+	# 另外**记一笔**"雾开着时夜色还剩多少可见度"（不做断言，只留痕）：
+	# 雾调到最浓之后这个差值会掉到 0.01 以下 —— 说明夜色在观感上已被雾盖住。
+	# 那是用户要的效果，但不该让"夜色有接上"这条断言跟着失效，所以两者分开量。
+	report["cases"]["fog"]["pixel"]["night_delta_fog_on"] = snappedf(mean_on - mean_darkest_fog_on, 0.0001)
+	_num("开雾_最暗档的全屏平均亮度", mean_darkest_fog_on)
 	_ok("★ 夜色旋钮真的接在画面上（只把 ambient 拧到最暗，全屏明显变暗）",
 		mean_night > mean_darkest + 0.02,
-		"本关 %.4f -> 最暗档 %.4f" % [mean_night, mean_darkest])
+		"关雾量：本关 %.4f -> 最暗档 %.4f" % [mean_night, mean_darkest])
 
 	_write_png(img_fog, "20-fog-on")
 	_write_png(img_nofog, "21-fog-off")
