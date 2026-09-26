@@ -91,6 +91,10 @@ func _run() -> void:
 	# 迷雾 / 夜色排在**最末**：这一段会重建世界、搬动玩家、还会把这一关的雾放掉。
 	await _section_fog_night()
 	await _section_pose_anim()
+	# 挥击范围线 vs 判定。**同样排在最后**：它也要重建世界（理由同上）。
+	await _section_swing_cone()
+	# 伤害数字的可读性（不重建世界，接着上一段的世界用）
+	await _section_text_readability()
 	_finish()
 
 
@@ -3545,6 +3549,22 @@ func _section_pose_anim() -> void:
 	_ok("★ 技能施法时长明显长于一次普攻（技能要有起手与收势的余地）",
 		Pose.CAST_DUR > Pose.ATTACK_DUR * 2.0,
 		"%.2f vs %.2f" % [Pose.CAST_DUR, Pose.ATTACK_DUR])
+	# ⚠️ 上面那一刀是**真挥出去了**（刻意走和玩家同一条输入路径），于是
+	# `w.effects` 里留下一条 slash 特效。手动模式下世界不推进，它**永不过期** ——
+	# 后面整面画廊的每一格都会拖着这条弧线。查它花了很久（画廊里那条淡黄弧
+	# 看上去像"范围线画错了"，实际是上一段的对账留下的残影），所以顺手把
+	# "画廊必须是干净的"写成断言：以后再有残留会立刻红，而不是变成一张
+	# 需要人眼去猜的图。这也是"量哪一层就把别层冻住/清干净"的又一例。
+	w.effects.clear()
+	w.particles.clear()
+	w.texts.clear()
+	p.attack_t = 0.0
+	p.swing_cone = {}
+	_pump(2)
+	_ok("★ 画廊是干净的（没有残留特效/飘字/飞行物 —— 有残留的话每一格都拖着上一段的残影）",
+		w.effects.is_empty() and w.texts.is_empty() and w.projs.is_empty(),
+		"effects=%d texts=%d projs=%d" % [
+			w.effects.size(), w.texts.size(), w.projs.size()])
 
 	# ══ ② 走路：两条腿严格反相、幅度不为零、站定回中立 ══
 	p.attack_t = 0.0
@@ -3916,6 +3936,363 @@ func _section_pose_anim() -> void:
 	report["cases"]["pose"]["e2e"] = {
 		"skill_id": sid, "cast_kind": kind_want, "skill_count": skills.size(),
 		"walk_phase_14_steps": snappedf(p.walk_t - wt0, 0.001),
+	}
+
+
+## ── 挥击范围线 vs 实际判定 ────────────────────────────────────────────
+##
+## 用户报的缺陷："**一些**武器实际攻击范围与标出来的线不符"。
+##
+## 根因一句话：**判定与绘制各算各的**。判定读 `w["arc"]` 与
+## `range × range_mul × reach_mul()`；绘制自己算 `range × reach_mul() × 0.9`
+## 再配一个**写死的 0.9 弧度**。于是 arc 恰好等于 0.9 的灯杖看着分毫不差，
+## 长明枪（0.62）画的比判定宽 45%，灯镰（2.7）画的只有判定三分之一 ——
+## "**一些**"这个词就是这么来的（对上的那把纯属巧合）。
+##
+## 修法是把几何收进 `World.swing_cone()`：判定用 `cone_hits()`、
+## 绘制用 `cone_polygon()`，两者是**同一个形状**。这一段就是验这件事：
+##   ① 纯逻辑：数对不对（半径带 range_mul、角宽随武器走、远程不算扇面）
+##   ② 逐点等价：`cone_hits` 与 `is_point_in_polygon` 在同一张采样网格上必须一致
+##   ③ 像素：这条线真的画在屏幕上，而且画在**正确的半径**上
+##   ④ 端到端：这一次的几何是**游戏**写进来的，连刺那 0.9 也跟着走
+##
+## ⚠️ 顺序：这一段必须排在 `_section_pose_anim()` **之后**。它会重建世界，
+## 而重建会推进随机流 —— 插在中间会把前面依赖位置与随机的段落整体挪掉
+## （仓库里踩过这个坑，见 `_run()` 里那段注释）。
+func _section_swing_cone() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	_pump(40)
+	var w := _w()
+	var p := _p()
+	# 清成"只有玩家和地板"，理由同姿态段：别的发光物会混进采样带里、
+	# 那样像素差就说不清是"线亮了"还是"别的什么亮了"。
+	for e in w.enemies:
+		e.dead = true
+	w.enemies.clear()
+	w.drops.clear()
+	w.projs.clear()
+	w.effects.clear()
+	w.props.clear()
+	w.walls.clear()
+	w.texts.clear()
+	w.girl = null
+	w.shake = 0.0
+	w.set_fog_enabled(false)
+	p.facing = 0.0
+	p.attack_alt = false
+	p.attack_t = 0.0
+	p.swing_cone = {}
+	_pump(24)
+	report["cases"]["cone"] = {}
+	var wids := Content.WEAPONS.keys()
+	var reach := w.reach_mul()
+	var melee := []
+	for wid in wids:
+		if World.has_swing_sector(Content.WEAPONS[wid]):
+			melee.append(str(wid))
+
+	# ── ① 判定几何的数 ───────────────────────────────────────────────
+	_num("挥击_范围倍率（基础 1.20）", reach)
+	_num("挥击_有扇面的武器数", float(melee.size()))
+	_ok("★ 八把武器里只有灯弩没有扇面（它射光矢、没有近战判定，所以不该画范围线）",
+		melee.size() == wids.size() - 1
+		and not World.has_swing_sector(Content.WEAPONS["crossbow"]),
+		"近战 %d / 全部 %d" % [melee.size(), wids.size()])
+	# 半径：手算走**独立路径**（直接读武器表），不经过 swing_cone ——
+	# 同一行里写两次 swing_cone() 是恒真式，什么都验不到。
+	var bad_r := ""
+	for wid in wids:
+		var wd: Dictionary = Content.WEAPONS[wid]
+		for rm in [1.0, 0.9]:
+			var want_r := float(wd["range"]) * float(rm) * reach
+			var got_r := float(w.swing_cone(wd, 1.0, float(rm))["r"])
+			if absf(got_r - want_r) > 0.01:
+				bad_r += "%s@%.1f %.2f≠%.2f  " % [wid, rm, got_r, want_r]
+	_ok("★ 挥击半径 = range × range_mul × reach_mul（连刺那 0.9 也真的进了算式）",
+		bad_r == "", bad_r)
+	var bad_h := ""
+	var halfs := []
+	for wid in melee:
+		var wd2: Dictionary = Content.WEAPONS[wid]
+		var want_h := float(wd2["arc"]) * 0.5
+		var got_h := float(w.swing_cone(wd2, 1.0, 1.0)["half"])
+		if absf(got_h - want_h) > 0.001:
+			bad_h += "%s %.3f≠%.3f  " % [wid, got_h, want_h]
+		halfs.append(got_h)
+	_ok("★ 扇面半角 = arc / 2（不再是一个写死的数）", bad_h == "", bad_h)
+	var h_lo: float = halfs.min()
+	var h_hi: float = halfs.max()
+	_num("挥击_最窄扇面半角（长明枪）", h_lo)
+	_num("挥击_最宽扇面半角（灯镰）", h_hi)
+	_ok("★ 角宽随武器走（极差 > 1.0 弧度 —— 写死一个数就绝不可能满足）",
+		h_hi - h_lo > 1.0, "%.3f ~ %.3f" % [h_lo, h_hi])
+	_ok("★ swing_reach(0.9) 正好是 swing_reach(1.0) 的 0.9 倍（range_mul 真的进了算式）",
+		absf(w.swing_reach(0.9) - w.swing_reach(1.0) * 0.9) < 0.01,
+		"%.3f vs %.3f" % [w.swing_reach(0.9), w.swing_reach(1.0)])
+
+	# ── ② 逐点等价：画出来的形状 == 判定形状 ─────────────────────────
+	# 15 档半径 × 48 档角度，对每把近战武器逐点问两个问题：
+	#   `cone_hits`（判定打不打得到这个点）
+	#   `is_point_in_polygon`（这个点在不在"画出来的线"围成的形状里）
+	# 不一致就是"标出来的线与实际判定不符"。这是这条缺陷**机器可验**的版本：
+	# 不看渲染，又快又稳，而且能指出是哪把武器、差了几个采样点。
+	#
+	# 采样点刻意错开半格（半径 +0.5 档、角度 +0.5 档）：`is_point_in_polygon`
+	# 对**恰好落在边界上**的点结果未定义，踩上去就会变成随机的假红。
+	var mism_total := 0
+	var mism_detail := ""
+	for wid in melee:
+		var wd3: Dictionary = Content.WEAPONS[wid]
+		var cone := w.swing_cone(wd3, 1.0, 1.0)
+		var rr: float = float(cone["r"])
+		var poly := World.cone_polygon(cone, 0.0, 64)
+		var mism := 0
+		for ri in 15:
+			var rad := rr * 1.35 * (float(ri) + 0.5) / 15.0
+			for ai in 48:
+				var a := TAU * (float(ai) + 0.5) / 48.0
+				var pt := Vector2(cos(a), sin(a)) * rad
+				var hit := World.cone_hits(cone, 0.0, 0.0, 0.0, pt.x, pt.y, 0.0)
+				var cov := Geometry2D.is_point_in_polygon(pt, poly)
+				if hit != cov:
+					mism += 1
+		report["cases"]["cone"]["mism_" + str(wid)] = mism
+		mism_total += mism
+		if mism > 0:
+			mism_detail += "%s:%d " % [wid, mism]
+	_num("挥击_形状与判定不一致的采样点数（近战武器合计）", float(mism_total))
+	_ok("★ 画出来的范围线与判定逐点一致（%d 把武器 × 15 半径 × 48 角度）" % melee.size(),
+		mism_total == 0, mism_detail)
+	# 网格是"大面积对不对"，下面两条是"边界在哪儿" —— 两条都要。
+	# 形状整体缩放 2% 这种错，网格可能一个采样点都碰不到边界附近。
+	var cb := w.swing_cone(Content.WEAPONS["blade"], 1.0, 1.0)
+	var rb: float = float(cb["r"])
+	var ib: float = float(cb["inner"])
+	_num("挥击_灯刃半径", rb)
+	_num("挥击_贴身豁免半径", ib)
+	_ok("★ 正前方：r×0.99 打得到、r×1.02 打不到（外沿就在 r 上，不多不少）",
+		World.cone_hits(cb, 0.0, 0.0, 0.0, rb * 0.99, 0.0, 0.0)
+		and not World.cone_hits(cb, 0.0, 0.0, 0.0, rb * 1.02, 0.0, 0.0),
+		"r=%.2f" % rb)
+	_ok("★ 正后方贴身：inner×0.8 打得到、inner×1.3 打不到（贴身豁免是一整圈）",
+		World.cone_hits(cb, 0.0, 0.0, 0.0, -ib * 0.8, 0.0, 0.0)
+		and not World.cone_hits(cb, 0.0, 0.0, 0.0, -ib * 1.3, 0.0, 0.0),
+		"inner=%.2f" % ib)
+	var poly_b := World.cone_polygon(cb, 0.0, 64)
+	_ok("★ 【用户报的这条】贴身豁免那一圈**也画出来了** —— 判定里有、画面上没有，就是「打到了却看不出为什么」",
+		Geometry2D.is_point_in_polygon(Vector2(-ib * 0.8, 0.0), poly_b)
+		and Geometry2D.is_point_in_polygon(Vector2(0.0, -ib * 0.8), poly_b))
+
+	# ── ③ 这条线真的画在屏幕上、而且画在正确的半径上 ──────────────────
+	# 单变量对照：**同一位置、同一朝向、同一武器**，只改 `attack_t`
+	# （有挥击 / 没有挥击）；并且**只画范围线** —— 月牙刃与扫过的那道亮弧
+	# 也压在同一个半径上，留着就分不清是谁亮的（这个开关与 fog 是同一个理由）。
+	# 采样带一律用**地面坐标**给（半径是世界单位、角度是弧度），再按 YSQUASH
+	# 投到屏幕上 —— 地面上的圆在屏幕上是压扁的椭圆，写屏幕矩形一定量歪。
+	w.set_swing_guide_only(true)
+	var wid_px := "scythe"                      # 扇面最宽（半角 1.35），采样角度好挑
+	var cone_px := w.swing_cone(Content.WEAPONS[wid_px], 1.0, 1.0)
+	var rpx: float = float(cone_px["r"])
+	var ipx: float = float(cone_px["inner"])
+	p.weapon_id = wid_px
+	p.swing_cone = cone_px
+	p.attack_t = Pose.ATTACK_DUR
+	w.mark_redraw()
+	var im_on := await _grab()
+	p.attack_t = 0.0
+	w.mark_redraw()
+	var im_off := await _grab()
+	w.mark_redraw()
+	var im_off2 := await _grab()                # 同一状态的第二帧：真正的"重取"对照
+	var foot := Vector2(Proj.sx(p.x, w.draw_cam.x), Proj.sy(p.y, 0.0, w.draw_cam.y))
+	# 对照图的窗口：要把整条外沿装进去（灯镰 r = 115.2 世界单位，
+	# 竖着按 YSQUASH 压成 71），右边留出 +x 那一侧给采样带看。
+	var r_px_guide := Rect2i(int(foot.x) - 150, int(foot.y) - 100, 300, 180)
+	# 四条采样带。角度取在**偏离正前方**的那一侧（+0.55 ~ +1.20 弧度）：
+	# 那里除了这条线没有别的（角色与手里的剑都在正前方 ±0.3 弧度里）。
+	var band_r := _ground_band_diff(im_off, im_on, foot,
+		rpx * 0.94, rpx * 1.06, 0.55, 1.20, 240)
+	var band_far := _ground_band_diff(im_off, im_on, foot,
+		rpx * 1.25, rpx * 1.45, 0.55, 1.20, 240)
+	var band_back := _ground_band_diff(im_off, im_on, foot,
+		ipx * 0.90, ipx * 1.10, PI - 0.55, PI + 0.55, 240)
+	var band_null := _ground_band_diff(im_off, im_off2, foot,
+		rpx * 0.94, rpx * 1.06, 0.55, 1.20, 240)
+	_num("挥击_外沿带(0.94~1.06 r)的平均像素差", band_r)
+	_num("挥击_更外面那条对照带(1.25~1.45 r)", band_far)
+	_num("挥击_背后贴身圈(0.9~1.1 inner)", band_back)
+	_num("挥击_重取一帧的对照（必须精确为 0）", band_null)
+	_ok("★ 采样判据本身是干净的（同一状态重取一帧，差必须精确为 0）",
+		band_null < 1e-9, "%.6f" % band_null)
+	_ok("★ 范围线真的画在**外沿 r** 上（那一带有东西亮起来）",
+		band_r > 0.012, "%.4f" % band_r)
+	_ok("★ 而 r 之外那条对照带几乎是黑的（只亮外沿带是不够的，还得**没画远**）",
+		band_far < 0.004, "%.4f" % band_far)
+	_ok("★ 背后的贴身豁免圈也画了（那一圈在判定里存在，画面上必须也看得见）",
+		band_back > 0.006, "%.4f" % band_back)
+	_write_png(_grid([_pose_tile(im_off, r_px_guide), _pose_tile(im_on, r_px_guide)], 2),
+		"35-swing-guide")
+	w.set_swing_guide_only(false)
+
+	# ── ④ 端到端：这一次的几何是**游戏**写进来的 ─────────────────────
+	w.set_swing_guide_only(false)
+	p.weapon_id = "spear"
+	p.facing = 0.0
+	p.swing_cone = {}
+	w.player_swing(float(Content.WEAPONS["spear"]["arc"]), 1.0, 1.0)
+	var c_hit: Dictionary = p.swing_cone.duplicate()
+	var want_base := w.swing_reach(1.0)
+	_num("端到端_普攻写进来的半径", float(c_hit.get("r", -1.0)))
+	_ok("★ 真调 player_swing 会把这次的判定几何写进 player.swing_cone（绘制层不许自己算）",
+		not c_hit.is_empty() and absf(float(c_hit.get("r", -1.0)) - want_base) < 0.01,
+		str(c_hit))
+	# 连灯刺那一下：range_mul = 0.9、arc_mul = 0.72。**半径与角宽都得跟着变小** ——
+	# 原来绘制自己按武器表算（不读 range_mul），连刺的线会画大 11%。
+	p.swing_cone = {}
+	w.player_swing(0.72, 1.5, 0.9)
+	var c_fl: Dictionary = p.swing_cone.duplicate()
+	var want_fl := want_base * 0.9
+	var want_fl_half := float(Content.WEAPONS["spear"]["arc"]) * 0.72 * 0.5
+	_num("端到端_连刺写进来的半径", float(c_fl.get("r", -1.0)))
+	_num("端到端_连刺半径 / 普攻半径", float(c_fl.get("r", 0.0)) / maxf(1e-6, want_base))
+	_ok("★ 连灯刺（range_mul=0.9）写进来的半径正好是普攻的 0.9 倍",
+		absf(float(c_fl.get("r", -1.0)) - want_fl) < 0.01,
+		"%.3f vs %.3f" % [float(c_fl.get("r", -1.0)), want_fl])
+	_ok("★ 连刺的扇面也更窄（arc_mul=0.72）—— 半径与角宽都得跟着这一次的倍率走",
+		absf(float(c_fl.get("half", -1.0)) - want_fl_half) < 0.001,
+		"%.4f vs %.4f" % [float(c_fl.get("half", -1.0)), want_fl_half])
+	report["cases"]["cone"]["px"] = {
+		"scythe_r": snappedf(rpx, 0.01), "inner": snappedf(ipx, 0.01),
+		"band_r": snappedf(band_r, 0.0001), "band_far": snappedf(band_far, 0.0001),
+		"band_back": snappedf(band_back, 0.0001), "band_null": snappedf(band_null, 0.0001),
+	}
+
+
+## 沿"地面上的一圈/一扇"采样，返回两帧的平均通道差。
+##
+## 半径与角度都是**地面量**（世界单位 / 弧度），采样点再按 YSQUASH 投到屏幕上 ——
+## 地面上的圆在屏幕上是压扁的椭圆，直接写屏幕矩形会把弧量歪。
+## 采样点用 Kronecker 序列（t×7 与 t×11 的小数部分）铺开：既不吃随机数，
+## 也不会在带上排成一行（排一行的话会正好落在某一条抗锯齿的缝上）。
+func _ground_band_diff(a: Image, b: Image, foot: Vector2,
+		r_lo: float, r_hi: float, a_lo: float, a_hi: float, n: int) -> float:
+	var acc := 0.0
+	for i in n:
+		var t := (float(i) + 0.5) / float(n)
+		var rad := lerpf(r_lo, r_hi, fposmod(t * 7.0, 1.0))
+		var ang := lerpf(a_lo, a_hi, fposmod(t * 11.0, 1.0))
+		var sx := int(round(foot.x + cos(ang) * rad))
+		var sy := int(round(foot.y + sin(ang) * rad * Proj.YSQUASH))
+		acc += _px_diff3(a, b, sx, sy)
+	return acc / float(maxi(1, n))
+
+
+## 3x3 邻域的平均通道差。单点采样会被抗锯齿与细线宽度带偏（线宽 1.5px 时，
+## 采样点差半个像素就是"全有"和"全无"的区别）。
+func _px_diff3(a: Image, b: Image, x: int, y: int) -> float:
+	var acc := 0.0
+	var n := 0
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var qx := x + dx
+			var qy := y + dy
+			if qx < 0 or qy < 0 or qx >= a.get_width() or qy >= a.get_height():
+				continue
+			var ca := a.get_pixel(qx, qy)
+			var cb := b.get_pixel(qx, qy)
+			acc += (absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)) / 3.0
+			n += 1
+	return acc / float(maxi(1, n))
+
+
+## 一个矩形里"够亮"的像素数。用来量"字号变了，屏幕上那行字是不是真的变大了" ——
+## 比量包围盒稳：字的外形与描边都不规则，包围盒对单个像素的抖动很敏感。
+func _bright_count(im: Image, r: Rect2i, thr := 0.55) -> int:
+	var n := 0
+	for y in range(r.position.y, r.position.y + r.size.y):
+		for x in range(r.position.x, r.position.x + r.size.x):
+			if x < 0 or y < 0 or x >= im.get_width() or y >= im.get_height():
+				continue
+			var c := im.get_pixel(x, y)
+			if (c.r + c.g + c.b) / 3.0 > thr:
+				n += 1
+	return n
+
+
+## ── 攻击时的伤害数字够不够大 ──────────────────────────────────────
+##
+## 用户反馈："攻击时伤害数字看不清"。这里只验两件事，但两件都必须是**真的**：
+##   ① 字号集中在一张表里（`Art.TEXT_SIZE`），并且确实比调整前大
+##   ② 那个字号**真的影响渲染** —— 不是"表建好了、调用点也改了，但绘制函数
+##      忘了读 `ft["size"]`"。这正是本轮最可能悄悄失败的地方：
+##      单看代码调用点是查不出这个的，只有让屏幕上的像素说话。
+##
+## ② 用单变量对照：**同一段文字、同一个位置、同一颜色**，只改字号，
+## 数它在屏幕上覆盖的亮像素。字号 22 → 28 理论上是 (28/22)² ≈ 1.62 倍，
+## 所以判据"比 > 1.25"是留了余量的（字形的覆盖率不会严格按平方走）。
+func _section_text_readability() -> void:
+	var w := _w()
+	var p := _p()
+	# ── ① 字号表 ────────────────────────────────────────────────────
+	var t_hit: float = float(Art.TEXT_SIZE["hit"])
+	var t_crit: float = float(Art.TEXT_SIZE["crit"])
+	_num("飘字_普通命中的字号", t_hit)
+	_num("飘字_暴击的字号", t_crit)
+	_ok("★ 命中字号 ≥ 20（原来的 14 就是用户说的「看不清」）", t_hit >= 20.0, "%.1f" % t_hit)
+	_ok("★ 暴击字号 > 普通命中字号（暴击要一眼分得出来）", t_crit > t_hit,
+		"%.1f vs %.1f" % [t_crit, t_hit])
+	var too_small := ""
+	for k in Art.TEXT_SIZE.keys():
+		if float(Art.TEXT_SIZE[k]) < 15.0:
+			too_small += "%s=%.1f " % [k, float(Art.TEXT_SIZE[k])]
+	_ok("★ 每一个飘字键的字号都 ≥ 15（元素刻字 / DoT 也别回到「看不清」）",
+		too_small == "", too_small)
+	# 衬底辉光必须是**显式标记**出来的，不能是"字号够大就发光"这种隐式规则 ——
+	# 字号一调，隐式规则会把暴击与普通命中划到同一边去。
+	var bg_keys := " ".join(Art.TEXT_GLOW_KEYS)
+	_ok("★ 衬底辉光只给了必须一眼看到的两种（暴击 / 自己受伤）",
+		bg_keys == "crit hurt", bg_keys)
+
+	# ── ② 字号真的影响渲染 ──────────────────────────────────────────
+	# 世界清空、只留一条飘字，并把它抬到 z = 200（玩家头顶之上、灯照不到的地方）——
+	# 那里是暗底，数亮像素干净；留在脚边会被灯光池与角色一起数进去。
+	w.enemies.clear()
+	w.effects.clear()
+	w.projs.clear()
+	w.particles.clear()
+	w.texts.clear()
+	w.girl = null
+	w.set_fog_enabled(false)
+	p.attack_t = 0.0
+	p.cast_t = 0.0
+	var foot := Vector2(Proj.sx(p.x, w.draw_cam.x), Proj.sy(p.y, 0.0, w.draw_cam.y))
+	var box := Rect2i(int(foot.x) - 150, int(foot.y) - 270, 300, 110)
+	w.texts.clear()
+	w._add_text(p.x, p.y, 200.0, "8888", "#ffffff", "hit")
+	w.mark_redraw()
+	var im_small := await _grab()
+	var n_small := _bright_count(im_small, box)
+	w.texts.clear()
+	w._add_text(p.x, p.y, 200.0, "8888", "#ffffff", "crit")
+	w.mark_redraw()
+	var im_big := await _grab()
+	var n_big := _bright_count(im_big, box)
+	_num("飘字_小字号那帧的亮像素数", float(n_small))
+	_num("飘字_大字号那帧的亮像素数", float(n_big))
+	_num("飘字_两者之比", float(n_big) / maxf(1.0, float(n_small)))
+	_ok("★ 小字号那帧必须画出了字（否则下面那条是拿两个 0 在比，恒真）",
+		n_small > 0, "%d" % n_small)
+	_ok("★ 字号真的影响渲染（大字号覆盖的亮像素明显更多）",
+		float(n_big) > float(n_small) * 1.25,
+		"%d → %d（×%.2f）" % [n_small, n_big, float(n_big) / maxf(1.0, float(n_small))])
+	_write_png(_grid([_pose_tile(im_small, box), _pose_tile(im_big, box)], 2), "36-text-size")
+	w.texts.clear()
+	report["cases"]["text"] = {
+		"hit": t_hit, "crit": t_crit, "px_small": n_small, "px_big": n_big,
 	}
 
 

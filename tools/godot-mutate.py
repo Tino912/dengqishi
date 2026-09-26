@@ -7,7 +7,7 @@
   · 没有连带误伤（别的断言不该无故变红 —— 那说明它们互相耦合，将来会误导人）。
 
 **怎么用**
-    tools/godot-mutate.py              # 跑全部变异（32 个，一个约 1 分钟）
+    tools/godot-mutate.py              # 跑全部变异（40 个，一个约 1 分钟）
     tools/godot-mutate.py 迷雾          # 只跑名字里含「迷雾」的
     tools/godot-mutate.py --list       # 只列出变异清单
     tools/godot-mutate.py --restore-only   # 从备份还原 src（中途崩了用这个）
@@ -536,6 +536,174 @@ MUTATIONS: list[dict] = [
         "expect": ["★ 施法姿态会自己结束"],
         "forbid": ["★ 真的放技能会触发施法姿态"],
     },
+    # ══════════════════════════════════════════════════════════════════
+    # 挥击范围线 vs 判定（2026-09-26）
+    # 用户报："**一些**武器实际攻击范围与标出来的线不符"。
+    # 根因是判定与绘制各算各的（判定读 w.arc，绘制写死 0.9 半径 + 0.9 弧度）。
+    # 下面 8 条把每一层各自会怎么坏都试一遍，顺便确认哪一层的断言抓哪一层。
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "name": "挥击半径漏掉 range_mul（判定与绘制又各算各的）",
+        # 打在**几何来源**上：`swing_cone` 把 range_mul 按回 1.0。
+        # 普通攻击看不出来（它本来就是 1.0），**连灯刺那一下才会偏** ——
+        # 这正是用户那个缺陷里最难发现的一半。
+        # 像素层应该保持绿：判定与绘制都读同一个 cone，仍然自洽。
+        "edits": [
+            (
+                "world.gd",
+                "\t\t\"r\": cone_radius(float(w[\"range\"]), range_mul, reach_mul()),\n",
+                "\t\t\"r\": cone_radius(float(w[\"range\"]), 1.0, reach_mul()),\n",
+            ),
+        ],
+        "expect": [
+            "★ 挥击半径 = range × range_mul × reach_mul",
+            "★ 连灯刺（range_mul=0.9）写进来的半径正好是普攻的 0.9 倍",
+        ],
+        "forbid": [
+            "★ 画出来的范围线与判定逐点一致",
+            "★ 范围线真的画在**外沿 r** 上",
+            "★ 背后的贴身豁免圈也画了",
+            "★ 扇面半角 = arc / 2",
+        ],
+    },
+    {
+        "name": "绘制层自己算范围线（半径 ×0.9、角宽写死 0.9）—— 复现用户报的那个缺陷",
+        # 打在**绘制层**：判定照旧用正确的 cone，画出来的线按回旧算法。
+        # 期望：像素层的「外沿带」变红（线画小了，那条带里什么都没有）；
+        # 而**纯逻辑那一层必须保持绿** —— 它量的是判定与形状生成器，
+        # 补丁根本没打到那里。这对绿/红说明"缺陷在哪一层，哪一层的断言负责"。
+        "edits": [("world.gd", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon(cone, player.facing),\n\t\t\t\t(1.0 - t01))\n", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon({\n\t\t\t\t\"r\": cone_r * 0.9, \"inner\": 40.0, \"half\": 0.45, \"arc\": 0.9},\n\t\t\t\tplayer.facing),\n\t\t\t\t(1.0 - t01))\n")],
+        "expect": ["★ 范围线真的画在**外沿 r** 上"],
+        "forbid": [
+            "★ 画出来的范围线与判定逐点一致",
+            "★ 背后的贴身豁免圈也画了",
+            "★ 而 r 之外那条对照带几乎是黑的",
+            "★ 扇面半角 = arc / 2",
+        ],
+    },
+    {
+        "name": "绘制层把范围线画远 1.3 倍（反向的失败方式：线画大了）",
+        # 与上一条**互为反向**：画小了由「外沿带」抓，画大了由「更外面那条对照带」抓。
+        # 两条各有一条专属断言 —— 只写一条的话，必有一半失败方式没人管。
+        "edits": [("world.gd", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon(cone, player.facing),\n\t\t\t\t(1.0 - t01))\n", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon({\n\t\t\t\t\"r\": cone_r * 1.3, \"inner\": 40.0, \"half\": float(cone[\"half\"]), \"arc\": 0.9},\n\t\t\t\tplayer.facing),\n\t\t\t\t(1.0 - t01))\n")],
+        "expect": [
+            "★ 而 r 之外那条对照带几乎是黑的",
+            "★ 范围线真的画在**外沿 r** 上",
+        ],
+        "forbid": [
+            "★ 背后的贴身豁免圈也画了",
+            "★ 画出来的范围线与判定逐点一致",
+        ],
+    },
+    {
+        "name": "绘制层漏掉贴身豁免那圈（判定里有、画面上没有）",
+        # 只把**画出来的**内圈缩到 0.5。判定一个字没动，所以纯逻辑那层全绿 ——
+        # 这一条专门证明「背后的贴身豁免圈也画了」这条像素断言有牙齿，
+        # 而它是唯一能抓住这个失败方式的断言。
+        "edits": [("world.gd", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon(cone, player.facing),\n\t\t\t\t(1.0 - t01))\n", "\t\t\tArt.ground_cone(ci, px2, gy2, World.cone_polygon({\n\t\t\t\t\"r\": cone_r, \"inner\": 0.5, \"half\": float(cone[\"half\"]), \"arc\": 0.9},\n\t\t\t\tplayer.facing),\n\t\t\t\t(1.0 - t01))\n")],
+        "expect": ["★ 背后的贴身豁免圈也画了"],
+        "forbid": [
+            "★ 范围线真的画在**外沿 r** 上",
+            "★ 而 r 之外那条对照带几乎是黑的",
+            "★ 画出来的范围线与判定逐点一致",
+        ],
+    },
+    {
+        "name": "判定不看角度（贴身豁免扩大到整个半径）",
+        "edits": [
+            (
+                "world.gd",
+                "\treturn absf(Proj.angle_diff(facing, atan2(dy, dx))) <= float(cone[\"half\"])\n",
+                "\treturn true\n",
+            ),
+        ],
+        # ⚠️ 后面两条机器人断言**是该红的，不是误伤**：判定变成无方向之后，
+        # 机器人那一路的战况真的变了（背后的敌人也会被砍到）。
+        # 端到端断言对玩法改动敏感是应该的 —— 只是要**写明白**，
+        # 否则下一次跑的人会把它们当成"连带误伤"去追。
+        "expect": [
+            "★ 画出来的范围线与判定逐点一致",
+            "★ 正后方贴身：inner×0.8 打得到、inner×1.3 打不到",
+            "机器人打到了 Boss 区（进关链条能走通）",
+            "机器人清完了三波（波次链条能走通）",
+        ],
+        "forbid": [
+            "★ 正前方：r×0.99 打得到、r×1.02 打不到",
+            "★ 范围线真的画在**外沿 r** 上",
+            "★ 背后的贴身豁免圈也画了",
+        ],
+    },
+    {
+        "name": "扇面角宽写死 0.9（复现「有的武器对、有的武器不对」）",
+        # 灯杖的 arc 正好是 0.9 —— 写死它，灯杖看着分毫不差、其余六把全错。
+        # 这就是用户那句"**一些**武器不符"的字面复现。
+        # 注意它连像素层也带红（画出来的扇形也变成 0.9 了），这是应该的：
+        # 缺陷在几何来源那一层，往下每一层都会跟着错。
+        "edits": [
+            (
+                "world.gd",
+                "\tvar arc := float(w[\"arc\"]) * arc_mul\n",
+                "\tvar arc := 0.9 * arc_mul\n",
+            ),
+        ],
+        # 角宽写死之后 `arc_mul` 也失效了，所以"连刺的扇面更窄"那条**也该红**
+        # （它验的正是 arc_mul 有没有进来）；机器人那两条同理（见上一条的说明）。
+        "expect": [
+            "★ 扇面半角 = arc / 2",
+            "★ 角宽随武器走",
+            "★ 范围线真的画在**外沿 r** 上",
+            "★ 连刺的扇面也更窄",
+            "机器人打到了 Boss 区（进关链条能走通）",
+            "机器人清完了三波（波次链条能走通）",
+        ],
+        "forbid": ["★ 画出来的范围线与判定逐点一致"],
+    },
+    {
+        "name": "灯弩被当成近战（既不再射光矢，又多画一条近战范围线）",
+        # `shot` 类武器射光矢出去，判定走投射物。给它画一条近战范围线，
+        # 等于"标出来的线"指向一个不存在的命中区域 —— 最明目张胆的一种"不符"。
+        #
+        # ⚠️ 这一条打的是 `has_swing_sector()`，而**同一个判据也决定
+        # "要不要走射光矢那条分支"**（两件事本来就是同一件事：没有近战判定）。
+        # 所以它一坏，灯弩就真的变成了近战 —— 后面那四条**是该红的**：
+        # 三条灯弩自己的（不射箭了）加一条"八把武器特效种类"（少了一种）。
+        "edits": [
+            (
+                "world.gd",
+                "\treturn str(w.get(\"style\", \"slash\")) != \"shot\"\n",
+                "\treturn true\n",
+            ),
+        ],
+        "expect": [
+            "★ 八把武器里只有灯弩没有扇面",
+            "灯弩挥击会射出光矢（而不是刀弧）",
+            "灯弩挥击射出了光矢",
+            "玩家侧关键特效齐了（挥击/环/爆发/光柱/拽拉/持续区/枪口）",
+            "八把武器共产出 ≥ 7 种特效（不是靠改数字凑数）",
+        ],
+        "forbid": [
+            "★ 画出来的范围线与判定逐点一致",
+            "★ 角宽随武器走",
+        ],
+    },
+    {
+        "name": "飘字字号表建了但绘制不读（float_text 里写死字号）",
+        # 本轮"放大伤害数字"最可能悄悄失败的方式：表建好了、调用点也全改成读表了，
+        # 但绘制函数忘了用 `ft["size"]`。翻代码查不出来（调用点看着全对），
+        # 只有让屏幕上的像素说话。
+        "edits": [
+            (
+                "art.gd",
+                "\tvar size := base * pop\n",
+                "\tvar size := 20.0 * pop\n",
+            ),
+        ],
+        "expect": ["★ 字号真的影响渲染"],
+        "forbid": [
+            "★ 命中字号 ≥ 20",
+            "★ 小字号那帧必须画出了字",
+        ],
+    },
 ]
 
 
@@ -549,6 +717,27 @@ def run_verify() -> dict:
 
 def failed_checks(rep: dict) -> list[str]:
     return sorted(k for k, v in rep["checks"].items() if not v)
+
+
+def unknown_targets(rep: dict, picked: list[dict]) -> list[str]:
+    """`expect`/`forbid` 里有没有**对不上任何真实断言名**的字符串。
+
+    为什么需要这道校验：比对用的是子串匹配，所以抄错一个字（少个「★ 」前缀、
+    大小写不同、措辞记岔了）**不会**报错 —— 它会一路跑完，最后显示成
+    "✘ 预期变红却没有"，看起来像"这条断言没有牙齿"，把人引到完全错误的方向。
+
+    本条就是踩出来的：四条 `expect` 多写了「★ 」前缀，全套跑满 27 分钟才发现
+    是字符串抄错了，而断言其实**全都正常变红**。基线跑完时手上正好有全量断言名，
+    花 0.01 秒就能验掉，宁可在第 40 秒停下。
+    """
+    names = list(rep["checks"].keys())
+    bad: list[str] = []
+    for m in picked:
+        for kind in ("expect", "forbid"):
+            for pat in m.get(kind, []):
+                if not any(pat in n for n in names):
+                    bad.append(f'{m["name"]} —— {kind} 里的 {pat!r} 对不上任何断言名')
+    return bad
 
 
 def apply_edits(edits: list[tuple[str, str, str]]) -> None:
@@ -618,11 +807,23 @@ def main() -> int:
         shutil.copytree(SRC, BAK)  # 覆盖式工具，目标不存在时行为与普通复制一致
 
     print("▸ 跑基线（应为全绿）…")
-    base_fails = failed_checks(run_verify())
+    base_report = run_verify()
+    base_fails = failed_checks(base_report)
     if base_fails:
         print("  ⚠️ 基线本身就有红的，先修好再变异：", base_fails, file=sys.stderr)
         return 1
-    print("  基线全绿 ✓\n")
+
+    # 基线绿了，手上正好有**全量**断言名 —— 先拿它把 expect/forbid 的字符串验一遍。
+    # 抄错一个字不会在比对时报错，只会跑完全程后伪装成"预期变红却没有"。
+    bad_pat = unknown_targets(base_report, picked)
+    if bad_pat:
+        print("  ✗ expect/forbid 里有对不上断言名的字符串：", file=sys.stderr)
+        for b in bad_pat:
+            print("     " + b, file=sys.stderr)
+        print("     对着 shots/report.json 的 checks 键名原样抄（「★ 」前缀也算在内）",
+              file=sys.stderr)
+        return 1
+    print("  基线全绿 ✓ · expect/forbid 的断言名全部对得上 ✓\n")
 
     bad: list[str] = []
     try:

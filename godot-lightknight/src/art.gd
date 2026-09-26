@@ -84,6 +84,28 @@ static func ground_arc(ci: CanvasItem, px: float, py: float, r: float,
 	end_xf(ci)
 
 
+## 地面形状（"挥击能打到的范围"那条线）。顶点按"以玩家为心"的世界半径给好，
+## 与 ground_circle / ground_arc 用同一套变换，于是它是**压扁的** ——
+## 屏幕上看起来才是"贴在地上"，而不是立起来的一块。
+##
+## ⚠️ 两层描法（先暗后亮）不是装饰：这条线要落在**玩家自己那盏灯照亮的地面**上，
+## 而亮地面上的浅色细线会被洗白（同 `Art.player` 的描边，见 README）。
+## 先垫一道暗线，无论地面多亮都能读出形状；再压一道亮线标出位置。
+##
+## `k` 是整体淡出系数（挥击进度）。`pts` 不足 3 个点或退化时直接不画 ——
+## 宁可少画一条线，也不要画出一块看不出形状的东西。
+static func ground_cone(ci: CanvasItem, px: float, py: float,
+		pts: PackedVector2Array, k: float) -> void:
+	if pts.size() < 3 or k <= 0.0:
+		return
+	ci.draw_set_transform(Vector2(px, py), 0.0, Vector2(1.0, Proj.YSQUASH))
+	var closed := pts.duplicate()
+	closed.append(pts[0])
+	ci.draw_polyline(closed, Color(0.03, 0.04, 0.07, 0.62 * k), 3.6, true)
+	ci.draw_polyline(closed, Color(1.0, 0.96, 0.86, 0.70 * k), 1.5, true)
+	end_xf(ci)
+
+
 static func shadow(ci: CanvasItem, x: float, y: float, r: float, cam: Vector2, alpha: float) -> void:
 	ground_circle(ci, Proj.sx(x, cam.x), Proj.sy(y, 0.0, cam.y), r, Color(0.0, 0.0, 0.0, alpha))
 
@@ -1377,6 +1399,28 @@ static func _statue(ci: CanvasItem, px: float, gy: float, h: float) -> void:
 
 # ---------------------------------------------------------------- 掉落物 / 粒子 / 飘字
 
+## 飘字（伤害 / 治疗 / 格挡…）的**字号表** —— 唯一来源。
+##
+## 集中在一处是因为"数字够不够大"是个整体手感问题：散在十几处 `_add_text(...)`
+## 的实参里，既没法一次性调、也没法断言（自检只能去每个调用点各验一遍）。
+##
+## 本轮整体放大约 55%：用户反馈"攻击时的伤害数字看不清"。
+## 括注里是调整前的值，留着是为了下次再有人想动它时知道原来多大。
+const TEXT_SIZE := {
+	"hit": 22.0,      # 普通命中（原 14）
+	"crit": 28.0,     # 暴击（原 19）
+	"dot": 16.0,      # 元素持续伤害（原 12）—— 刷得密，比命中收一点，否则屏幕全是字
+	"hurt": 22.0,     # 自己受伤（原 16）
+	"heal": 17.0,     # 回血 / 吸血 / 噬影（原 13 ~ 16）
+	"block": 17.0,    # 格挡 / 护光（原 13 ~ 14）
+	"status": 16.0,   # 元素状态刻字（原 13）
+}
+
+## 哪些飘字要衬底辉光。**显式列出来**，不用"字号 ≥ 某数"这种隐式规则 ——
+## 字号一调，隐式规则就会把暴击和普通命中划到同一边去。
+const TEXT_GLOW_KEYS := ["crit", "hurt"]
+
+
 static func drop(ci: CanvasItem, d: Dictionary, cam: Vector2, t: float) -> void:
 	var px := Proj.sx(float(d["x"]), cam.x)
 	var py := Proj.sy(float(d["y"]), float(d["z"]) + 6.0, cam.y)
@@ -1423,13 +1467,19 @@ static func float_text(ci: CanvasItem, ft: Dictionary, cam: Vector2) -> void:
 	var size := base * pop
 	var w := font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x
 	var pos := Vector2(px - w * 0.5, py)
-	# 暴击那种大数字：背后垫一层同色暖光，在暗底上会自己亮起来
-	if base >= 17.0:
+	# 需要衬底辉光的数字（暴击 / 自己受伤）：背后垫一层同色暖光，在暗底上会自己亮起来。
+	# 判据从"字号够不够大"改成**显式标记** —— 字号一调，"字大就发光"这种
+	# 隐式规则会跟着漂（本轮把字号整体调大了，暴击与普通命中就撞在了一起）。
+	if bool(ft.get("bg", false)):
 		glow(ci, Vector2(px, py - size * 0.36), size * 1.2, c, 0.30 * life01)
-	# 描边：八个方向各描一遍。比单层 1px 阴影清楚得多，暗背景上尤其明显
+	# 描边：八个方向各描一遍。比单层 1px 阴影清楚得多，暗背景上尤其明显。
+	# ⚠️ 偏移量要**跟着字号缩放**：字号调大之后写死的 1.4px 会显得极细，
+	# 数字一大就"糊在光里"（这正是本轮用户反馈"看不清"的一部分原因）。
+	var so := maxf(1.4, size * 0.11)
 	var oc := Color(0.04, 0.03, 0.03, life01 * 0.85)
-	for d in [Vector2(-1.4, 0.0), Vector2(1.4, 0.0), Vector2(0.0, -1.4), Vector2(0.0, 1.4),
-			Vector2(-1.0, -1.0), Vector2(1.0, 1.0), Vector2(-1.0, 1.0), Vector2(1.0, -1.0)]:
+	for d in [Vector2(-so, 0.0), Vector2(so, 0.0), Vector2(0.0, -so), Vector2(0.0, so),
+			Vector2(-so * 0.72, -so * 0.72), Vector2(so * 0.72, so * 0.72),
+			Vector2(-so * 0.72, so * 0.72), Vector2(so * 0.72, -so * 0.72)]:
 		ci.draw_string(font, pos + d, txt, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size, oc)
 	ci.draw_string(font, pos, txt, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size,
 		Color(c.r, c.g, c.b, life01))

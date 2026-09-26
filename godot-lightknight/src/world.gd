@@ -89,6 +89,19 @@ var fog: Fog
 ## 迷雾开关（默认开）。像素类断言要能关掉它，否则量到的是雾而不是世界层
 ## —— 与 HUD 那层暗角的 `set_post_enabled(false)` 同一个道理。
 var fog_enabled := true
+
+## 只画"挥击范围线"，不画月牙刃与扫过的那道亮弧。
+##
+## 存在的理由与 `fog_enabled` 一模一样：**像素断言要能把别的东西关掉**。
+## 月牙刃的贴图有 200+ 像素宽、又正好扫在外沿那一带 —— 它亮着的时候，
+## "这条线到底画在哪个半径上"就完全量不出来（第一版没关它，
+## 「外沿带有变化」被月牙刃满足了，把半径写错也一样绿）。
+## 关掉它之后，"外沿带亮、更外面那条对照带不亮"才真的在说线的位置。
+var swing_guide_only := false
+
+func set_swing_guide_only(on: bool) -> void:
+	swing_guide_only = on
+	queue_redraw()
 ## 这一帧实际用于绘制的相机（含震屏偏移）。光照层也用它，否则影子会与画面脱开。
 var draw_cam := Vector2.ZERO
 
@@ -442,10 +455,125 @@ func reach_mul() -> float:
 	return BASE_REACH + float(boon("reach")) * 0.12 + float(affix_lv("reach")) * 0.12
 
 
-## 这一下挥击实际能打到的距离（世界单位）。绘制弧线、命中判定、攻击灯
-## 三处都从这里取，才不会"光甩到哪儿"与"刀能打到哪儿"对不上。
-func swing_reach() -> float:
-	return float(player.weapon()["range"]) * reach_mul()
+## 近身豁免半径（世界单位）：这一圈之内**不看角度**。
+##
+## 贴脸时敌人常常正好落在扇形之外（多半是从侧面绕过来的），此时"挥空"手感很怪，
+## 所以贴身这一圈是全方向的 —— 判定里一直有它。
+##
+## ⚠️ 它必须同时是**画范围线时要画出来的那一圈**：判定里有、画面上没有，
+## 就是"打到了却看不出为什么"。所以它不能再只作为一个字面量活在判定那几行里。
+const SWING_INNER := 40.0
+
+
+## 挥击半径的**唯一算式**：`range × range_mul × reach_mul`。
+##
+## 拆成一个静态函数是为了让下面两个入口共用同一行：`swing_reach()` 吃"当前手持
+## 武器"，`swing_cone()` 吃任意武器字典。两处各写一遍 —— 哪怕公式一样 ——
+## 就是下一个跑偏的入口（本轮修的病正是"两处各写一遍"）。
+static func cone_radius(range_v: float, range_mul: float, reach_v: float) -> float:
+	return range_v * range_mul * reach_v
+
+
+## 这一下挥击实际能打到的距离（世界单位），按**当前手持武器**算。
+## `range_mul` 是本次挥击的额外倍率（普通攻击 1.0；连灯刺的每一刺 0.9）。
+##
+## ⚠️ 这个参数是补上的：原来的注释写着"绘制弧线、命中判定、攻击灯三处都从这里取"，
+## 而实际上**只有自检在读它** —— 判定和绘制各自内联了一套算式。于是连刺那一刺
+## （0.9）的判定范围与画出来的弧根本不是同一个数，"注释说的"和"代码做的"分了家。
+func swing_reach(range_mul := 1.0) -> float:
+	return cone_radius(float(player.weapon()["range"]), range_mul, reach_mul())
+
+
+## 一次挥击的**判定几何** —— 判定与"画出来的范围线"**唯一**的共同来源。
+##
+## `w` 是**武器字典**（不一定等于当前手持的那把）：自检要拿它逐把遍历武器表，
+## 而"从 `player.weapon()` 里偷偷取 range"会让每把武器都算成当前手持那把 ——
+## 第一版就是这么写的，自检一眼抓住（八把武器的半径全是灯刃的 79.20）。
+##
+## 返回：`r` 外半径 / `arc` 整个扇面角宽（弧度）/ `half` 半角（= arc/2，
+## 判定比较用）/ `inner` 贴身豁免半径。
+##
+## ⚠️ **为什么必须收进一个函数**：原来判定用
+## `range * range_mul * reach_mul()`，画线用 `range * reach_mul() * 0.9`。
+## 两边各算各的，于是"标出来的线"与"真能打到的范围"朝三个方向跑偏：
+##   ① **半径**：画的漏了 `range_mul`、还多乘一个写死的 0.9 —— 普攻的线永远近 10%；
+##   ② **角宽**：判定是 `w["arc"]`（0.2 ~ 2.7），画的却是**写死的 0.9**。
+##      于是 arc 恰好 = 0.9 的灯杖看着分毫不差，arc = 0.62 的长明枪画得比判定宽 45%，
+##      arc = 2.7 的灯镰画得只有判定的三分之一；
+##   ③ **贴身那圈**判定里有、画面上没有。
+## 合起来就是用户报的"**一些**武器对不上"—— 对上的那个纯属巧合（arc 正好 0.9）。
+func swing_cone(w: Dictionary, arc_mul: float, range_mul: float) -> Dictionary:
+	var arc := float(w["arc"]) * arc_mul
+	return {
+		"r": cone_radius(float(w["range"]), range_mul, reach_mul()),
+		"arc": arc, "half": arc * 0.5, "inner": SWING_INNER,
+	}
+
+
+## 这一下打不打得到 —— **纯函数**，判定与自检共用同一个形状。
+##
+## 形状 = 半径 `inner` 的整圆 ∪ 从 `inner` 到 `r`、半角 `half` 的扇面
+## （一枚"钥匙孔"）；敌人是半径 `er` 的圆，**身体碰到形状**就算命中
+## （所以距离那一条带 `+ er`，角度那一条不带 —— 与原判定逐字对应，没有改手感）。
+static func cone_hits(cone: Dictionary, facing: float, cx: float, cy: float,
+		tx: float, ty: float, er: float) -> bool:
+	var dx := tx - cx
+	var dy := ty - cy
+	var d := sqrt(dx * dx + dy * dy)
+	if d > float(cone["r"]) + er:
+		return false
+	if d <= float(cone["inner"]):
+		return true
+	return absf(Proj.angle_diff(facing, atan2(dy, dx))) <= float(cone["half"])
+
+
+## 这把武器的挥击**有没有扇面**。
+##
+## 灯弩是 `shot`：它射一支光矢出去，**根本没有近战判定** —— 所以它不能画范围线。
+## 原来它照画不误（`attack_t` 一起被设上），等于"标出来的线"指向一个不存在的
+## 命中区域，这本身就是最明目张胆的一种"不符"。
+static func has_swing_sector(w: Dictionary) -> bool:
+	return str(w.get("style", "slash")) != "shot"
+
+
+## 挥击范围线的**顶点表**（纯函数，不负责画）。
+##
+## `cone_hits` 回答"这个点在不在形状里"，这里把同一个形状描出来。
+## 生成的多边形**关于玩家是星形的**（每一条从玩家出发的射线只穿过边界一次），
+## 所以自检可以直接用 `Geometry2D.is_point_in_polygon` 与 `cone_hits` 逐点比对 ——
+## "标出来的线"与"实际打到的范围"从此有一条机器可验的等式，而不是两句注释。
+##
+## ⚠️ 顶点顺序：内圈(a0) → 沿 a0 径向外出 → 外弧 → 沿 a1 径向内收 → 内弧绕回。
+## 两个易错点，都踩过：
+##   ① 原点**不能**进顶点表 —— 会把"径向外出"与"径向内收"两段变成共线重叠，
+##      多边形退化，`is_point_in_polygon` 的结果就没意义了；
+##   ② 内弧**必须从 i = 0 开始**（即包含 `(inner, a1)` 这个点）。
+##      少写它，`(r, a1)` 就会直接连到 `(inner, a1+ε)` —— 那条边是斜的，
+##      于是紧贴 a1 外侧多出一个窄三角，"画出来的形状"比真实扇面宽出去一点点。
+##      幅度只有 ε ≈ 0.06 弧度，**肉眼绝对看不出来**，但逐点比对会红
+##      （7 把武器里有 3 把各差 2~4 个采样点，就是这 3 个点把这条断言的价值
+##      全部兑现了：它连 0.06 弧度的偏差都不放过）。
+static func cone_polygon(cone: Dictionary, facing: float, seg := 24) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	var r := float(cone["r"])
+	var inner := float(cone["inner"])
+	var half := float(cone["half"])
+	if half * 2.0 >= TAU - 1e-6:
+		for i in seg:
+			var a := TAU * float(i) / float(seg)
+			pts.append(Vector2(cos(a), sin(a)) * r)
+		return pts
+	var a0 := facing - half
+	var a1 := facing + half
+	pts.append(Vector2(cos(a0), sin(a0)) * inner)
+	for i in seg + 1:                            # 外弧：这一刀真正扫得到的那一段
+		var a := a0 + (a1 - a0) * float(i) / float(seg)
+		pts.append(Vector2(cos(a), sin(a)) * r)
+	for i in seg + 1:                            # 内弧：扇面之外补成整圈的贴身豁免
+		var t := float(i) / float(seg)
+		var a := a1 + (a0 + TAU - a1) * t
+		pts.append(Vector2(cos(a), sin(a)) * inner)
+	return pts
 
 
 ## 迷雾开关。像素类断言与对照实验要能关掉它（否则"墙后到底暗不暗"量到的是雾），
@@ -809,7 +937,7 @@ func use_potion() -> bool:
 	p.hp += healed
 	prog["shop"]["oil_bank"] = n - 1
 	sfx("coin")
-	_add_text(p.x, p.y, 70.0, "+%d" % int(round(healed)), "#ffe0a8", 16.0)
+	_add_text(p.x, p.y, 70.0, "+%d" % int(round(healed)), "#ffe0a8", "heal")
 	events.append({"type": "toast", "text": "喝下灯油 ×1（背包还剩 %d）" % (n - 1)})
 	return true
 
@@ -1369,20 +1497,23 @@ func _update_player(dt: float) -> void:
 func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 	var p := player
 	var w := player.weapon()
-	var rng_r := float(w["range"]) * range_mul * reach_mul()
-	var arc := float(w["arc"]) * arc_mul
+	var cone := swing_cone(w, arc_mul, range_mul)
+	# 把"这一次"的判定几何留给绘制层。绘制**不许**自己再按武器表算一遍 ——
+	# 普通攻击（1.0）与连灯刺的每一刺（0.9）范围不一样，各算各的就是偏的那 10%。
+	p.swing_cone = cone
 	# 基础攻击的**染色**取自元素：这把武器是冰的，打出来就是蓝的。
 	# （技能仍然用武器自己的颜色 —— 那是"这把武器的技艺"，与元素是两件事。）
 	var col := "#" + element_color_of().to_html(false)
 	var hits := 0
 
-	if str(w.get("style", "slash")) == "shot":
-		# 远程：射一支光矢，飞完 w.range 就消失
+	if not has_swing_sector(w):
+		# 远程：射一支光矢，飞完 cone["r"] 就消失。
+		# ⚠️ 它**没有近战判定**，所以下面那条范围线也不该画（见 has_swing_sector）。
 		var sp := 900.0
 		_add_proj({
 			"x": p.x, "y": p.y, "z": 26.0,
 			"vx": cos(p.facing) * sp, "vy": sin(p.facing) * sp,
-			"r": 13.0, "dmg": float(w["dmg"]) * dmg_mul_v, "life": rng_r / sp,
+			"r": 13.0, "dmg": float(w["dmg"]) * dmg_mul_v, "life": float(cone["r"]) / sp,
 			"color": col, "own": "player", "knock": float(w["knock"]),
 			"elem": weapon_element(),
 		})
@@ -1400,19 +1531,17 @@ func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 	for e in enemies:
 		if e.dead:
 			continue
-		var d := Proj.dist(p.x, p.y, e.x, e.y)
-		if d > rng_r + e.r:
+		if not cone_hits(cone, p.facing, p.x, p.y, e.x, e.y, e.r):
 			continue
 		var ang := Proj.angle_to(p.x, p.y, e.x, e.y)
-		if absf(Proj.angle_diff(p.facing, ang)) > arc * 0.5 and d > 40.0:
-			continue
 		damage_enemy(e, float(w["dmg"]) * dmg_mul_v, ang, float(w["knock"]),
 			0.0, weapon_element())
 		hits += 1
 
 	effects.append({
 		"id": _next_id, "kind": "slash", "x": p.x, "y": p.y, "z": 24.0,
-		"angle": p.facing, "r0": rng_r * 0.35, "r1": rng_r, "len": 0.0, "w": arc,
+		"angle": p.facing, "r0": float(cone["r"]) * 0.35, "r1": float(cone["r"]),
+		"len": 0.0, "w": float(cone["arc"]),
 		"life": 0.17, "max_life": 0.17, "dmg": 0.0, "knock": 0.0, "stun": 0.0,
 		"color": col, "hit": {}, "own": "player", "delay": 0.0,
 	})
@@ -1421,7 +1550,7 @@ func player_swing(arc_mul: float, dmg_mul_v: float, range_mul: float) -> void:
 	if hits > 0:
 		shake = minf(shake + float(hits) * 1.1, 9.0)
 		player.glow = minf(1.0, player.glow + 0.22)
-	try_light_brazier(player.x, player.y, rng_r + 26.0)
+	try_light_brazier(player.x, player.y, float(cone["r"]) + 26.0)
 
 
 
@@ -2134,7 +2263,7 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 	if e.ward_cd > 0.0 and e.ward_t <= 0.0:
 		e.ward_t = e.ward_cd
 		e.hit_flash = 0.12
-		_add_text(e.x, e.y, e.h * 0.9, "格挡", "#ffe08a", 14.0)
+		_add_text(e.x, e.y, e.h * 0.9, "格挡", "#ffe08a", "block")
 		sfx("ui")
 		return
 	var el_id := elem if elem != "" else weapon_element()
@@ -2167,7 +2296,7 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 		var healed := final * p.lifesteal_pct
 		if healed >= 1.0:
 			p.hp = minf(p.max_hp, p.hp + healed)
-			_add_text(p.x, p.y, 56.0, "+" + str(int(round(healed))), "#a8e6b0", 13.0)
+			_add_text(p.x, p.y, 56.0, "+" + str(int(round(healed))), "#a8e6b0", "heal")
 
 	# 击退：重量越大越抗
 	var wt := 1.0 - float(e.def.get("weight", 0.3))
@@ -2197,7 +2326,7 @@ func damage_enemy(e: EnemyState, dmg: float, dir: float, knock: float, stun := 0
 			})
 	_add_text(e.x, e.y, e.h * 0.9,
 		("●" if crit else "") + str(int(round(final))),
-		"#fff2c8" if crit else "#ffcf86", 19.0 if crit else 14.0)
+		"#fff2c8" if crit else "#ffcf86", "crit" if crit else "hit", crit)
 
 	# 元素状态：伤害结算完之后才施加。这一击已经把它打死的话就不必挂了
 	# （挂了也会被下一帧的清场逻辑收走，只是白跑一遍粒子）。
@@ -2249,7 +2378,7 @@ func _apply_element(e: EnemyState, el_id: String, hit: float, dir: float) -> voi
 				"size": _rng.randf_range(1.2, 2.6), "color": col, "glow": true,
 				"drag": 2.8, "grav": 220.0,
 			})
-	_add_text(e.x, e.y, e.h * 0.72, str(el["glyph"]), col, 13.0)
+	_add_text(e.x, e.y, e.h * 0.72, str(el["glyph"]), col, "status")
 
 
 ## 雷元素：从命中点放一道电弧到**最近的、且隔着墙也连得上**的敌人。
@@ -2293,7 +2422,7 @@ func _dot_damage(e: EnemyState, dmg: float, color: String) -> void:
 		return
 	e.hp -= dmg * (1.0 - clampf(e.dr, 0.0, 0.9))
 	e.hit_flash = maxf(e.hit_flash, 0.06)
-	_add_text(e.x, e.y, e.h * 0.78, str(int(round(dmg))), color, 12.0)
+	_add_text(e.x, e.y, e.h * 0.78, str(int(round(dmg))), color, "dot")
 	if e.hp <= 0.0:
 		_kill_enemy(e, Proj.angle_to(player.x, player.y, e.x, e.y))
 
@@ -2339,7 +2468,7 @@ func _kill_enemy(e: EnemyState, dir: float) -> void:
 		player.hp = minf(player.max_hp, player.hp + float(vamp) * 3.0)
 		if player.hp > hp_before + 0.01:
 			_add_text(e.x, e.y, e.h + 12.0,
-				"+%d" % int(round(player.hp - hp_before)), "#ff9db4", 13.0)
+				"+%d" % int(round(player.hp - hp_before)), "#ff9db4", "heal")
 
 	var is_boss := e.is_boss()
 	var coins := int(e.def["coin"])
@@ -2411,7 +2540,7 @@ func _kill_enemy(e: EnemyState, dir: float) -> void:
 	if boon("vamp") > 0 and not player.dead:
 		var hv := 4.0 * float(boon("vamp"))
 		player.hp = minf(player.max_hp, player.hp + hv)
-		_add_text(player.x, player.y, 58.0, "+" + str(int(hv)), "#a8e6b0", 13.0)
+		_add_text(player.x, player.y, 58.0, "+" + str(int(hv)), "#a8e6b0", "heal")
 	# 词缀「燃」：死亡时爆出一圈火，会烧到玩家
 	if e.burn > 0.0:
 		_push_effect({
@@ -2470,7 +2599,7 @@ func hurt_player(dmg: float, dir: float, extra_combo_loss := 0.0) -> void:
 	# 灯杖·护光：护盾期间完全免疫，只在身上擦一下火花
 	if p.shield_t > 0.0:
 		_spawn_fx(p.x, p.y, "#d9c2ff")
-		_add_text(p.x, p.y, 60.0, "护光", "#d9c2ff", 14.0)
+		_add_text(p.x, p.y, 60.0, "护光", "#d9c2ff", "block")
 		sfx("ui")
 		return
 	p.hp -= dmg
@@ -2484,7 +2613,7 @@ func hurt_player(dmg: float, dir: float, extra_combo_loss := 0.0) -> void:
 	p.vx += cos(dir) * 210.0
 	p.vy += sin(dir) * 210.0
 	sfx("hurt")
-	_add_text(p.x, p.y, 60.0, "-" + str(int(round(dmg))), "#ff8a72", 16.0)
+	_add_text(p.x, p.y, 60.0, "-" + str(int(round(dmg))), "#ff8a72", "hurt", true)
 	for i in 12:
 		var a := dir + _rng.randf_range(-1.2, 1.2)
 		_add_particle(p.x, p.y, _rng.randf_range(10.0, 44.0), {
@@ -2789,9 +2918,15 @@ func _add_particle(x: float, y: float, z: float, d: Dictionary) -> void:
 	})
 
 
-func _add_text(x: float, y: float, z: float, txt: String, color: String, size: float) -> void:
+## 飘一条字。`txt_key` 是 `Art.TEXT_SIZE` 里的键 —— **字号只从那张表里取**，
+## 这里不收裸数字：否则"把伤害数字调大"就变成十几个调用点各改一次。
+## `bg` = 要不要衬底辉光（暴击 / 自己受伤那种"必须一眼看到"的）。
+func _add_text(x: float, y: float, z: float, txt: String, color: String,
+		txt_key: String, bg := false) -> void:
 	texts.append({"x": x, "y": y, "z": z, "vy": 46.0, "text": txt,
-		"color": color, "size": size, "life": 0.85, "max_life": 0.85})
+		"color": color, "size": float(Art.TEXT_SIZE[txt_key]),
+		"bg": bg, "key": txt_key,
+		"life": 0.85, "max_life": 0.85})
 
 
 func _spawn_fx(x: float, y: float, color: String) -> void:
@@ -3277,32 +3412,55 @@ func draw_bloom(ci: CanvasItem) -> void:
 	if player.attack_t > 0.0:
 		var t01 := 1.0 - player.attack_t / 0.2
 		var w: Dictionary = player.weapon()
-		var a0 := player.facing - float(w["arc"]) * 0.6
-		var a1 := player.facing + float(w["arc"]) * 0.6
+		# 这一次挥击的判定几何。**从玩家身上读，不在这里重算** ——
+		# 绘制与判定各算各的正是"标出来的线不符"的成因（见 swing_cone 的注释）。
+		# 理论上 `player_swing` 一定会先写上；空字典只是防止自检直接摆姿态时读到 null。
+		var cone: Dictionary = player.swing_cone
+		if cone.is_empty():
+			cone = swing_cone(w, 1.0, 1.0)
+		var cone_r: float = float(cone["r"])
+		var a0 := player.facing - float(cone["half"])
+		var a1 := player.facing + float(cone["half"])
 		var sweep := a0 + (a1 - a0) * t01
 		var px2 := Proj.sx(player.x, c.x)
 		var gy2 := Proj.sy(player.y, 0.0, c.y)
-		# 弧线的半径也乘 `reach_mul()`：**画出来的弧必须与打得中的范围一致**，
-		# 否则"提升攻击范围"会变成"刀还是那么短、但判定偷偷变远了"。
-		Art.ground_arc(ci, px2, gy2, float(w["range"]) * reach_mul() * 0.9, sweep - 0.9, sweep,
-			Color(1.0, 0.95, 0.82, 0.55 * (1.0 - t01)), 4.0)
+		if has_swing_sector(w) and not player.dead:
+			# ① **标出来的线**：这一刀真正能打到的形状，一笔描出来。
+			#    形状由 `World.cone_polygon` 生成 —— 与判定用的 `cone_hits`
+			#    是同一个形状，自检里用 is_point_in_polygon 逐点比对。
+			#    半径与角宽都取真值（原来这里写死 `range*reach_mul()*0.9`
+			#    与固定 0.9 弧度，就是"线不符"的出处）。
+			Art.ground_cone(ci, px2, gy2, World.cone_polygon(cone, player.facing),
+				(1.0 - t01))
+			# ② 扫过去的那道亮弧。**长度夹在扇面角宽以内** ——
+			#    原来写死 0.9 弧度，比长明枪的整个扇面（0.62）还长 45%，
+			#    等于又画出一条打不到的线。
+			# ①②都被 `swing_guide_only` 关掉的是**②**、不是①：像素断言量的是①
+			# 画在哪，②与月牙刃都压在同一个半径上，留着就分不清是谁亮的。
+			if not swing_guide_only:
+				var tail := minf(0.9, float(cone["arc"]))
+				Art.ground_arc(ci, px2, gy2, cone_r, maxf(a0, sweep - tail), sweep,
+					Color(1.0, 0.95, 0.82, 0.55 * (1.0 - t01)), 4.0)
 		# 月牙斩：一道有弧度的亮刃跟着扫过去 —— 打击感主要来自这一下。
 		# 位置与朝向都在**屏幕空间**（贴图是用 draw_set_transform 转的），
 		# 所以 y 要按 YSQUASH 压一下、角度也要换算，才能和地面上那道弧严丝合缝。
-		var rad := float(w["range"]) * reach_mul() * 1.34
-		var sxp := px2 + cos(sweep) * rad * 0.70
-		var syp := gy2 - 24.0 + sin(sweep) * rad * 0.70 * Proj.YSQUASH
-		var scr := atan2(sin(sweep) * Proj.YSQUASH, cos(sweep))
-		# 月牙形状按武器挑一个：重武器宽、突刺类窄，八把武器一眼能看出差别。
-		# 朝左时竖直镜像 —— 镜像一次加旋转正好等于水平镜像，朝向就对上了。
-		var sn := "01"
-		if player.weapon_id == "spear" or player.weapon_id == "crossbow":
-			sn = "03"
-		elif player.weapon_id == "hammer" or player.weapon_id == "scythe":
-			sn = "02"
-		Art.tex_rot(ci, "slash_" + sn, Vector2(sxp, syp), rad * 1.45, rad * 1.45,
-			scr + PI * 0.5, Color(1.0, 0.95, 0.84, 0.78 * (1.0 - t01)),
-			cos(player.facing) < 0.0)
+		# 半径也换成 cone 的：原来用 `range * reach_mul() * 1.34`，
+		# 既漏了 `range_mul`（连刺时刃会甩到判定之外），又比判定远 34%。
+		if not swing_guide_only:
+			var rad := cone_r * 1.34
+			var sxp := px2 + cos(sweep) * rad * 0.70
+			var syp := gy2 - 24.0 + sin(sweep) * rad * 0.70 * Proj.YSQUASH
+			var scr := atan2(sin(sweep) * Proj.YSQUASH, cos(sweep))
+			# 月牙形状按武器挑一个：重武器宽、突刺类窄，八把武器一眼能看出差别。
+			# 朝左时竖直镜像 —— 镜像一次加旋转正好等于水平镜像，朝向就对上了。
+			var sn := "01"
+			if player.weapon_id == "spear" or player.weapon_id == "crossbow":
+				sn = "03"
+			elif player.weapon_id == "hammer" or player.weapon_id == "scythe":
+				sn = "02"
+			Art.tex_rot(ci, "slash_" + sn, Vector2(sxp, syp), rad * 1.45, rad * 1.45,
+				scr + PI * 0.5, Color(1.0, 0.95, 0.84, 0.78 * (1.0 - t01)),
+				cos(player.facing) < 0.0)
 
 	# 灯杖·护光：身上罩一层会呼吸的光壳
 	if player.shield_t > 0.0 and not player.dead:
