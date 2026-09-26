@@ -27,7 +27,7 @@
 
 ## 当前基线
 - `tools/godot-lightknight.sh` — 自检 **358/358**，约 30 秒，连跑两遍 `report.json`
-  **逐字节相同**（md5 `f1afc1cefbf99d830d9ec22896cbb6dd`）。超过两分钟没好通常是脚本
+  **逐字节相同**（md5 `8368deda0f49b1ef7a08fbd637377c60`，雾 0.45 后）。超过两分钟没好通常是脚本
   没起来，先 grep `SCRIPT ERROR|Parse Error`。
   ⚠️ **rc=1 不等于断言红** —— 必须单独看 `report.json.errors`。
   ⚠️ **别在测试跑的时候改脚本/源码**（它会反复调用自检，中途改会污染整轮结果）。

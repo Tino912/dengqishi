@@ -194,7 +194,8 @@ if fg:
           f"满雾格 {fg['grid_dark_cells']}/{fg['grid_cells']}")
     print(f"    同一像素　没照到的地方 {px['dark_off']:.4f} → 有雾 {px['dark_on']:.4f}"
           f"　灯下 {px['lit_off']:.4f} → {px['lit_on']:.4f}（几乎不动）")
-    print(f"    全屏平均亮度　关雾 {px['mean_off']:.4f} → 开雾 {px['mean_on']:.4f}（最浓）"
+    print(f"    全屏平均亮度　关雾 {px['mean_off']:.4f} → 开雾 {px['mean_on']:.4f}"
+          f"（雾 α={fg['mist_max']}）"
           f"　夜色旋钮（关雾量）{px['mean_night_off']:.4f} → {px['mean_darkest']:.4f}"
           f"　雾开着时夜色只剩 {px['night_delta_fog_on']:.4f}")
     print(f"    墙挡散雾（两点到灯同距 {wl['d_open']:.0f}px）　空地 {wl['open']:.3f}"
