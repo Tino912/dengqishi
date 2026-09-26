@@ -7,8 +7,8 @@
 地图全黑、只有灯骑士周围些许亮光的游戏，**两份实现，故意的**：
 - **Web 版** `src/`（Vite + TS + Canvas）：3 武器、三关数值、商店/升级/存档。
 - **Godot 版** `godot-lightknight/`（4.7.2）：**跑在前面** —— 8 武器 / 19 技能 / 三选一 /
-  精英词缀 / 种子随机布局 / 三关三图 / 5 元素与状态效果 / 攻击发光 / 夜色 / 迷雾，
-  这些 Web 都没有。
+  精英词缀 / 种子随机布局 / 三关三图 / 5 元素与状态效果 / 攻击发光 / 夜色 / 迷雾 /
+  F11 全屏，这些 Web 都没有。
 ⚠️ 旧约定「跨版本改玩法以 Web 为准」**已作废**；动之前先决定以哪边为准，**别默认 Web 是权威**。
 
 ## 硬约定
@@ -52,8 +52,8 @@
    推广：**判据只有一个出处时，才对得起"改坏它就会红"**。
 
 ## 当前基线
-- `tools/godot-lightknight.sh` — 自检 **418/418**，约 45 秒，连跑两遍 `report.json`
-  **逐字节相同**（md5 `04a6ab5630b4a83fb826e76011c28c34`，远程视觉/字号再放大之后）。
+- `tools/godot-lightknight.sh` — 自检 **442/442**，约 50 秒，连跑两遍 `report.json`
+  **逐字节相同**（md5 `9b82023f140037875c12bc2949c2594d`，F11 全屏之后）。
   超过两分钟没好通常是脚本没起来，先 grep `SCRIPT ERROR|Parse Error`
   —— **GDScript 解析错误会让 Godot 挂住不退出**，外面只看得出"这轮自检好慢"。
   ⚠️ **rc=1 不等于断言红** —— 必须单独看 `report.json.errors`。
@@ -64,17 +64,22 @@
   ⚠️ **它不做 `rm -rf shots` 了**：沙箱批量删除保护**按 turn 累计**（同 turn 删 >50 个
   就要求确认），而 shots/ 有 60 个文件 → 一删就**卡住等确认**（自检 3 分钟无输出，
   `ps` 里连 godot 都没有）。现在是**只写不删** + 跑完只读地列出多余文件。
-- `tools/godot-mutate.py` — **43 个变异**（全量约 30 分钟），备份 `~/.cache/dq-mutate/src.bak`。
+  ⚠️ **新加了 `class_name` 的脚本要先刷全局类缓存**，否则报
+  `Parse Error: Identifier "xxx" not declared`（看着像语法错，其实是缓存旧）。
+  脚本已自愈（`find src -name '*.gd' -newer <缓存>` → 先 `--import`）。
+- `tools/godot-mutate.py` — **50 个变异**（全量约 45 分钟），备份 `~/.cache/dq-mutate/src.bak`。
   ⚠️ 刻意不用 `rmtree`（沙箱批量删除保护会拦 → 还原失败、坏源码留盘），改用
   `copytree(dirs_exist_ok=True)` 覆盖还原；⚠️ src 改过后它拒绝覆盖旧备份，先把 `src.bak`
   **改名存档**（别删）再重跑。⚠️ 多个名字子串是 **OR** 过滤。
+  ⚠️ 开跑前有 `unknown_targets()` **前置校验**：`expect/forbid` 的字符串对不上任何
+  断言名就直接退出（否则抄错名字只会伪装成"预期变红却没有"）。**改断言措辞后要
+  顺手 grep 变异表里的同名子串** —— 本轮就这么拦下一条。
 - 另有 `godot-probe*.sh`（迁移前遮挡探针）、`browser-verify.sh` + `make-*.py`（Web 版）。
-- **最近一轮：「远程武器不该有挥击视觉 / 伤害数字再放大」** —— 总闸
-  `World.swing_visual_on()`（上一轮只拦住①范围线，③月牙刃漏在外面 → 灯弩开枪甩出
-  一道 886px 宽的刀弧）；`TEXT_SIZE` → 30/40/22。断言 418，变异 43。
+- **最近一轮：「F11 全屏」** —— `src/window_mode.gd`（纯状态机：决策与真窗口分开验）+
+  `main.advance()` 里在状态机分发**之前**处理（任何界面都生效）。断言 442，变异 50。
   细节见 DETAIL-godot.md 同名小节。
 
-## 五个最容易踩的坑（其余见 DETAIL-godot.md）
+## 七个最容易踩的坑（其余见 DETAIL-godot.md）
 1. **沙箱「批量删除保护」**：**按 turn 累计**，同一条命令里删 >50 个（或同 turn 累计超 50）
    就被拦 —— 而且是**卡住等确认、不报错退出**（`scope":"turn"`）。覆盖式**写**多少个都不拦。
    → 还原 / 同步一律**覆盖式复制，只写不删**。
@@ -94,6 +99,14 @@
    换成 `_region_moved` 占比 + 400×280 的小窗 → **4.63%**。
    **两种窗要反着用**："精确为 0" 用大窗（0 不受窗大小影响，越大越不漏），
    "看得出来" 用小窗（占比，窗大了被稀释）。
+6. **加动作要加进 `GameInput.ACTIONS`，只 `_register()` 进 InputMap 不算**。
+   采样只看 ACTIONS 那张表 —— 漏了它 `just()` 永远是 false，**键按下去毫无反应
+   且不报任何错**。2026-09-26 又踩了一次（F11 就是这样"改了但没生效"的）。
+   → 判据是端到端那条断言（"按下次数 0"），决策层的断言**全都不会红**。
+7. **新加 `class_name` 的脚本必须先刷 `.godot/global_script_class_cache.cfg`**，
+   否则报 `Parse Error: Identifier "xxx" not declared` —— 看着像"变量没声明"的语法错误，
+   其实代码没问题，是类缓存旧。跑 `godot --headless --path <proj> --import`（约 10 秒）。
+   一键脚本已自愈。
 
 ## 仓库
 `origin` = `git@github.com:Tino912/dengqishi.git`（SSH）。沙箱内 push 见 skill
