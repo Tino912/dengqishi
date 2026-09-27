@@ -96,6 +96,8 @@ func _run() -> void:
 	await _sec(_section_swing_cone)
 	# 伤害数字的可读性（不重建世界，接着上一段的世界用）
 	await _sec(_section_text_readability)
+	# 伤害产生的光圈有多大（同样接着上面那个世界用；排在 F11 之前）
+	await _sec(_section_damage_glow)
 	# F11 全屏。**排在最末**：这一段会真去切真实窗口（全屏 ↔ 窗口），
 	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
 	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
@@ -104,7 +106,34 @@ func _run() -> void:
 
 
 ## 段数。**加了新的 `_sec(...)` 就要 +1** —— 它是下面那条"段哨兵"断言的分母。
-const SECTIONS := 22
+const SECTIONS := 23
+## 伤害光圈的判据（见 `_section_damage_glow`）：
+## `GLOW_OLD_MUL` 是把旋钮拧回**旧尺寸**那一档要用的倍数。旋钮同时缩放半径与不透明度，
+## 于是能量按 m³ 走，m 就取两个"旧/新能量比"开三次方的几何中点：
+##   飘字 1.20²×0.30 / (0.85²×0.22) = 2.70 → m = 1.39；火花 3.4²×0.50 / (2.1²×0.30) = 4.35 → m = 1.63。
+## 取 **1.51** 落在两者之间（几何中点 1.508）—— 两处光晕都落在"≈旧、略偏"的位置上。
+const GLOW_OLD_MUL := 1.51
+## 光圈大小的**绝对上限**，单位是"窗里被加色层照亮了多少个像素"（`_gain_count`）。
+##
+## 为什么不用"逐通道平均差"当上限：那个数被窗里的空地**稀释**一个数量级
+## （实测这一版 e_now 只有 0.002 上下，跟"没接上"同一个量级，阈值没法摆）。
+## 面积型判据没有这个问题 —— 它数的是光圈本身。
+##
+## ⚠️ 阈值是**量出来再定**的，不拍脑袋：上限取"现在"与"旧尺寸那一档"的**几何中点**，
+##    两边各留同样的倍数余量 —— 于是"现在通过"与"把常量改回旧值就撞线"都不擦边。
+##    实测（见 `report["cases"]["damage_glow"]`）：现在 424 / 旧尺寸那一档 3742
+##    → 中点 1260，两边各 ~2.97 倍。改了两处光晕常量之后要**重新量这两个数**。
+const GLOW_PX_MAX := 1260
+## 同一件事的**能量口径**（逐通道平均差），与上面那条配成一对：
+## 面积那条拦"整团变大"，这条拦"半径收小、不透明度拉高"那种面积不变而更亮的改法。
+## 实测 0.00182 / 0.01045 → 中点 0.0044，两边各 ~2.4 倍。
+const GLOW_E_MAX := 0.0044
+## **真实命中**（`damage_enemy` 真打出来的那一发）亮起来的像素数上限。
+## 为什么除了 ② 那个手摆现场还要单独来一条：手摆现场两处光晕都有，于是
+## "只把火花那一处改回旧尺寸"会被平均掉 —— 实测火花单独只占 215 个像素
+## （非暴击那一发）而两处加起来 400+，单独给它一条上限才拦得住这种**局部回退**。
+## 实测（暴击那一档）554 / 拧到旧尺寸 3060 → 中点 1300，两边各 ~2.35 倍。
+const GLOW_HIT_PX_MAX := 1300
 ## 已经**完整跑完**的段数。
 var _sections_done := 0
 
@@ -435,6 +464,17 @@ func _window_alt_range(w: World, r: Rect2i, step := 2) -> Vector2:
 			lo = minf(lo, a)
 			hi = maxf(hi, a)
 	return Vector2(lo, hi)
+
+
+## 一整块屏幕矩形里**最大**的迷雾揭示度（用当前相机反解成世界地面点）。
+## 用来断言"这个窗在两个机位下都没被照亮" —— 否则量到的是灯，不是雾。
+func _window_reveal_max(w: World, r: Rect2i, step := 4) -> float:
+	var hi := 0.0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var wp := _world_of(w, float(r.position.x + x), float(r.position.y + y))
+			hi = maxf(hi, w.fog_reveal_at(wp.x, wp.y))
+	return hi
 
 
 ## 取一块 patch 的平均亮度（Rec.709）
@@ -3589,6 +3629,131 @@ func _section_fog_night() -> void:
 	_ok("雾散尽之后还能重新聚起来（重开同一关要用）", w.fog.fade() > 0.95,
 		"%.2f" % w.fog.fade())
 
+	# ── ②f 雾长在**地图**上：镜头动了，雾纹跟着地图走（不跟着主角走）──
+	#
+	# 需求原话：「请让迷雾是地图本身的元素，不要跟着主角动」。
+	# 旧版噪声采样的是 `SCREEN_UV` —— 贴在屏幕上，主角一走整片雾跟着镜头平移。
+	#
+	# 判据：把整个世界在屏幕上平移 Δ 像素（相机反向挪 Δ），然后比两张图：
+	#   ① 按**屏幕**对齐（同一个窗）：雾纹应当**明显不同**（相对屏幕它动了）；
+	#   ② 按**地图**对齐（窗反向挪 Δ）：雾纹应当**逐字节相同**（相对地图它没动）。
+	# ② 是"雾是地图的一部分"的直接证明，① 是它的反向对照。
+	#
+	# ⚠️ 量之前必须把**时间冻住**：`mist_speed` 与 `mist_billow` 都拧到 0，雾纹于是变成
+	#    "世界位置的纯函数"。否则"两张图不同"里混着"时间又过去了"（与 ②c 不调 `_pump`
+	#    是同一条规矩：量哪一层，就把别层冻住）。
+	# ⚠️ 地形也必须跟着地图平移，否则 ② 的差值里混着地形。这一条**单独量**：
+	#    拿关雾的两帧做同样的比对，差值必须是 0 —— 它是整个判据的地基。
+	# ⚠️ 相机要停在**没被地图边界夹住**的地方，否则"挪主角"不等于"挪镜头"（那是另一件事）。
+	var sp_f := float(fmat.get_shader_parameter("mist_speed"))
+	var bl_f := float(fmat.get_shader_parameter("mist_billow"))
+	fmat.set_shader_parameter("mist_speed", 0.0)
+	fmat.set_shader_parameter("mist_billow", 0.0)
+	var anchor_w := Vector2(900.0, 1100.0)
+	var dx_scr := 83            # 屏幕位移 = 1.5 个雾胞（55px）；也不是 16 的倍数（照亮场格子）
+	w.teleport(anchor_w.x, anchor_w.y)
+	p.combo = 0.0
+	p.glow = 0.0
+	p.combo_timer = 0.0
+	_pump(12)
+	var cam_a := w.draw_cam
+	# 取样窗：屏幕 (380,180) 起 96×64。位置是**算过**的（不是随手取的）：
+	# 世界 x∈[640,736]、y∈[809.5,913] —— 关内所有墙都躲开了（最近的一面在 x≥860），
+	# 三个火盆都够不着（最近的 267px，火盆开雾半径 199.5），也躲开了屏幕正中（主角）
+	# 与 HUD（上边 180px 起、只到 244px）。
+	var win_a := Rect2i(380, 180, 96, 64)
+	var win_a_alt := _window_alt_range(w, win_a)
+	var win_a_rev := _window_reveal_max(w, win_a)
+	w.set_fog_enabled(false)
+	_pump(2)
+	var off_a := await _grab()
+	w.set_fog_enabled(true)
+	_pump(2)
+	var on_a := await _grab()
+	# 挪主角 = 挪镜头（这一带没被夹住：x 的夹取区间是 [640, 1760]）
+	w.teleport(anchor_w.x + float(dx_scr), anchor_w.y)
+	_pump(12)
+	var cam_b := w.draw_cam
+	# 反向挪 Δ 的那个窗 —— 它盖住的**世界**范围与 `win_a` 完全相同
+	var win_b := Rect2i(win_a.position.x - dx_scr, win_a.position.y, win_a.size.x, win_a.size.y)
+	var win_b_alt := _window_alt_range(w, win_b)
+	var win_b_rev := _window_reveal_max(w, win_b)
+	w.set_fog_enabled(false)
+	_pump(2)
+	var off_b := await _grab()
+	w.set_fog_enabled(true)
+	_pump(2)
+	var on_b := await _grab()
+
+	var cam_dx := cam_b.x - cam_a.x
+	var cam_dy := cam_b.y - cam_a.y
+	# 三个数：整帧按屏幕对齐 / 按地图对齐 / **关雾**（地形）按地图对齐；
+	# 再加两个"雾层"（开雾 − 关雾，地形与灯光已抵消）的数 —— 判据只用雾层那两个。
+	var anchor_same := _region_diff(on_a, on_b, win_a)
+	var anchor_map := _region_diff_shift(on_a, on_b, win_a, -dx_scr, 0)
+	var anchor_off_map := _region_diff_shift(off_a, off_b, win_a, -dx_scr, 0)
+	var anchor_off_same := _region_diff(off_a, off_b, win_a)
+	var layer_same := _fog_layer_diff_shift(on_a, off_a, on_b, off_b, win_a, 0, 0)
+	var layer_map := _fog_layer_diff_shift(on_a, off_a, on_b, off_b, win_a, -dx_scr, 0)
+	_num("锚定·镜头横向平移的实测值（像素）", cam_dx)
+	_num("锚定·整帧按**屏幕**对齐的差", anchor_same)
+	_num("锚定·整帧按**地图**对齐的差", anchor_map)
+	_num("锚定·关雾（地形）按地图对齐的差（抗锯齿残差）", anchor_off_map)
+	_num("锚定·关雾（地形）按屏幕对齐的差（证明世界真的挪了）", anchor_off_same)
+	_num("锚定·**雾层**按屏幕对齐的差", layer_same)
+	_num("锚定·**雾层**按地图对齐的差（判据）", layer_map)
+	report["cases"]["fog"]["anchor"] = {
+		"dx": snappedf(cam_dx, 0.001), "dy": snappedf(cam_dy, 0.001),
+		"same_pos": snappedf(anchor_same, 0.000001),
+		"map_aligned": snappedf(anchor_map, 0.000001),
+		"off_map_aligned": snappedf(anchor_off_map, 0.000001),
+		"off_same_pos": snappedf(anchor_off_same, 0.000001),
+		"layer_same_pos": snappedf(layer_same, 0.000001),
+		"layer_map_aligned": snappedf(layer_map, 0.000001),
+		"win_alt": [snappedf(win_a_alt.y, 0.0001), snappedf(win_b_alt.y, 0.0001)],
+		"win_reveal": [snappedf(win_a_rev, 0.0001), snappedf(win_b_rev, 0.0001)],
+	}
+	_ok("锚定前提：镜头真的横移了 %.0f 像素、纵向没动" % float(dx_scr),
+		absf(cam_dx - float(dx_scr)) < 0.01 and absf(cam_dy) < 0.01,
+		"实测 Δ=(%.3f, %.3f)" % [cam_dx, cam_dy])
+	_ok("★ 锚定前提：两个机位下**两个窗**都是平地（高度场 0）且没被照亮（揭示度 < 0.05）",
+		win_a_alt.y < 0.001 and win_b_alt.y < 0.001
+		and win_a_rev < 0.05 and win_b_rev < 0.05,
+		"高度 %.4f / %.4f　揭示度 %.3f / %.3f" % [win_a_alt.y, win_b_alt.y,
+			win_a_rev, win_b_rev])
+	_ok("地基前提：世界确实是**整块**平移的（关雾两帧按地图对齐后只剩抗锯齿的残差）",
+		anchor_off_map < 0.008 and anchor_off_same > 0.01,
+		"地图对齐 %.5f（屏幕对齐 %.5f）" % [anchor_off_map, anchor_off_same])
+	# ⚠️ 阈值是**量出来的**：雾层按地图对齐实测 **0.0013**（剩下的全是 8bit 量化噪声 ——
+	#    "开雾帧 − 关雾帧"两次取整带来的 ±1/255），按屏幕对齐 **0.0250**（19×）。
+	#    取 0.005 / 0.012：两边各留 3~2 倍余量，而"噪声退回屏幕空间"那个变异是 0.025 量级
+	#    （离 0.005 有 5 倍）—— 不会擦边过，也不会把无关变异连坐打红。
+	_ok("★ 雾长在地图上：镜头平移 %.0f 像素后，**把平移抵消掉**，雾这一层几乎逐字节相同"
+		% float(dx_scr) + "（雾纹相对地图没动）",
+		layer_map < 0.005, "地图对齐 %.6f（地形地基 %.6f）" % [layer_map, anchor_off_map])
+	_ok("★ 反向对照：同一组图按**屏幕**对齐则明显不同 —— 雾纹相对屏幕动了 %d 像素"
+		% int(dx_scr),
+		layer_same > 0.012 and layer_same > layer_map * 10.0,
+		"屏幕对齐 %.5f vs 地图对齐 %.6f（%.0f×）" % [layer_same, layer_map,
+			layer_same / maxf(layer_map, 1e-6)])
+
+	# 对照图：把"雾这一层"抠出来（扣掉地形与灯光），3 列 × 2 行 ——
+	#   第一行 = 雾层：①A 的窗、②B 的**同一屏幕位置**、③B 平移 Δ 后（应与①相同）
+	#   第二行 = 同一套三格，但用的是**关雾**的帧（地形）：①②不同、①③相同
+	var tiles := [
+		_fog_layer_tile(on_a, off_a, win_a, 3),
+		_fog_layer_tile(on_b, off_b, win_a, 3),
+		_fog_layer_tile(on_b, off_b, win_b, 3),
+		_pose_tile(off_a, win_a, 3),
+		_pose_tile(off_b, win_a, 3),
+		_pose_tile(off_b, win_b, 3),
+	]
+	_write_png(_grid(tiles, 3), "26-fog-anchor")
+
+	# 还原：雾的时间冻结解开（时间由下次 `_rebuild` 写回 `w.time`）
+	fmat.set_shader_parameter("mist_speed", sp_f)
+	fmat.set_shader_parameter("mist_billow", bl_f)
+
 	# 收尾：世界停在一个干净的正常状态（雾开着、后处理开着）
 	w.set_fog_enabled(true)
 	GameInput.aim_world = null
@@ -4720,6 +4885,42 @@ func _bright_count(im: Image, r: Rect2i, thr := 0.55) -> int:
 	return n
 
 
+## 一块区域里"被加色层照亮了多少像素"：`on` 比 `off` 亮出 `thr` 以上才算一个。
+##
+## 用来量**伤害光圈有多大**。它直接数的是**面积**，不被窗里的空地稀释 ——
+## 而"逐通道平均差"天生会被稀释（光圈只占窗的一小块，均值被摊平），
+## 实测同一个旋钮在 140×151 的窗里均值只有 0.0019，看着像"光晕没接上"。
+## 阈值 0.03：软光斑中心 α≈0.18（+0.18 亮度）、到 0.65 倍半径处还有 +0.03 ——
+## 于是它量到的约是"π(0.65r)²"，也就是**光斑面积**这个量本身。
+func _gain_count(on: Image, off: Image, r: Rect2i, thr := 0.03) -> int:
+	var n := 0
+	for y in range(r.position.y, r.position.y + r.size.y):
+		for x in range(r.position.x, r.position.x + r.size.x):
+			if x < 0 or y < 0 or x >= on.get_width() or y >= on.get_height():
+				continue
+			var a := on.get_pixel(x, y)
+			var b := off.get_pixel(x, y)
+			if ((a.r - b.r) + (a.g - b.g) + (a.b - b.b)) / 3.0 > thr:
+				n += 1
+	return n
+
+
+## 一块区域的**平均亮度**（Rec.709）。
+##
+## 用来守"加色光斑不会被饱和压平"这个前提：亮点（加色）在亮底上会顶到 1.0，
+## 于是"大光圈"与"小光圈"在像素上一样白，差值被压掉 —— 这时量出来的"减小了"
+## 是**假的**（它其实没变小，只是量不出来了）。所以量光圈的那块窗必须先自证够暗。
+func _region_lum(img: Image, r: Rect2i, step := 2) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var c := img.get_pixel(r.position.x + x, r.position.y + y)
+			acc += c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722
+			n += 1
+	return acc / maxf(float(n), 1.0)
+
+
 ## ── 攻击时的伤害数字够不够大 ──────────────────────────────────────
 ##
 ## 用户反馈："攻击时伤害数字看不清"。这里只验两件事，但两件都必须是**真的**：
@@ -4792,6 +4993,182 @@ func _section_text_readability() -> void:
 	report["cases"]["text"] = {
 		"hit": t_hit, "crit": t_crit, "px_small": n_small, "px_big": n_big,
 	}
+
+
+# ================================================================ 伤害产生的光圈
+#
+# 需求原话：「减小伤害产生的光圈」。指的是命中那一下炸开的两块**加色光斑**：
+#   ① 暴击/受击飘字的衬底辉光（`Art.TEXT_GLOW_*`）
+#   ② 命中火花的光晕（`Art.PARTICLE_GLOW_*`）
+# 两块都归一个旋钮管：`Art.glow_mul`（半径与不透明度一起缩放，能量按 m³ 走）。
+#
+# 量法与前几段同一路数：**冻结世界，同一帧只拧这一个旋钮**，量那一圈光在窗里
+# 贡献了多少能量（逐通道平均差）。判据三条，缺一不可：
+#   · **在发光**（E > 0）—— 否则下面两条是拿两个 0 在比，恒真；
+#   · **剂量-反应**（拧回旧尺寸那一档 E 明显更大）—— 证明这个度量真的在量"光圈的大小"；
+#   · **绝对上限**（E ≤ 阈值）—— 这条才是"减小"本身。只有它挡得住"把常量改回旧值"。
+#
+# ⚠️ 摆场景**只摆一次**，三帧之间一个粒子都不再生成：`damage_enemy` 会吃 `_rng`
+#    撒出随机方向的火花，摆两次的话"两张图不一样"里混着"火花落点又变了"。
+# ⚠️ 窗必须**又平又暗**：地面上有高度（`alt > 0`）时雾更薄、背景更亮，加色光斑会撞到
+#    饱和（饱和之后"大光圈"与"小光圈"在像素上都顶到 1.0，差值被压掉）——
+#    量出来的"减小了"会假性变小。所以窗的位置是**算过**的（见下面那条前提断言）。
+func _section_damage_glow() -> void:
+	var w := _w()
+	var p := _p()
+	w.enemies.clear()
+	w.effects.clear()
+	w.projs.clear()
+	w.particles.clear()
+	w.texts.clear()
+	w.drops.clear()
+	w.girl = null
+	w.shake = 0.0
+	w.hitstop = 0.0
+	p.attack_t = 0.0
+	p.cast_t = 0.0
+	p.combo = 0.0
+	p.glow = 0.0
+	p.combo_timer = 0.0
+	# 关雾量：这是**最严**的一档 —— 没有雾在前面挡着，光圈看起来最亮。
+	# （雾开着时它只是被按同一个比例压住，比较的比值不变。）
+	w.set_fog_enabled(false)
+	# 先把机位钉死（上一段留下的玩家位置是任意的，相机可能还夹在地图边上）——
+	# 这个点算过：x 不被夹（[640,1760] 内），y 也不被夹（[580.6,1119.4] 内）。
+	w.teleport(900.0, 1100.0)
+	_pump(12)
+	var hit_pt := Vector2(760.0, 960.0)
+	var e := w.spawn_enemy("shade", hit_pt.x, hit_pt.y, false)
+	_pump(6)
+	var foot := Vector2(Proj.sx(e.x, w.draw_cam.x), Proj.sy(e.y, 0.0, w.draw_cam.y))
+	# 窗：200×200，罩住**整团**光斑 —— 飘字辉光在头顶那条字上（圆心 `foot.y - z - size*0.36`，
+	# 半径最大的一档 = 字号 40 × 弹跳 1.45 × 0.85 × 旋钮 1.51 ≈ 74px），火花在脚边。
+	# 窗口**不许裁**：裁掉的话"旧尺寸那一档"会被系统性地低估，绝对上限跟着一起定低 ——
+	# 看着像"判据很严"，其实是量歪了。（实测过一次：150 宽那版把最外圈切掉了几像素。）
+	#
+	# ⚠️ 这一段是**关着雾**量的（见上面 `set_fog_enabled(false)`），于是窗里的 `alt` 与
+	#    揭示度**一个像素都不影响** —— 它们只作记录，不是前提。真正要守的前提是
+	#    **背景够暗**：加色光斑在亮底上会撞饱和，那时"大光圈"和"小光圈"都被顶到 1.0，
+	#    差值被压掉，量出来的"减小了"会**假性变小**（这条是下面 `bg_lum` 那条断言）。
+	var glow_win := Rect2i(int(foot.x) - 100, int(foot.y) - 165, 200, 200)
+	var ga_alt := _window_alt_range(w, glow_win)
+	var ga_rev := _window_reveal_max(w, glow_win)
+	# 把这一发**钉成暴击**：`damage_enemy` 里是 `_add_text(..., bg = crit)`，只有暴击的飘字
+	# 才带衬底辉光 —— 于是"暴击那一档"才是两处光晕**都在**的那一档，量它才有意义。
+	# 做法：抽到暴击就把随机流**退回抽之前**（`state` 是 PCG 的完整状态），让
+	# `damage_enemy` 自己再抽到同一发。**不写死种子** —— 暴击率一改，写死的种子
+	# 会悄悄变成"不暴击"，那时这一段的结论就不成立了，而且没有任何东西会报错。
+	var crit_thr := minf(0.85, 0.16 + w.crit_chance())
+	var st := w._rng.state
+	var want_crit := w._rng.randf() < crit_thr
+	var rolls := 0
+	while not want_crit and rolls < 4096:
+		rolls += 1
+		st = w._rng.state
+		want_crit = w._rng.randf() < crit_thr
+	w._rng.state = st
+	w.damage_enemy(e, 8.0, 0.0, 0.0)          # 8 点伤害：打不死（打死了会再多出一圈死亡特效）
+	var is_crit := false
+	for t in w.texts:
+		if bool(t.get("bg", false)):
+			is_crit = true
+	_ok("这一发真的打成了暴击（下面量的是「火花 + 飘字衬底辉光」两处都在的那一档）",
+		is_crit, "暴击率阈值 %.3f，为凑这一发先空抽了 %d 次" % [crit_thr, rolls])
+	w.mark_redraw()
+	var real_on := await _grab()
+	Art.glow_mul = 0.0
+	w.mark_redraw()
+	var real_off := await _grab()
+	Art.glow_mul = GLOW_OLD_MUL
+	w.mark_redraw()
+	var real_big := await _grab()
+	Art.glow_mul = 1.0
+	var px_real := _gain_count(real_on, real_off, glow_win)
+	var e_real := _region_diff(real_on, real_off, glow_win)
+	var px_real_big := _gain_count(real_big, real_off, glow_win)
+	var bg_lum := _region_lum(real_off, glow_win)
+	_num("伤害光圈·窗里最大高度场（这一段雾是关的，只作记录）", ga_alt.y)
+	_num("伤害光圈·窗里最大揭示度（同上，只作记录）", ga_rev)
+	_num("伤害光圈·窗里的背景亮度（前提：够暗才不会把加色光斑压饱和）", bg_lum)
+	_num("伤害光圈·真实命中那一下亮起来的像素数", float(px_real))
+	_num("伤害光圈·真实命中·拧到旧尺寸那一档亮起来的像素数", float(px_real_big))
+	_num("伤害光圈·真实命中那一下的能量", e_real)
+	_ok("★ 伤害光圈前提：量它的那个窗背景够暗（亮底上加色光斑会撞饱和，「减小」会假性变小）",
+		bg_lum < 0.35, "背景亮度 %.3f（上限 0.35）" % bg_lum)
+	_ok("真实命中确实会打出这套光晕（不是只在我手摆的那两件道具上生效）",
+		px_real > 50, "%d 个像素" % px_real)
+	# 端到端的那一条：真实打出来的这一发（火花 + 飘字辉光）也要小，而且旋钮拧大了要明显更多。
+	# 与 ② 那个手摆现场的判据**互为对照** —— ② 证明"这个度量在量光圈"，这一条证明
+	# "真打出来的那一下也真的变小了"，两者量的场景不同，一条绿另一条红是有意义的。
+	_ok("★ 真实命中的光圈也变小了：亮起来的像素数 ≤ %d，且拧大旋钮会明显更多" % GLOW_HIT_PX_MAX,
+		px_real <= GLOW_HIT_PX_MAX and px_real_big > px_real * 1.5,
+		"%d 个像素（上限 %d；拧到 %.2f 是 %d 个）" % [px_real, GLOW_HIT_PX_MAX, GLOW_OLD_MUL, px_real_big])
+
+	# ── ② 单变量定量：摆一次现场，只拧 `Art.glow_mul` ──
+	w.enemies.clear()
+	w.particles.clear()
+	w.texts.clear()
+	w.shake = 0.0
+	w.hitstop = 0.0
+	_pump(4)
+	var e2 := w.spawn_enemy("shade", hit_pt.x, hit_pt.y, false)
+	_pump(4)
+	# 照抄 `damage_enemy` 里那一簇火花（9 颗、暖黄、带火花贴图的芯）—— 参数**写死**，不吃随机数
+	for i in 9:
+		var a := -0.9 + float(i) * 0.225
+		w._add_particle(e2.x + cos(a) * 4.0, e2.y + sin(a) * 4.0, e2.h * 0.5, {
+			"vx": cos(a) * 180.0, "vy": sin(a) * 180.0, "vz": 60.0,
+			"life": 0.45, "size": 2.4, "color": "#ffce80", "glow": true,
+			"drag": 2.6, "grav": 260.0, "tex": "spark_07", "rot": a,
+		})
+	w._add_text(e2.x, e2.y, e2.h * 0.9, "8888", "#fff2c8", "crit", true)
+	w.mark_redraw()
+	var g_now := await _grab()
+	Art.glow_mul = 0.0
+	w.mark_redraw()
+	var g_off := await _grab()
+	Art.glow_mul = GLOW_OLD_MUL
+	w.mark_redraw()
+	var g_old := await _grab()
+	Art.glow_mul = 1.0
+	var px_now := _gain_count(g_now, g_off, glow_win)
+	var px_old := _gain_count(g_old, g_off, glow_win)
+	var e_now := _region_diff(g_now, g_off, glow_win)
+	var e_old := _region_diff(g_old, g_off, glow_win)
+	_num("伤害光圈·这一版亮起来的像素数", float(px_now))
+	_num("伤害光圈·旧尺寸那一档亮起来的像素数（旋钮拧到 %.2f）" % GLOW_OLD_MUL, float(px_old))
+	_num("伤害光圈·这一版的能量", e_now)
+	_num("伤害光圈·旧尺寸那一档的能量", e_old)
+	report["cases"]["damage_glow"] = {
+		"text_r": Art.TEXT_GLOW_R, "text_a": Art.TEXT_GLOW_A,
+		"particle_r": Art.PARTICLE_GLOW_R, "particle_a": Art.PARTICLE_GLOW_A,
+		"old_mul": GLOW_OLD_MUL, "window": [glow_win.position.x, glow_win.position.y,
+			glow_win.size.x, glow_win.size.y],
+		"px_now": px_now, "px_old": px_old, "px_real": px_real,
+		"px_real_big": px_real_big, "bg_lum": snappedf(bg_lum, 0.0001),
+		"e_now": snappedf(e_now, 0.00001), "e_old": snappedf(e_old, 0.00001),
+		"e_real": snappedf(e_real, 0.00001), "alt_max": snappedf(ga_alt.y, 0.0001),
+		"reveal_max": snappedf(ga_rev, 0.0001),
+	}
+	_ok("★ 这一版的光圈真的在发光（关掉旋钮后画面明显变了）", px_now > 20 and e_now > 0.0008,
+		"%d 个像素　能量 %.5f" % [px_now, e_now])
+	_ok("★ 剂量-反应：旋钮拧回旧尺寸那一档，光斑明显更大 —— 这个度量真的在量光圈的大小",
+		px_old > px_now * 1.5 and e_old > e_now * 1.5,
+		"像素 %d → %d　能量 %.5f → %.5f" % [px_now, px_old, e_now, e_old])
+	_ok("★ 光圈变小了：亮起来的像素数 ≤ %d（旧尺寸那一档是 %d 个）" % [GLOW_PX_MAX, px_old],
+		px_now <= GLOW_PX_MAX, "%d 个像素（上限 %d，旧尺寸 %d）" % [px_now, GLOW_PX_MAX, px_old])
+	# 与上一条**配成一对**的第二个绝对口径。为什么两个都要：
+	# 上一条量"面积"，这一条量"总能量"。把半径调小、不透明度调大这种改法就是
+	# 面积不变而亮度更高 —— 单看面积它蒙混过关，能量这条把它拦下。
+	_ok("★ 光圈变小了（能量口径）：%.5f ≤ %.5f —— 与上一条配成一对" % [e_now, GLOW_E_MAX],
+		e_now <= GLOW_E_MAX, "能量 %.5f（上限 %.5f，旧尺寸 %.5f）" % [e_now, GLOW_E_MAX, e_old])
+	_write_png(_grid([_pose_tile(g_off, glow_win, 3), _pose_tile(g_now, glow_win, 3),
+		_pose_tile(g_old, glow_win, 3)], 3), "38-damage-glow")
+	w.particles.clear()
+	w.texts.clear()
+	w.shake = 0.0
+	w.hitstop = 0.0
+	w.mark_redraw()
 
 
 # ================================================================ F11 全屏
@@ -5087,6 +5464,69 @@ func _region_moved(a: Image, b: Image, r: Rect2i, eps := 0.10, step := 2) -> flo
 				moved += 1
 			n += 1
 	return float(moved) / maxf(float(n), 1.0)
+
+
+## 两块**错开**的区域的平均逐通道差：`a` 取 `r`，`b` 取 `r` 平移 (dx, dy) 之后那一块。
+##
+## 用来问"相机挪了 Δ 之后，**同一个世界内容**有没有变样"（见迷雾段 ②f）。
+## `_region_diff` 只能比同一个矩形，而"地图对齐"天生要比两个不同位置的窗。
+func _region_diff_shift(a: Image, b: Image, r: Rect2i, dx: int, dy: int, step := 2) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var ca := a.get_pixel(r.position.x + x, r.position.y + y)
+			var cb := b.get_pixel(r.position.x + x + dx, r.position.y + y + dy)
+			acc += absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)
+			n += 3
+	return acc / maxf(float(n), 1.0)
+
+
+## 把"雾**这一层**"从两张图里抠出来：逐像素取（开雾 − 关雾），中灰打底再放大 k 倍。
+##
+## 地形与灯光在两张图里是同一份，相减就抵消了 —— 剩下的只有雾自己的浓淡。
+## 于是"雾纹长什么样"变成一张能直接看的图，对照图（`26-fog-anchor`）用它做面板：
+## 相机挪了之后，"按屏幕对齐"和"按地图对齐"哪个能对上，一眼就看得出来。
+func _fog_layer_tile(on: Image, off: Image, r: Rect2i, k := 3) -> Image:
+	var out := Image.create_empty(r.size.x * k, r.size.y * k, false, Image.FORMAT_RGBA8)
+	for y in r.size.y:
+		for x in r.size.x:
+			var a := on.get_pixel(r.position.x + x, r.position.y + y)
+			var b := off.get_pixel(r.position.x + x, r.position.y + y)
+			var d := ((a.r - b.r) + (a.g - b.g) + (a.b - b.b)) / 3.0
+			# 放大 3 倍：这一层实测落在 0.055 ~ 0.14（雾色 0.31、地面 0.06、α 0.22~0.56），
+			# ×3 之后正好铺满中灰到白，既看得见絮、又不会糊成一片白。
+			var v := clampf(0.5 + d * 3.0, 0.0, 1.0)
+			var c := Color(v, v, v, 1.0)
+			for oy in k:
+				for ox in k:
+					out.set_pixel(x * k + ox, y * k + oy, c)
+	return out
+
+
+## 两张图的**雾层**（各自"开雾 − 关雾"）在**错开**位置上的平均差。
+##
+## 这是 ②f 真正的判据。地形与灯光在**同一帧里**相减就抵消了 —— 于是这个数只问一件事：
+## **相机挪了之后，雾纹有没有跟着地图走**。
+##
+## 为什么不直接比两张"开雾"的图：地形自己也吃了抗锯齿，而抗锯齿是**屏幕空间**的
+## （采样点钉在像素上），所以世界整体平移之后地形会有 0.003 量级的残差（实测）。
+## 那点残差不影响"雾有没有跟着动"这个问题，但会占满整个阈值 —— 相减之后它归零。
+func _fog_layer_diff_shift(on_a: Image, off_a: Image, on_b: Image, off_b: Image,
+		r: Rect2i, dx: int, dy: int, step := 2) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var pa := on_a.get_pixel(r.position.x + x, r.position.y + y)
+			var qa := off_a.get_pixel(r.position.x + x, r.position.y + y)
+			var pb := on_b.get_pixel(r.position.x + x + dx, r.position.y + y + dy)
+			var qb := off_b.get_pixel(r.position.x + x + dx, r.position.y + y + dy)
+			acc += absf((pa.r - qa.r) - (pb.r - qb.r)) \
+				+ absf((pa.g - qa.g) - (pb.g - qb.g)) \
+				+ absf((pa.b - qa.b) - (pb.b - qb.b))
+			n += 3
+	return acc / maxf(float(n), 1.0)
 
 
 ## 把一个区域降采样成 6x6 的亮度指纹，用来判「两个姿态是不是同一个」。

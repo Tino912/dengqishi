@@ -7,16 +7,48 @@
   · 没有连带误伤（别的断言不该无故变红 —— 那说明它们互相耦合，将来会误导人）。
 
 **怎么用**
-    tools/godot-mutate.py              # 跑全部变异（50 个，一个约 1 分钟）
-    tools/godot-mutate.py 迷雾          # 只跑名字里含「迷雾」的
-    tools/godot-mutate.py --list       # 只列出变异清单
+    tools/godot-mutate.py                  # 串行跑全部变异
+    tools/godot-mutate.py --jobs 4         # 4 个 worker 并行（见下面「倍速」）
+    tools/godot-mutate.py 迷雾              # 只跑名字里含「迷雾」的
+    tools/godot-mutate.py --list           # 只列出变异清单
     tools/godot-mutate.py --restore-only   # 从备份还原 src（中途崩了用这个）
 
-每次变异的流程：备份 src → 打补丁 → 跑 tools/godot-lightknight.sh →
-读 shots/report.json 取"变红的断言名" → **无条件还原 src**。
-全部跑完后再跑一次基线，确认还原干净（必须全绿）。
+每次变异的流程：备份 src → 打补丁 → 跑自检 → 读 shots/report.json 取"变红的断言名"
+→ **无条件还原 src**。全部跑完后再跑一次基线，确认还原干净（必须全绿）。
 
 退出码：0 = 每个变异的实际变红集合都符合预期；1 = 有变异不符合。
+
+**倍速（2026-09-27 用户要求「在进行变异测试时尝试倍速」，逐个量过再改）**
+
+改之前一轮 = `tools/godot-lightknight.sh`，实测 **48.6 秒**。拆开看有两个可省的开销：
+  · **每轮白跑一次导入刷新（~8 秒）**。那个脚本拿"源码比类缓存新"当判据，
+    而**每个变异都会重写一个 src 文件** → 判据必然成立 → 每轮都 `--import` 一遍。
+    变异从不新增 `class_name` 脚本，这一步对变异测试毫无用处。
+    → 这里改成**直接调 godot**（不走那个脚本），把它省掉。
+  · **`--disable-vsync`（~2.5 秒 / 6%）**：实测 42.9 → 40.2 秒，`report.json` 逐字节相同。
+    ⚠️ 这个数**早先被记错过**：写的是"86 秒 → 40 秒（2.15×）"，那是拿**脚本总耗时**
+    去比**引擎耗时**，两件事。真话是"脚本 48.6 / 引擎 40.2"，两处都省才落到 40.2 秒。
+  · 剩下的 **40.2 秒**基本是引擎本身（llvmpipe 软件渲染）的下限，没法再挤。
+
+所以**单轮 48.6 → 40.2 秒（1.21×）** —— 这是能落到实处的那一截。
+
+再往上只剩**并行**：`--jobs N` 给每个 worker 一份**工程副本**（连 `.godot/` 一起复制，
+所以副本也不必重新导入），各自就地改自己的 `src/`。自检只吃满 20 核里的一两核，
+所以 4 路在纸面上能拿到 ~3×。
+
+⚠️ **但本机实测用不了 —— 而且是被它自己的前提自证拦下的**（见 `run_batch()`）：
+`--jobs > 1` 时会**先用未打补丁的副本并发跑一轮**。4 个 worker 一起跟 XWayland 要窗口
+尺寸时，基线里这条会偶发变红：
+
+    ★ 前提：真窗口能被设成测试尺寸 —— 设不上，下面两条尺寸断言就无从谈起
+
+而那条前提一红，后面两条尺寸断言全成了"无从谈起" → **含全屏断言的变异会被误判**。
+（它是**偶发**的：同一批 4 条变异早先并发跑过一次是全绿的。偶发最不该被"重试到绿"糊过去。）
+
+处理：**退回串行**（慢，但结论一定可信），并把发现打在日志里。
+想真正用上并发，得让真窗口那一段在进程之间互斥（或给它一个"跳过真窗口段"的模式、
+再把那几条变异单独串行跑）—— 本机没做，理由见 README 二.20.5：**这一类"看起来更快"
+的改动，收益必须量出来，不能推出来**。
 
 ⚠️ **沙箱注意：这里刻意不用 `shutil.rmtree`。** 本环境的沙箱有"批量删除保护"
 （一次删超过 50 个文件会被拦下并抛异常），而 `src/` 有 20+ 个文件、`restore()`
@@ -29,17 +61,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROJ = ROOT / "godot-lightknight"
 SRC = PROJ / "src"
-BAK = pathlib.Path.home() / ".cache" / "dq-mutate" / "src.bak"
-REPORT = PROJ / "shots" / "report.json"
-VERIFY = ROOT / "tools" / "godot-lightknight.sh"
+CACHE = pathlib.Path.home() / ".cache" / "dq-mutate"
+BAK = CACHE / "src.bak"
+REPORT_REL = pathlib.Path("shots") / "report.json"
+REPORT = PROJ / REPORT_REL
+# 直接调引擎，不走 tools/godot-lightknight.sh —— 那个脚本每轮会白跑一次
+# "导入刷新"（~8 秒，因为变异必然让某个 src 文件比类缓存新）。见模块开头的「倍速」。
+GODOT_BIN = os.environ.get("GODOT_BIN", "/usr/bin/godot")
+VERIFY_TIMEOUT = 240   # 单轮自检的超时。正常 ~40 秒；超了多半是解析错误把引擎挂住了
 
 # 每个变异 = 一组对 src/ 下源文件的纯文本替换。
 #   edits: [(相对 src 的路径, 原文, 替换)]
@@ -779,6 +818,7 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "退出全屏时立刻设尺寸（不等窗口模式落定）",
+        "serial": True,   # 碰真窗口 → 永远串行跑（并发下 WM 会抖）
         # 这是"最自然的写法"，也正是本机（XWayland）会栽的那个坑：
         # 实测 window_set_mode(WINDOWED) 之后，窗口尺寸**当帧**还报着全屏的
         # 2560×1600，下一帧才被 WM 改成它自己的 1270×1528。同一步里 set_size
@@ -793,14 +833,29 @@ MUTATIONS: list[dict] = [
                 "\t\tleft = 0\n",
             ),
         ],
+        # ⚠️ **只列"确定的那一半"**（2026-09-27 实测 5 次后的结论，见 README 二.20.5）。
+        #
+        # 这条变异的效果分两半：
+        #   · **确定的那一半**：调用时机 —— `left = 0` 让"设尺寸"不再等 RESTORE_DELAY 步。
+        #     下面那条时序断言 **5/5 全红**，钉得住。
+        #   · **偶发的那一半**：最终尺寸对不对。`left = 0` 是让"我们设"和"WM 覆盖"
+        #     去**抢**那一步，谁赢看运气 —— 实测五次：时序断言 5/5 红，
+        #     「标题界面那一轮还原干净了」红 **3/5**，「尺寸真的被我们设回」红 **1/5**。
+        #     （顺带说明 `RESTORE_DELAY` **不是**多余的余量：它挡掉的正是一个真竞态；
+        #      基线里这条一直稳绿，是"等够 6 步"在起作用。）
+        #
+        # → **偶发的那一半两边都不能写**：写进 expect 会 5 次里错 2~4 次，
+        #   写进 forbid 会 5 次里错 1~3 次，**两种写法都让这条变异随机报错**。
+        #   留白反而是对的：它们照旧以"？额外"出现在日志里（看得见，但不参与判定）。
+        #   它们**有牙**，只是归属另一条变异 ——「tick 算出来的尺寸不下发（记了不用）」
+        #   稳定地让这两条一起红。**一条断言一个归属**。
         "expect": [
             "★ 【本机时序陷阱的判据】退出全屏后**恰好**先等 RESTORE_DELAY 步",
-            "★ 退出全屏后窗口尺寸真的被**我们**设回按下之前那个",
-            "★ 标题界面这一轮也把尺寸还原干净了",
         ],
     },
     {
         "name": "is_fullscreen 只认 FULLSCREEN（漏掉独占全屏）",
+        "serial": True,   # 碰真窗口 → 永远串行跑（并发下 WM 会抖）
         # 「只认一种全屏」的后果不是"退不出来"这么轻：独占全屏下 F11 会以为
         # 自己当前不在全屏，于是**再进一次全屏**，玩家就再也出不来了。
         "edits": [
@@ -818,6 +873,7 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "进全屏时把「当前报的尺寸」当成窗口尺寸（不看待还原的）",
+        "serial": True,   # 碰真窗口 → 永远串行跑（并发下 WM 会抖）
         # "刚退出全屏就又按回来"时，那一帧报的还是**全屏尺寸** —— 照抄就会把
         # 2560×1600 记成"窗口尺寸"，下次退出全屏得到一个占满屏幕的窗口。
         # 这条只有"把两个动作挤到同一帧"才暴露，所以自检里专门有这么一段。
@@ -835,6 +891,7 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "tick 不再核对尺寸是否已经对上（会一直重复设）",
+        "serial": True,   # 碰真窗口 → 永远串行跑（并发下 WM 会抖）
         # 去掉"已经对了就收工"那一半。掉的是**幂等性**：
         # 收工之后每步还在设尺寸，等于一直跟 WM 抢。
         "edits": [
@@ -960,11 +1017,16 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "去掉高度视差（图案不再锚在地面）",
+        # ⚠️ 这行的**变量名换过**：雾改成世界空间采样后，旧写法
+        # `float sink = height_parallax * alt * height_top / view_h;` 变成了
+        # `float hz = ...`（去掉 / view_h —— 除数挪进了下面的世界坐标换算里）。
+        # 2026-09-27 全量跑就栽在这儿：`待替换文本出现 0 次`。
+        # → 改 fog.gd 里任何一行"长得像补丁目标"的代码后，**顺手 grep 一遍变异表**。
         "edits": [
             (
                 "fog.gd",
-                "\tfloat sink = height_parallax * alt * height_top / view_h;",
-                "\tfloat sink = 0.0;",
+                "\tfloat hz = height_parallax * alt * height_top;",
+                "\tfloat hz = 0.0;",
             ),
         ],
         "expect": [
@@ -1046,15 +1108,175 @@ MUTATIONS: list[dict] = [
             "★ 雾会飘：翻涌关掉后推进 6 秒",
         ],
     },
+    # ── 雾长在地图上 / 伤害光圈变小（2026-09-27）────────────────────────────
+    # 用户这一轮的两句话：「让迷雾是地图本身的元素，不要跟着主角动」与
+    # 「减小伤害产生的光圈」。两条需求都属于**看起来正常、其实没做到**那一类：
+    # 雾跟着镜头走一样"有雾"，光圈大一点一样"有打击感" —— 只有断言会说话。
+    {
+        "name": "雾纹退回屏幕空间采样（复现用户报的「雾跟着主角动」）",
+        # 只去掉 `gw` 里的 `cam_xy` 两项：噪声的**尺度、形状、漂移全不变**，
+        # 变的只有"它长在哪" —— 从"长在地图上"退回"贴在屏幕上"。
+        # 这就是用户看到的现象：主角一走，整片雾跟着镜头一起平移。
+        #
+        # 期望是**正反两条一起红**：自检把这件事写成了一对判据 ——
+        # 「把平移抵消掉应当对得上」（正）与「不抵消就该明显不同」（反）——
+        # 退成屏幕空间之后两条恰好互换，所以这一条变异同时钉住它们。
+        "edits": [
+            (
+                "fog.gd",
+                "\tvec2 gw = vec2(SCREEN_UV.x * view_w - view_w * 0.5 + cam_xy.x,\n"
+                "\t\t(SCREEN_UV.y * view_h - view_h * 0.5) / ysquash + cam_xy.y + hz / ysquash);",
+                "\tvec2 gw = vec2(SCREEN_UV.x * view_w - view_w * 0.5,\n"
+                "\t\t(SCREEN_UV.y * view_h - view_h * 0.5) / ysquash + hz / ysquash);",
+            ),
+        ],
+        "expect": ["★ 雾长在地图上", "★ 反向对照"],
+        # 改坏的只是"锚在哪"，雾本身还在、还会飘 —— 那几条必须保住。
+        "forbid": ["★ 雾会飘：翻涌关掉后推进 6 秒", "★ 雾会翻涌"],
+    },
+    {
+        "name": "相机没发给雾着色器（uniform 接线断，雾纹不再跟着镜头挪）",
+        # 与上一条**可观察结果相同、坏的那一层不同**：着色器照样读 `cam_xy`，
+        # 只是再也没人发它（`_rebuild` 里发的是 ZERO）→ 等价于"镜头永远停在地图原点"。
+        # 留这一条是因为它最像"重构时顺手删了一行"，而着色器那边看着毫无问题。
+        "edits": [
+            ("fog.gd", '\tmat.set_shader_parameter("cam_xy", w.draw_cam)\n', ""),
+        ],
+        "expect": ["★ 雾长在地图上", "★ 反向对照"],
+        "forbid": ["★ 雾会翻涌"],
+    },
+    {
+        "name": "两处伤害光圈都退回旧尺寸（复现用户报的「光圈太大」）",
+        # 四个常量一起回退 —— 这才是用户当初看到的那一版。
+        # 期望：三条**绝对上限**全红（面积 / 能量 / 真实命中那一发），
+        # 而「真的在发光」与两条**剂量-反应**必须保住：改坏的是"多大"，不是"有没有"。
+        "edits": [
+            ("art.gd", "const TEXT_GLOW_R := 0.85", "const TEXT_GLOW_R := 1.20"),
+            ("art.gd", "const TEXT_GLOW_A := 0.22", "const TEXT_GLOW_A := 0.30"),
+            ("art.gd", "const PARTICLE_GLOW_R := 2.1", "const PARTICLE_GLOW_R := 3.4"),
+            ("art.gd", "const PARTICLE_GLOW_A := 0.30", "const PARTICLE_GLOW_A := 0.50"),
+        ],
+        "expect": [
+            "★ 光圈变小了：亮起来的像素数",
+            "★ 光圈变小了（能量口径）",
+            "★ 真实命中的光圈也变小了",
+        ],
+        "forbid": [
+            "★ 这一版的光圈真的在发光",
+            "★ 剂量-反应：旋钮拧回旧尺寸那一档",
+            "★ 剂量-反应：漂速减半",
+        ],
+    },
+    {
+        "name": "光圈旋钮失效（半径与不透明度不再跟着 glow_mul 缩放）",
+        # 四个调用点全摘掉 `glow_mul`：画出来的光圈**尺寸一点没变**，只是那个旋钮
+        # 从画线上脱开了。期望正好与上一条**互补**：两条剂量-反应红，
+        # 三条绝对上限与「真的在发光」保住 —— 这两条变异合起来说明这一对判据各有分工：
+        # **绝对上限拦"整体变大"，剂量-反应拦"旋钮没接上"。**
+        #
+        # ⚠️ 必须四个调用点一起摘：只摘飘字那一处的话，火花那一半还在响应旋钮，
+        #    px_old 仍然远大于 px_now，剂量-反应照样绿 —— 那样这条变异会假通过。
+        "edits": [
+            (
+                "art.gd",
+                "\t\tglow(ci, Vector2(px, py - size * 0.36), size * TEXT_GLOW_R * glow_mul, c,\n"
+                "\t\t\tTEXT_GLOW_A * glow_mul * life01)",
+                "\t\tglow(ci, Vector2(px, py - size * 0.36), size * TEXT_GLOW_R, c,\n"
+                "\t\t\tTEXT_GLOW_A * life01)",
+            ),
+            (
+                "world.gd",
+                '\t\tArt.glow(ci, gp, float(q["size"]) * Art.PARTICLE_GLOW_R * Art.glow_mul, gc,\n'
+                "\t\t\tArt.PARTICLE_GLOW_A * Art.glow_mul, 4)",
+                '\t\tArt.glow(ci, gp, float(q["size"]) * Art.PARTICLE_GLOW_R, gc,\n'
+                "\t\t\tArt.PARTICLE_GLOW_A, 4)",
+            ),
+        ],
+        "expect": [
+            "★ 剂量-反应：旋钮拧回旧尺寸那一档",
+            "★ 真实命中的光圈也变小了",
+            # 下面这两条**也该红**（第一版把这两条列进了 forbid，实测打脸）：
+            # 旋钮一旦不从画线上走，"把旋钮拧到 0"就**关不掉**那两处光晕了 ——
+            # 于是"关掉之后画面会变"与"真实命中会打出光晕"这两条也一起红。
+            # 它们量的是"这团光能不能被关掉"，而这个变异坏的正是"关掉"。
+            "★ 这一版的光圈真的在发光",
+            "真实命中确实会打出这套光晕",
+        ],
+        # 顺带记一件事：两条**绝对上限**在这里是"0 ≤ 上限"式的**平凡绿**
+        # （测不出东西时数值塌成 0）。这不是漏测 —— 塌成 0 这件事由上面
+        # 「真的在发光」那条拦住了。两条缺一条都拦不住对应的失败方式。
+        "forbid": [
+            "★ 光圈变小了：亮起来的像素数",
+            "★ 光圈变小了（能量口径）",
+        ],
+    },
 ]
 
 
-def run_verify() -> dict:
-    """跑一次自检，返回 report.json（断言变红是预期内的，rc 不用管）。"""
-    subprocess.run([str(VERIFY)], cwd=ROOT, capture_output=True, text=True, timeout=900)
-    if not REPORT.exists():
-        raise RuntimeError("自检没有产出 report.json —— 看 ~/.cache/godot-tmp/godot-lightknight.log")
-    return json.loads(REPORT.read_text())
+def worker_project(i: int) -> pathlib.Path:
+    """第 i 个 worker 用的**工程副本**（`i >= 1`；真工程本身从不发出去）。
+
+    为什么必须复制整份工程：变异是**就地改 `src/`**，两个 worker 不能共用一份 src。
+    一次复制约 63MB（~1 秒），比"串行跑几十轮"便宜得多。
+    连 `.godot/` 一起复制，是为了让副本**不必重新导入** —— 变异从不新增
+    `class_name` 脚本，那份类缓存一直有效（这正是每轮省下 ~8 秒的地方）。
+
+    ⚠️ **真工程不发出去**（第一版把 worker 0 指到真工程上了）：并发跑的时候只该碰副本，
+    于是"整批被强杀"也不会在盘上留下改坏的 `src/` —— `restore()` 只管得住正常退出那一路。
+    """
+    dst = CACHE / f"w{i}" / PROJ.name
+    if not dst.exists():
+        shutil.copytree(PROJ, dst)
+    else:
+        # 只写不删地刷回基线（上一轮留下的改动与截图都作废）
+        shutil.copytree(SRC, dst / "src", dirs_exist_ok=True)
+    return dst
+
+
+def run_verify(proj: pathlib.Path) -> dict:
+    """跑一次自检，返回 report.json（断言变红是预期内的，退出码不用管）。
+
+    ⚠️ **必须确认这份报告是这一轮写出来的**，否则"引擎挂住 / 解析错误 / 补丁把文件改坏"
+    这些情况下读到的会是**上一轮那份报告** —— 结果看起来是一组完全正常的断言名，
+    而这一轮其实根本没跑完。照着假结果去改代码是最贵的一种浪费。
+
+    ⚠️ **但不要用"先删掉旧的 report.json"来实现它**（第一版就是那么写的，翻车了）：
+    沙箱有「批量删除保护」，按 turn 累计，达到阈值后**连删一个文件都会被拦**
+    （`SAFE_DELETE_BULK_CONFIRM_REQUIRED`，而且会**卡住等确认**）。实测并发那一轮
+    四个 worker 各撞一次，整批跑挂、日志也没了。→ 改成**只记 mtime、跑完必须变**，
+    一条删除都不发生，效果完全等价（自检是"跑完一次性写出来"的，所以文件被重写
+    必然改 mtime）。想要更强就把 run tag 经环境变量传进去让报告自己带上（未做）。
+    """
+    rep = proj / REPORT_REL
+    before = rep.stat().st_mtime_ns if rep.exists() else -1
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+              "ALL_PROXY", "all_proxy"):
+        env.pop(k, None)          # 本机预设了代理，本地回环会 502
+    tmp = CACHE / "tmp"           # 本机 /tmp 只有 10MB，必须落在真实磁盘上
+    tmp.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(tmp)
+    try:
+        # `--disable-vsync` 只值 6%（42.9 → 40.2 秒），但它**改的是帧节奏** ——
+        # 而自检里有一段"退出全屏后**第几步**才设尺寸"的时序测试（`_section_fullscreen`）。
+        # 帧节奏一变，那条判据的牙齿就可能跟着变，所以留一个开关，
+        # 让"引擎参数"这一层能被单独冻住做 A/B（量哪一层，就把别层冻住）。
+        args = [GODOT_BIN, "--path", str(proj), "res://scenes/selfcheck.tscn",
+                "--rendering-driver", "opengl3"]
+        if os.environ.get("DQ_VSYNC") != "1":
+            args.append("--disable-vsync")
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=VERIFY_TIMEOUT, env=env, cwd=str(proj))
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"自检超过 {VERIFY_TIMEOUT} 秒没退出 —— 多半是 GDScript 解析错误把引擎挂住了"
+            "（解析错误会让引擎打一行日志后一直不退出）") from exc
+    if not rep.exists() or rep.stat().st_mtime_ns == before:
+        tail = "\n".join((proc.stdout or "").splitlines()[-15:])
+        raise RuntimeError(
+            f"这一轮没有写出新的 report.json（rc={proc.returncode}，"
+            f"mtime 没变）—— 多半是解析错误/中途崩了。stdout 尾部：\n{tail}")
+    return json.loads(rep.read_text())
 
 
 def failed_checks(rep: dict) -> list[str]:
@@ -1082,9 +1304,37 @@ def unknown_targets(rep: dict, picked: list[dict]) -> list[str]:
     return bad
 
 
-def apply_edits(edits: list[tuple[str, str, str]]) -> None:
+def stale_patches(picked: list[dict]) -> list[str]:
+    """每条变异的 `edits` 里，`old_string` 在**当前源码**里恰好出现 1 次吗。
+
+    为什么需要这道校验：`apply_edits` 是"找不到就抛"的（这很对），但那条错误**只在
+    跑到该变异时**才发生 —— 一条陈旧补丁会让整批跑到一半才报 `待替换文本出现 0 次`，
+    白等十分钟。而"补丁锚点"其实就是**源码里的一行**：改了源码里一行长得像它的代码，
+    这条变异就悄悄失效了。
+
+    2026-09-27 实例：雾改成世界空间采样后，`float sink = ... / view_h` 变成
+    `float hz = ...`（除数挪进了下面的世界坐标换算），变异表没跟上 → 全量那轮才炸。
+
+    ⚠️ 这就是"改了源码就要顺手核对变异表"的自动化版本。判据是**恰好 1 次**：
+    0 次 = 锚点没了；≥2 次 = 锚点不唯一（改错了地方也不报错）。
+    """
+    bad: list[str] = []
+    for m in picked:
+        for rel, old, _new in m.get("edits", []):
+            f = SRC / rel
+            if not f.exists():
+                bad.append(f'{m["name"]} —— {rel} 不存在')
+                continue
+            n = f.read_text().count(old)
+            if n != 1:
+                head = old.strip().splitlines()[0][:64]
+                bad.append(f'{m["name"]} —— {rel}: 锚点出现 {n} 次（应为 1 次）：{head!r}')
+    return bad
+
+
+def apply_edits(edits: list[tuple[str, str, str]], src: pathlib.Path) -> None:
     for rel, old, new in edits:
-        p = SRC / rel
+        p = src / rel
         txt = p.read_text()
         n = txt.count(old)
         if n != 1:
@@ -1102,21 +1352,186 @@ def tree_hash(d: pathlib.Path) -> str:
     return h.hexdigest()
 
 
-def restore() -> None:
+def restore_into(src: pathlib.Path) -> None:
     """**覆盖式**还原：只写不删。
 
     刻意不用 `shutil.rmtree` —— 沙箱的批量删除保护会在目录文件数超过阈值时
     抛异常，那样 `finally: restore()` 本身就会失败，把改坏的源码留在盘上。
     """
-    shutil.copytree(BAK, SRC, dirs_exist_ok=True)
+    shutil.copytree(BAK, src, dirs_exist_ok=True)
+
+
+def restore() -> None:
+    restore_into(SRC)
+
+
+def run_mutation(m: dict, proj: pathlib.Path) -> tuple[bool, list[str]]:
+    """在一个工程副本上：打补丁 → 跑自检 → 还原。返回 (是否符合预期, 要打印的行)。
+
+    **三条出口各自还原一次**（不靠 `finally`）：因为要先读 `got` 再还原，
+    而 `finally` 里抛异常会把结果吞掉。宁可多写两次，也不能让改坏的代码留在盘上。
+    """
+    try:
+        apply_edits(m["edits"], proj / "src")
+    except Exception as exc:  # noqa: BLE001
+        restore_into(proj / "src")
+        return False, [f"  ✗ 打补丁失败：{exc}"]
+    try:
+        got = failed_checks(run_verify(proj))
+    except Exception as exc:  # noqa: BLE001
+        restore_into(proj / "src")
+        return False, [f"  ✗ 这一轮没跑成：{exc}"]
+    restore_into(proj / "src")            # 无条件还原
+
+    exp_ok = all(any(e in g for g in got) for e in m.get("expect", []))
+    bad_hits = [g for g in got if any(f in g for f in m.get("forbid", []))]
+    lines = [f"  {'✓' if exp_ok and not bad_hits else '✗'} 变红的断言（{len(got)} 条）："]
+    for g in got:
+        exp = any(e in g for e in m.get("expect", []))
+        lines.append(f"      {'✔ 预期' if exp else '？额外'} {g}")
+    for e in m.get("expect", []):
+        if not any(e in g for g in got):
+            lines.append(f"      ✘ 预期变红却没有：{e}")
+    for f in bad_hits:
+        lines.append(f"      ✘ 不该红却红了：{f}")
+    return exp_ok and not bad_hits, lines
+
+
+def run_batch(picked: list[dict], jobs: int) -> list[str]:
+    """跑一批变异，返回"不符合预期"的变异名。jobs > 1 时并发（每个 worker 一份副本）。
+
+    ⚠️ **碰真窗口的那几条永远串行**（变异里标了 `"serial": True`）。
+    它们会真去改本机窗口（全屏切换、尺寸还原），而几个进程同时跟 WM 抢的时候，
+    `_section_fullscreen` 的前提断言（"真窗口能被设成测试尺寸"）会**偶发**变红 ——
+    那条一红，它后面两条尺寸断言就全成了"无从谈起"，这 4 条的判定随之不可信。
+    **慢一点可以接受，不可信不行** —— 所以这 4 条（62 条里就 4 条）不进并发。
+    ⚠️ 2026-09-27 记账更正：曾把「退出全屏时立刻设尺寸」的"预期变红却没有"归因于并发，
+    实测**串行跑它也一样不红**（所以那不是并发造成的，见 README 二.20.5）。
+    """
+    if jobs <= 1:
+        bad: list[str] = []
+        for i, m in enumerate(picked):
+            print(f"▸ [{i + 1}/{len(picked)}] 变异：{m['name']}")
+            ok, lines = run_mutation(m, PROJ)
+            for ln in lines:
+                print(ln)
+            print()
+            if not ok:
+                bad.append(m["name"])
+        return bad
+
+    total = len(picked)
+    serial_idx = [i for i, m in enumerate(picked) if m.get("serial")]
+    par_idx = [i for i, m in enumerate(picked) if not m.get("serial")]
+    got: dict[int, tuple[bool, list[str]]] = {}
+
+    def live(i: int, ok: bool) -> None:
+        """边跑边报一行。整批十分钟，只在最后一次性打印会**看着像卡住** ——
+        这个坑本轮真踩过（`pool.map` 要等全部跑完才返回，日志一片空白）。"""
+        print(f"  {'OK' if ok else 'NG'} [{i + 1}/{total}] {picked[i]['name']}",
+              flush=True)
+
+    if serial_idx:
+        print(f"▸ 先串行跑 {len(serial_idx)} 条**碰真窗口**的变异"
+              f"（并发下 WM 会抖，判定不可信）…")
+        for i in serial_idx:
+            ok, lines = run_mutation(picked[i], PROJ)
+            got[i] = (ok, lines)
+            live(i, ok)
+        print()
+
+    if par_idx:
+        jobs = min(jobs, len(par_idx))
+        # ── 并发之前先自证"并发本身不会污染判定" ────────────────────────
+        # `_section_fullscreen` 会真去改本机窗口（XWayland 下的全屏切换与尺寸还原）。
+        # 几个进程同时跟窗口管理器打交道时，那几条"尺寸真的被我们设回去了"的断言
+        # 有理由怀疑 —— 所以先用**未打补丁**的副本并发跑一轮，要求全绿才继续。
+        projects = [worker_project(i + 1) for i in range(jobs)]
+        print(f"▸ 并发前提自证：{jobs} 份副本各跑一遍**未打补丁**的自检（必须全绿）…")
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            pres = list(pool.map(lambda p: failed_checks(run_verify(p)), projects))
+        flaked = {i: f for i, f in enumerate(pres) if f}
+        if flaked:
+            # ⚠️ **本机实测就是这里拦下的**（2026-09-27）：4 个 worker 并发时，
+            # `_section_fullscreen` 里这条基线断言会抖 ——
+            # `★ 前提：真窗口能被设成测试尺寸 —— 设不上，下面两条尺寸断言就无从谈起`。
+            # 四个进程同时跟 XWayland 要窗口尺寸，WM 顶不住；而那条前提一红，
+            # 后面两条尺寸断言就全成了"无从谈起"。
+            #
+            # 处理：**不硬失败，退回串行**。理由：这个抖动是**偶发**的，
+            # 偶发的东西不该让整批跑挂，更不该被"重试到绿"糊过去。
+            # 退回串行是唯一"结论一定可信"的走法，代价只是慢。
+            for i, fails in sorted(flaked.items()):
+                print(f"  ⚠️ worker {i} 的基线在并发下有红的：{fails}")
+            print("  → 结论：**本机并发跑不安全**（真窗口那一段会抖），退回串行。",
+                  file=sys.stderr)
+            for i in par_idx:
+                ok, lines = run_mutation(picked[i], PROJ)
+                got[i] = (ok, lines)
+                live(i, ok)
+        else:
+            print("  并发下基线依然全绿 ✅ —— 并发没有污染判定，开跑。\n")
+            chunks: list[list[tuple[int, dict]]] = [[] for _ in range(jobs)]
+            for k, i in enumerate(par_idx):
+                chunks[k % jobs].append((i, picked[i]))
+
+            def loop(args: tuple[int, list]) -> list[tuple[int, bool, list[str]]]:
+                wi, mine = args
+                out = []
+                for idx, m in mine:
+                    ok, lines = run_mutation(m, projects[wi])
+                    live(idx, ok)
+                    out.append((idx, ok, lines))
+                return out
+
+            print(f"▸ 开跑：{len(par_idx)} 个变异 / {jobs} 个 worker 并行…")
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                parts = list(pool.map(loop, list(enumerate(chunks))))
+            for idx, ok, lines in (r for part in parts for r in part):
+                got[idx] = (ok, lines)
+
+    # 按原始顺序汇总打印 —— 几路输出直接往外打会搅在一起，没法看
+    bad = []
+    for idx in sorted(got):
+        ok, lines = got[idx]
+        m = picked[idx]
+        print(f"▸ [{idx + 1}/{total}] 变异：{m['name']}")
+        for ln in lines:
+            print(ln)
+        print()
+        if not ok:
+            bad.append(m["name"])
+    return bad
 
 
 def main() -> int:
+    # 输出改成**行缓冲**。python 的 stdout 一旦被重定向到文件就是块缓冲：
+    # 后台跑整批时日志一片空白，看着像"卡住了"，只能靠任务状态猜 —— 这个坑
+    # 在本项目里已经记过一次（DETAIL「后台跑时日志是块缓冲」），这次直接修掉。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:  # noqa: BLE001
+            pass
+
     argv = sys.argv[1:]
     if "--list" in argv:
         for m in MUTATIONS:
             print(f"  · {m['name']}")
         return 0
+
+    # `--jobs N` / `--jobs=N`：并发 worker 数。先摘出来，剩下的参数才是名字过滤
+    jobs = 1
+    for i, a in enumerate(argv):
+        if a == "--jobs" and i + 1 < len(argv):
+            jobs = int(argv[i + 1])
+            del argv[i:i + 2]
+            break
+        if a.startswith("--jobs="):
+            jobs = int(a.split("=", 1)[1])
+            argv.pop(i)
+            break
+    jobs = max(1, jobs)
 
     if "--restore-only" in argv:
         if not BAK.exists():
@@ -1124,6 +1539,12 @@ def main() -> int:
             return 1
         print("▸ 从备份覆盖还原 src（只写不删）…")
         restore()
+        # 顺带把并发留下的 worker 副本也拉回基线（不然下次 --jobs 会从脏副本起步）
+        for i in range(1, 9):
+            w = CACHE / f"w{i}" / PROJ.name / "src"
+            if w.exists():
+                restore_into(w)
+                print(f"  顺带还原 worker 副本：{w.parent}")
         print("  完成。src 指纹 =", tree_hash(SRC)[:12])
         return 0
 
@@ -1149,7 +1570,7 @@ def main() -> int:
         shutil.copytree(SRC, BAK)  # 覆盖式工具，目标不存在时行为与普通复制一致
 
     print("▸ 跑基线（应为全绿）…")
-    base_report = run_verify()
+    base_report = run_verify(PROJ)
     base_fails = failed_checks(base_report)
     if base_fails:
         print("  ⚠️ 基线本身就有红的，先修好再变异：", base_fails, file=sys.stderr)
@@ -1165,43 +1586,29 @@ def main() -> int:
         print("     对着 shots/report.json 的 checks 键名原样抄（「★ 」前缀也算在内）",
               file=sys.stderr)
         return 1
-    print("  基线全绿 ✓ · expect/forbid 的断言名全部对得上 ✓\n")
+    print("  基线全绿 ✓ · expect/forbid 的断言名全部对得上 ✓")
 
-    bad: list[str] = []
+    # 再把**补丁锚点**也验一遍：陈旧锚点会让整批跑到一半才炸（`待替换文本出现 0 次`），
+    # 而那时已经白等十分钟。锚点就是源码里的一行，改完源码最容易忘的就是它。
+    stale = stale_patches(picked)
+    if stale:
+        print("  ✗ 有变异的补丁锚点在当前源码里对不上：", file=sys.stderr)
+        for b in stale:
+            print("     " + b, file=sys.stderr)
+        print("     多半是源码改过、变异表没跟上 —— 对着当前源码把它改成新的那一行。",
+              file=sys.stderr)
+        return 1
+    print("  每条变异的补丁锚点都恰好命中 1 次 ✓\n")
+
     try:
-        for m in picked:
-            print(f"▸ 变异：{m['name']}")
-            try:
-                apply_edits(m["edits"])
-                got = failed_checks(run_verify())
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ✗ 打补丁失败：{exc}", file=sys.stderr)
-                bad.append(m["name"])
-                continue
-            finally:
-                restore()  # 无条件还原，绝不让改坏的代码留在盘上
-
-            exp_ok = all(any(e in g for g in got) for e in m.get("expect", []))
-            bad_hits = [g for g in got if any(f in g for f in m.get("forbid", []))]
-            ok = exp_ok and not bad_hits
-            mark = "✓" if ok else "✗"
-            print(f"  {mark} 变红的断言（{len(got)} 条）：")
-            for g in got:
-                exp = any(e in g for e in m.get("expect", []))
-                print(f"      {'✔ 预期' if exp else '？额外'} {g}")
-            for e in m.get("expect", []):
-                if not any(e in g for g in got):
-                    print(f"      ✘ 预期变红却没有：{e}")
-            for f in bad_hits:
-                print(f"      ✘ 不该红却红了：{f}")
-            if not ok:
-                bad.append(m["name"])
-            print()
+        bad = run_batch(picked, jobs)
     finally:
+        # `run_mutation` 自己已经逐条还原过了；这一层是兜底：万一 `run_batch`
+        # 在循环之外抛了（拿不到副本、并发前提自证失败……），真工程那份也得干净。
         restore()
 
     print("▸ 还原后复跑基线，确认没留脏 …")
-    final_fails = failed_checks(run_verify())
+    final_fails = failed_checks(run_verify(PROJ))
     if final_fails:
         print("  ✗ 还原后仍有红的：", final_fails, file=sys.stderr)
         return 1

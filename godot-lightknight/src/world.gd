@@ -3629,13 +3629,19 @@ func draw_bloom(ci: CanvasItem) -> void:
 		Art.glow(ci, Vector2(px, py), 14.0, dc, 0.3, 4)
 
 	# 火花：光晕负责"在发光"，带贴图的那种再叠一层有形状的芯
+	#
+	# ⚠️ 光晕那两个数是 `Art.PARTICLE_GLOW_*`（还有个总缩放 `Art.glow_mul`）——
+	# 命中一次会撒 9~16 个这样的光斑，原来 α=0.5、半径 3.4×size，叠在一起中心直接顶白，
+	# 就是用户说的"伤害产生的光圈"。**芯（tex_rot 那层）一个像素都没动**：
+	# 去掉的是糊在周围的那圈光，不是火花本身。
 	for q in particles:
 		if not bool(q["glow"]):
 			continue
 		var gp := Art.gpos(float(q["x"]), float(q["y"]), float(q["z"]), c)
 		var gc := Color.html(str(q["color"]))
 		var lf := clampf(float(q["life"]) / maxf(0.001, float(q["max_life"])), 0.0, 1.0)
-		Art.glow(ci, gp, float(q["size"]) * 3.4, gc, 0.5, 4)
+		Art.glow(ci, gp, float(q["size"]) * Art.PARTICLE_GLOW_R * Art.glow_mul, gc,
+			Art.PARTICLE_GLOW_A * Art.glow_mul, 4)
 		var tn2 := str(q.get("tex", ""))
 		if tn2 != "":
 			var sz := float(q["size"]) * 5.6 * (0.55 + lf * 0.6)

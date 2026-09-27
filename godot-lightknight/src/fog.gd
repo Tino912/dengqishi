@@ -27,6 +27,16 @@ extends Node2D
 ##      量到的是雾。与 HUD 那层暗角（`set_post_enabled`）是同一个道理。
 ##   ③ **只认"能开雾的灯"**：玩家灯 / 灯塔 / 火盆 / 攻击类灯 / 敌人自光。
 ##      太小的灯不开雾（否则雾面上全是针孔），盏数也有上限。
+##
+## ── 雾长在地图上（2026-09-27 用户需求）──
+## 原话：「请让迷雾是地图本身的元素，不要跟着主角动」。
+## 旧版噪声采样的是 `SCREEN_UV` —— **贴在屏幕上**，主角一走整片雾跟着镜头平移，
+## 看着像"镜头前糊了一层灰纱"，而不是"这块地上有雾"。
+## 现在雾纹只在**世界坐标**里存在（`cam_xy` / `view_w` / `ysquash` 把 SCREEN_UV
+## 反解成地面点，见着色器里的推导）；同一张二维场喂给三个消费者：
+## 照亮场（`_rebuild`）、高度场（`_bake_heights`）、雾纹（着色器）。
+## 自检 ②f 就是量这件事：相机平移 Δ 后，**把 Δ 抵消掉**画面应逐字节相同
+## （而"按屏幕对齐"那一版必须明显不同）—— 后者是它的反向对照。
 
 ## 照亮场分辨率。16px 一格：够糊，也够抠。每格 1 个 texel，
 ## 着色器用线性过滤把它插值开，所以看不见格子。
@@ -152,6 +162,10 @@ const MIST_BILLOW := 1.0
 ## "从没被 set 过"的参数返回的是 **null**，不是着色器里那个默认值。
 ## 后果很隐蔽：读回来是 null（`float(null)` 直接报 "Nonexistent 'float' constructor"），
 ## 而且任何"先读出来、拧一下、再还原"的自检写法都会悄悄失效。
+## 雾胞在**屏幕上**的边长（像素）= `Proj.VIEW_H / MIST_SCALE` = 720/13 ≈ **55px**
+## （横竖都是 55：宽度 1280 与高度 720 的比值已经隐含在这个换算里了）。
+## 着色器把它换算成"世界像素 → 雾图坐标"的速率，纵向额外除掉竖压 ——
+## 世界 y 被压扁过，除掉之后雾胞在屏幕上才是圆的。
 const MIST_SCALE := 13.0
 ## 漂速（噪声单位/秒）。换算到屏幕像素：贴地雾 ≈ 9px/s 向东北、浮雾 ≈ 23px/s 向东南
 ## （两层方向相反 → 看得出"不是一整块板在平移"）。
@@ -191,6 +205,14 @@ uniform float mist_billow : hint_range(0.0, 2.0) = 1.0;
 uniform float height_top = 110.0;   // 世界像素：alt = min(1, 表面高度 / height_top)
 uniform float view_h = 720.0;
 
+// ── 世界锚定（"雾是地图的一部分"）──
+// 噪声**不在屏幕空间采样**：`cam_xy` / `view_w` / `ysquash` 三个 uniform 把
+// SCREEN_UV 反解成"这一像素朝下看、落在 z = 0 的那一点（世界像素）"。
+// 验收见自检 ②f，说明见类头「雾长在地图上」那一段。
+uniform vec2 cam_xy = vec2(0.0, 0.0);
+uniform float view_w = 1280.0;
+uniform float ysquash = 0.62;
+
 float h21(vec2 p) {
 	p = fract(p * vec2(0.1031, 0.1030));
 	p += dot(p, p.yx + 33.33);
@@ -213,26 +235,48 @@ void fragment() {
 	float reveal = rp.r;
 	float alt = clamp(rp.g, 0.0, 1.0);
 
-	// 图案锚在**地面**上：表面越高，这一像素看到的雾絮越是"它脚下那片地面"的。
-	// 于是同一片雾在墙面上会顺着高度滑开 —— 这是"雾是个体积、不是一层纱"最直接的线索。
-	// alt = 0 时 sink 恰好为 0，所以平地上这个旋钮转了也等于没转（自检拿它当精确对照）。
-	float sink = height_parallax * alt * height_top / view_h;
+	// ── 雾长在**地图**上，不跟着主角走 ──
+	// 投影是仿射的：sx = x − cam_x + VIEW_W/2、sy = (y − cam_y) × S − z + VIEW_H/2。
+	// 于是"这一像素朝下看、落在 z = 0 的那一点"可以直接反解，而且 **cam 会自己消掉**：
+	// 相机一动，同一个**世界点**算出来的 gw 不变 —— 雾纹于是钉在地图上。
+	//
+	// ⚠️ 之前这里是 `SCREEN_UV × mist_scale`：那一版雾纹是**贴在屏幕上**的，
+	// 主角一走、镜头一动，整片雾就跟着镜头平移（用户报的"雾跟着主角动"）。
+	// 现在它只是一张**世界空间的二维场**（与照亮场、高度场同一套坐标），
+	// 时间那一项留给"风"：雾自己也飘，但那是地图上的雾在飘，不是镜头在拖动它。
+	//
+	// 表面高 z 的像素看到的是**它脚下那片地面**的雾：把采样点沿地面深度往南挪
+	// z/S 世界像素（在屏幕上正好是往下 z 像素）。alt = 0 时这一项恰好是 0 ——
+	// 平地不受它影响，自检拿它当**精确**对照（见常量区的说明）。
+	float hz = height_parallax * alt * height_top;
+	vec2 gw = vec2(SCREEN_UV.x * view_w - view_w * 0.5 + cam_xy.x,
+		(SCREEN_UV.y * view_h - view_h * 0.5) / ysquash + cam_xy.y + hz / ysquash);
+
+	// 世界像素 → 雾图坐标。屏幕上雾胞的边长固定是 `view_h / mist_scale` 像素
+	// （13 → 55px，两个方向都是 55：横向不乘 1.78，是因为宽度 1280 与高度 720
+	// 在 `mist_scale` 里已经隐含了这个比值），所以纵向要**除掉竖压** S ——
+	// 世界 y 被压扁过，除掉之后雾胞在**屏幕上**才是圆的（老实现是屏幕空间，
+	// 天然就圆；换成世界空间而不补这一下，雾胞会变成竖着的长条）。
+	float cell1 = view_h / mist_scale;
+	vec2 w1 = vec2(1.0 / cell1, ysquash / cell1);
+	float cell2 = view_h / (mist_scale * 0.62);
+	vec2 w2 = vec2(1.0 / cell2, ysquash / cell2);
 
 	// 贴地雾：细、慢，主要往东北飘；另加一点缓慢的**垂直翻涌**
 	//
-	// ⚠️ 翻涌那两个系数（0.70 / 1.00）是**量出来的**，不是拍的：它们乘上 `mist_scale`
-	// 就是"雾纹在屏幕上上下挪多少像素"—— `0.70 / 13 * 720 ≈ 39px`（一个周期 37 秒）。
+	// ⚠️ 翻涌那两个系数（0.70 / 1.00）是**量出来的**，不是拍的：它们乘上雾胞尺度
+	// 就是"雾纹在屏幕上上下挪多少像素"—— `0.70 × 55 ≈ 39px`（一个周期 37 秒）。
 	// 第一版取 0.35（≈19px），自检里"推进时间后动了的像素"只有 9.6%，
 	// 而且**肉眼基本看不出来**在翻涌；翻倍到 39px / 58px 之后才读得出来"雾是一团在呼吸的东西"。
 	// 剂量-反应表见 README 二.19（`mist_billow` 拧 0 / 0.5 / 1.0 的量法）。
-	vec2 q1 = (SCREEN_UV + vec2(0.0, sink)) * vec2(mist_scale * 1.78, mist_scale);
+	vec2 q1 = gw * w1;
 	q1 += vec2(mist_time * mist_speed, mist_time * mist_speed * 0.55);
 	q1.y += sin(mist_time * 0.17) * 0.70 * mist_billow;
 	float n1 = vnoise(q1) * 0.54 + vnoise(q1 * 2.3 + 11.0) * 0.31
 		+ vnoise(q1 * 5.1 + 31.0) * 0.15;
 
 	// 浮雾：更大一团、飘得更快、垂直分量明显 —— 与贴地雾不是同一张图
-	vec2 q2 = (SCREEN_UV + vec2(0.0, sink)) * vec2(mist_scale * 0.62 * 1.78, mist_scale * 0.62);
+	vec2 q2 = gw * w2;
 	q2 += vec2(mist_time * mist_speed * 1.6, -mist_time * mist_speed * 0.9);
 	q2.y += sin(mist_time * 0.11 + 1.7) * 1.00 * mist_billow;
 	float n2 = vnoise(q2) * 0.62 + vnoise(q2 * 2.7 + 7.0) * 0.38;
@@ -303,6 +347,10 @@ func _ready() -> void:
 	mat.set_shader_parameter("mist_billow", MIST_BILLOW)
 	mat.set_shader_parameter("height_top", FOG_TOP)
 	mat.set_shader_parameter("view_h", float(Proj.VIEW_H))
+	# 世界锚定用的三个（`cam_xy` 每步都会重发，见 `sync()`）
+	mat.set_shader_parameter("view_w", float(Proj.VIEW_W))
+	mat.set_shader_parameter("ysquash", Proj.YSQUASH)
+	mat.set_shader_parameter("cam_xy", Vector2.ZERO)
 	# 这三个原本"只靠着色器默认值"（见 MIST_SCALE 的注释：不显式下发的话读回来是 null）
 	mat.set_shader_parameter("mist_scale", MIST_SCALE)
 	mat.set_shader_parameter("mist_speed", MIST_SPEED)
@@ -383,6 +431,10 @@ func openers() -> Array:
 func sync(w: World, dt: float) -> void:
 	if not enabled:
 		return
+	# ⚠️ **每一步**都要重发相机，不是等重建那一拍再发。雾纹现在是钉在世界上算的：
+	# 相机在两次重建之间挪了一点，图案就得跟着挪那一点 —— 发晚了（比如塞进
+	# `_rebuild` 里）镜头就会"拖着"雾走一帧，恰是这次要修掉的那种观感。
+	mat.set_shader_parameter("cam_xy", w.draw_cam)
 	_acc += dt
 	if _acc < REBUILD_PERIOD:
 		return
