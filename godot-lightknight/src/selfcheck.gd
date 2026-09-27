@@ -16,6 +16,26 @@ const STEP := 1.0 / 60.0
 ## 第一关里选来测遮挡的那面墙（x, y, w, d, h）
 const TEST_WALL := [520.0, 300.0, 140.0, 400.0, 54.0]
 
+## 「墙影稳不稳」那一段（`_section_fog_wall_shadow`）用的取样几何：
+## 扫描行的屏幕 y、x 范围、玩家每帧东移多少、走几帧。
+##
+## ⚠️ 行与范围是**量出来的，不是拍的**。第一版取了 y=170，那一行上雾的剖面
+## 主要是灯衰减那层平滑的底（挪几十像素残差都不动），于是"边界"量到的其实是
+## 别的东西 —— **连续几何那一边整整 12 帧位移恰好为 0**，拿它当对照毫无意义
+## （`tools/probe-anchor` 的选行输出：sy=276 上单像素落差 0.7415 @ x=801，
+## 而 170 那一行几乎没有落差）。改成 276 之后两边都真的在动，对照才成立。
+## 这件事的教训是：**判据取错了行 = 对一个不敏感的窗口下断言**，全绿全红都不可信。
+const SHADOW_ROW := 276
+## 取样窗口要**贴着那条影子边界**（x≈801 附近）。
+## ⚠️ 第一版用了 600..1100 这 500px：窗里绝大部分是灯衰减那层又平又缓的底，
+##    边界那点落差被摊薄 —— 连续几何那一边量出来的"边界"其实停在灯的心跳上，
+##    **12 帧位移恰好全为 0**，对照彻底失效（判据全绿也不代表什么）。
+##    收窄到边界两侧各 100px 之后两边才都真的在跟着影子走。
+const SHADOW_X0 := 700
+const SHADOW_X1 := 900
+const SHADOW_DPX := 2.5
+const SHADOW_FRAMES := 12
+
 ## 布局种子（宝箱点位 / 敌人锚点 / Boss 场地都由它派生）。
 ##
 ## **自检必须注入固定值**：正常游戏里这个种子是 Main 开局时随机摇的，
@@ -61,6 +81,12 @@ func _ready() -> void:
 	sub.add_child(main)
 
 	GameInput.aim_mode = "move"
+	# 玩家自己改过的键位存在 `user://keybindings.json`，GameInput 起来时会把它读回来。
+	# 自检全程走 `set_override()`（绕开 InputMap），所以它**不影响**别的段落 ——
+	# 但"开始界面 / 改键"那一段要验的必须是**出厂状态**，不能带着上一轮（或玩家自己）
+	# 的残留跑，否则同一份代码两次跑出来的报告不一样。
+	# 这里只洗内存、不写盘；那一段会自己备份 / 还原玩家那个文件。
+	GameInput.reset_bindings(false)
 	await _run()
 
 
@@ -91,6 +117,9 @@ func _run() -> void:
 	await _sec(_section_level3_art)
 	# 迷雾 / 夜色排在**最末**：这一段会重建世界、搬动玩家、还会把这一关的雾放掉。
 	await _sec(_section_fog_night)
+	# 墙影的时间稳定性（"墙周围的阴影一直乱晃"）—— 接在雾那一段后面，
+	# 它自己也重建第一关，量的是**真渲染出来的画面**。
+	await _sec(_section_fog_wall_shadow)
 	await _sec(_section_pose_anim)
 	# 挥击范围线 vs 判定。**同样排在最后**：它也要重建世界（理由同上）。
 	await _sec(_section_swing_cone)
@@ -106,6 +135,9 @@ func _run() -> void:
 	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
 	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
 	await _sec(_section_fullscreen)
+	# 开始界面 / 自定义快捷键。**排在最末**：它会把世界释放掉（`show_title()`），
+	# 而别的段落都要有一个活着的世界。它结束时留下的正是"刚开机"那个状态。
+	await _sec(_section_title_keys)
 	_finish()
 
 
@@ -117,7 +149,7 @@ func _run() -> void:
 ##    原因见 `_sec()`：段内抛错时 `await f.call()` 照样返回、`_sections_done += 1`
 ##    照样执行 —— 于是"段数"这个量对"段内少跑了一半"完全无感。
 ##    留着它只当个信息量（`report["samples"]["sections_done"]`）。
-const SECTIONS := 24
+const SECTIONS := 25
 ## **各段跑完之后、`_finish()` 登记哨兵之前**，应该已经跑过的断言条数下限。
 ##
 ## 为什么不能用段数当哨兵（见 `SECTIONS` 上面那条实测），而必须**数断言本身**：
@@ -131,7 +163,7 @@ const SECTIONS := 24
 ##    `_finish()` 里加/减哨兵都不必回来改它 —— 实测踩过一次：
 ##    第一版抄的是 `checks_total`（含哨兵自己），哨兵里就得补个 `+ 1`，
 ##    那个 `+ 1` 极容易忘、忘了就恒红。
-const CHECKS_MIN := 526
+const CHECKS_MIN := 556
 ## 伤害光圈的判据（见 `_section_damage_glow`）：
 ## `GLOW_OLD_MUL` 是把旋钮拧回**旧尺寸**那一档要用的倍数。旋钮同时缩放半径与不透明度，
 ## 于是能量按 m³ 走，m 就取两个"旧/新能量比"开三次方的几何中点：
@@ -202,8 +234,16 @@ func _ok(name: String, cond: bool, detail := "") -> void:
 		report["errors"].append("[断言失败] " + name + "  " + detail)
 
 
-func _num(name: String, v: float, shown := -999.0) -> void:
-	report["samples"][name] = snappedf(v, 0.0001) if shown == -999.0 else shown
+## 记一个样本量。`v` 是被判定的数，`shown` 是"想显示给人看的另一版数值"。
+##
+## `shown` 是 **Variant**（默认那个 float 哨兵）：除了数值，也允许塞**字符串** ——
+## 比如"改键被拒绝时引擎给的那句提示"，把它原样记进报告就是最直接的证据
+## （第三参写成 `:= -999.0` 的话会被推断成 float，传字符串是**解析错误**）。
+func _num(name: String, v: float, shown: Variant = -999.0) -> void:
+	var out: Variant = snappedf(v, 0.0001)
+	if typeof(shown) != TYPE_FLOAT or float(shown) != -999.0:
+		out = shown
+	report["samples"][name] = out
 
 
 ## 推进 n 个固定步（可同时按住若干键）。
@@ -3800,6 +3840,555 @@ func _section_fog_night() -> void:
 	_pump(2)
 
 
+# ================================================================ 墙影的时间稳定性
+#
+# 需求：「修一下雾与墙壁碰撞时的不协调」→ 用户选的具体症状是
+# **「墙周围的阴影一直乱晃」**（2026-09-27）。
+#
+# 病根：照亮场的**语义**是世界锚定的（每一格问的是"它脚下那一点被照亮多少"），
+# 但那张 80×45 的贴图每 REBUILD_PERIOD 秒才重算一次，中间那两三帧拿的是旧数据。
+# 旧实现把旧数据当**屏幕快照**钉住 —— 于是相机一走，影子的边界就
+# 「冻住 → 窜一步 → 再冻住」。探针实测（同一段匀速行走，玩家每帧东移 2.5px，
+# 光照半径 630）：
+##   灯层（同一套几何、连续判定）  相邻帧偏差 0.50px · 来回 0 次 · 无一帧发顿
+##   雾层（修复前）                相邻帧偏差 1.65px · 来回 30 次 · **抖动全落在重建帧上**
+##   雾层（修复后）                相邻帧偏差 0.59px · 来回 10 次
+# 修法见 `Fog.SHADER_SRC` 里 `rebuild_cam` 的推导：把旧快照**按相机位移挪回去**再采。
+# 零 CPU 代价 —— 提到 60Hz 重建要付 3 倍算力，而实测那样做偏差也只从 0.59 到 0.62。
+#
+# 这一段**量真渲染出来的画面**：同一帧、同一个世界状态，"雾开"与"雾关"各取一图，
+# 相减只剩雾那一层；再在一条扫描行上找影子边界，逐帧看它走不走得平稳。
+func _section_fog_wall_shadow() -> void:
+	main.run_seed = LAYOUT_SEED
+	main.prog["level"] = 0
+	main.prog["boons"] = {}
+	main.waves_off = true
+	main.start_level()
+	_pump(40)
+	var w := _w()
+	var p := _p()
+	for e in w.enemies:
+		e.dead = true
+	w.enemies.clear()
+	w.drops.clear()
+	w.projs.clear()
+	w.effects.clear()
+	w.shake = 0.0
+	# 光照半径调大：让那面墙与它的影子**稳稳落在光里**。
+	# 出生点默认半径 ~150，那面墙在 160px 外 —— 影子正好落在光池边上，量不着。
+	# （第一关里最长的横墙 (860,620,360,60,46)；玩家站它西南，光要往东北被它挡住。）
+	var light_bak := int(main.prog["up"]["light"])
+	main.prog["up"]["light"] = 20
+	w.teleport(700.0, 780.0)
+	w.set_fog_enabled(true)
+	_pump(120)
+
+	_ok("前提：这一段真的有一盏开雾的灯（否则量到的不是「灯的边界」）",
+		w.fog.enabled and w.fog.opener_count() >= 1,
+		"enabled=%s openers=%d" % [str(w.fog.enabled), w.fog.opener_count()])
+
+	var rows_on := []
+	var rows_off := []
+	var n_reb := 0
+	var rc_always_snapshot := true
+	var rc_is_snapshot := false
+	var last_rb := w.fog.rebuilds()
+	var px0 := p.x
+	for k in SHADOW_FRAMES:
+		p.x = px0 + float(k) * SHADOW_DPX
+		main.advance(STEP)
+		# ── 时间锚（`rebuild_cam`）的两条事实 ──
+		var rb := w.fog.rebuilds()
+		var rc := w.fog.rebuild_cam_xy()
+		var matches := rc.distance_to(w.draw_cam) < 0.001
+		if rb > last_rb:
+			n_reb += 1
+			if not matches:
+				rc_always_snapshot = false
+		elif not matches:
+			# 没重建的那几帧它与当前相机**不一样** —— 正是"快照"该有的样子
+			rc_is_snapshot = true
+		last_rb = rb
+		# ── 同一帧、同一世界状态，只切"雾开不开" ──
+		# 自检是手动步进：等渲染帧**不会**推进世界，所以两张图对齐的是同一个世界。
+		w.set_fog_enabled(true)
+		await _settle()
+		rows_on.append(_row_lum(sub.get_texture().get_image(),
+			SHADOW_ROW, SHADOW_X0, SHADOW_X1))
+		w.set_fog_enabled(false)
+		await _settle()
+		rows_off.append(_row_lum(sub.get_texture().get_image(),
+			SHADOW_ROW, SHADOW_X0, SHADOW_X1))
+		w.set_fog_enabled(true)
+
+	# ── 逐帧的"影子边界在第几列" ──
+	var e_fog := PackedFloat32Array()
+	var e_exact := PackedFloat32Array()
+	var fmin := 1.0e9
+	var fmax := -1.0e9
+	for k in SHADOW_FRAMES:
+		var on: PackedFloat32Array = rows_on[k]
+		var off: PackedFloat32Array = rows_off[k]
+		var f := PackedFloat32Array()
+		for i in on.size():
+			f.append(absf(on[i] - off[i]))
+		for v in f:
+			fmin = minf(fmin, v)
+			fmax = maxf(fmax, v)
+		e_fog.append(_edge_of(f))
+		e_exact.append(_edge_of(_exact_row(w, SHADOW_ROW, SHADOW_X0, SHADOW_X1)))
+
+	var bad_f := 0
+	var bad_x := 0
+	for k in SHADOW_FRAMES:
+		if e_fog[k] < 0.0:
+			bad_f += 1
+		if e_exact[k] < 0.0:
+			bad_x += 1
+	_ok("前提：这条扫描行上真的有一条雾的影子边界（对比度够，不是一片纯色）",
+		fmax - fmin > 0.03 and bad_f == 0 and bad_x == 0,
+		"雾层对比 %.4f　找不到边界的帧：雾 %d / 连续 %d" % [fmax - fmin, bad_f, bad_x])
+
+	var d_fog := _step_dev(e_fog)
+	var d_ex := _step_dev(e_exact)
+	var st_fog := _stall_frac(e_fog)
+	var st_ex := _stall_frac(e_exact)
+	var med_f := _step_med(e_fog)
+	var med_x := _step_med(e_exact)
+	var mx_f := _step_max(e_fog)
+	var mx_x := _step_max(e_exact)
+	var mn_f := _step_mean(e_fog)
+	var mn_x := _step_mean(e_exact)
+	_num("墙影边界（雾层）相邻帧偏差 px", d_fog)
+	_num("墙影边界（连续几何）相邻帧偏差 px", d_ex)
+	_num("墙影边界（雾层）发顿帧占比", st_fog)
+	_num("墙影边界（连续几何）发顿帧占比", st_ex)
+	_num("墙影边界（雾层）相邻帧位移中位数 px", med_f)
+	_num("墙影边界（连续几何）相邻帧位移中位数 px", med_x)
+	_num("墙影边界（雾层）相邻帧位移最大 px", mx_f)
+	_num("墙影边界（连续几何）相邻帧位移最大 px", mx_x)
+	_num("墙影边界（雾层）相邻帧位移均值 px", mn_f)
+	_num("墙影边界（连续几何）相邻帧位移均值 px", mn_x)
+	report["cases"]["fog_wall_shadow"] = {
+		"frames": SHADOW_FRAMES, "dpx": SHADOW_DPX,
+		"row": SHADOW_ROW, "x": [SHADOW_X0, SHADOW_X1],
+		"dev_fog": snappedf(d_fog, 0.0001), "dev_exact": snappedf(d_ex, 0.0001),
+		"stall_fog": snappedf(st_fog, 0.0001), "stall_exact": snappedf(st_ex, 0.0001),
+		"med_fog": snappedf(med_f, 0.0001), "med_exact": snappedf(med_x, 0.0001),
+		"max_fog": snappedf(mx_f, 0.0001), "max_exact": snappedf(mx_x, 0.0001),
+		"mean_fog": snappedf(mn_f, 0.0001), "mean_exact": snappedf(mn_x, 0.0001),
+		"rebuilds": n_reb, "contrast": snappedf(fmax - fmin, 0.0001),
+	}
+	# ── ⚠️ 这一组"边界跟着走"的统计量**只报告、不断言** ──────────────
+	#
+	# 走到这个版本才想明白：`_edge_of()` 在这条行上抓到的**不是影子那条边**，
+	# 而是灯衰减那层又平又缓的底（连续几何那一边 12 帧位移**恰好全为 0**，
+	# 那正是"灯相对相机静止"的特征）。对着一个抓错了的窗口下断言，
+	# 全绿全红都不作数 —— 所以这一组只当证据留在报告里，不参与判定。
+	# 真正钉住这次修复的是下面 ③ 那三条（世界冻结 + 单变量 + 阴性对照）。
+	# 教训写进 README 二.22：**判据取错了窗口 = 在对一个不敏感的量下断言**。
+	_ok("锚点：着色器把照亮场贴图当**世界锚定**采（采样点里带着 `rebuild_cam`）",
+		Fog.SHADER_SRC.contains("rebuild_cam") and Fog.SHADER_SRC.contains("ruv"),
+		"若这里红了，说明那条修复被从着色器里摘掉了（画面会重新开始乱晃）")
+	_ok("时间锚是一次重建的**快照**、且与重建那一刻的相机一致（所以它真的会被挪）",
+		n_reb >= 2 and rc_always_snapshot and rc_is_snapshot,
+		"重建 %d 次　快照一致=%s　确实会过期=%s"
+			% [n_reb, str(rc_always_snapshot), str(rc_is_snapshot)])
+
+	# ── ③ 决定性的一条：旧快照按相机位移挪回去之后 == 在新相机处重建 ──────
+	#
+	# 上面那一组是"顺着走一遍、看边界稳不稳"，读数要经过若干派生指标才落到判据上。
+	# 这里换一条**直问**：把世界**完全冻结**（不 `advance` —— 灯、墙、人一个都不动），
+	# 只把"当前相机"挪 Δ。此时
+	#   (a) 用旧快照渲染 与 (b) 在新相机处重建一次再渲染
+	# 应当是**同一张图**：照亮场的语义是世界锚定的，世界没变，重建只是换台相机重采样。
+	# 少了那一下位移（= 退回屏幕锚定），旧快照会整整差 Δ 个像素 —— 影子还钉在屏幕上。
+	#
+	# ⚠️ Δ 取 64px = 4 × 16px（照亮场的格宽）：正好落在格子边界上，
+	#    双线性插值的权重两端完全一样 → (a) 与 (b) 应当**逐像素相同**。
+	#    取非整数格的话会剩下一点插值差，判据就没这么干净了。
+	#
+	# ⚠️ 再配一条**阴性对照**：把 `rebuild_cam` 强行设成当前相机（等价于"不挪"，
+	#    也就是修复前那条路）。它必须明显不同 —— 否则这条断言什么都量不到。
+	#    判据自己有没有牙，当场验一遍，不留到变异表里才知道。
+	# ── 取景：**现场量出来，不能硬编** ───────────────────────────────────
+	#
+	# 64px 是**水平**位移，只有在雾层沿着 x 真的在变的地方才看得出来。
+	# 硬编一个矩形（或者只在一行上找一列）很容易整块落在"已经饱和成纯雾或纯亮"
+	# 的地方 —— 那样"挪了"与"没挪"两个差**同时**为 0，看着像"阴性对照没牙"，
+	# 其实是窗选错了。**判据取错了窗口 = 对一个不敏感的量下断言**，全绿全红都不作数。
+	# 所以这里在整屏上扫一遍，挑"雾层水平梯度最陡"的那一处（顺手避开界面）。
+	#
+	# ⚠️ 取剖面之前先把回填"压干"：`_cur` 是被 `_target` 慢慢拉过去的，
+	#    两次重建之间它还在动（实测 0.0022）—— 那点变化正好和 64px 位移的信号
+	#    同量级，会把判据盖死。给一个很大的 dt（REFILL×10 ≫ 1）之后 `_cur`
+	#    直接等于本次算出来的目标值，两次重建逐字节相同。
+	var cam_keep := w.draw_cam
+	w.fog.sync(w, 10.0)
+	var snap_cam := w.fog.rebuild_cam_xy()
+	var snap_ok := absf(snap_cam.x - cam_keep.x) < 0.001 and absf(snap_cam.y - cam_keep.y) < 0.001
+	# 雾层剖面 = "雾开 − 雾关"两张图的差：**世界内容会被减掉，只剩雾本身**
+	# （墙、地板、人两张图里一模一样），于是它可以直接回答"这块地方雾在变吗"。
+	w.set_fog_enabled(true)
+	var img_prof_on := await _grab()
+	w.set_fog_enabled(false)
+	var img_prof_off := await _grab()
+	w.set_fog_enabled(true)
+	var roll := _steepest_fog_window(img_prof_on, img_prof_off)
+	# 这块窗"若把那一下位移摘掉、会变多少" —— 取景有没有牙，量的就是它。
+	var fog_lag := _fog_lag(img_prof_on, img_prof_off, roll, 64)
+	_num("墙影_取景窗左上角 x", float(roll.position.x))
+	_num("墙影_取景窗左上角 y", float(roll.position.y))
+	_num("墙影_窗里雾层平移 64px 的自身差（取景有没有牙）", fog_lag)
+	report["cases"]["fog_wall_shadow"]["rect_at"] = [roll.position.x, roll.position.y,
+		roll.size.x, roll.size.y]
+	report["cases"]["fog_wall_shadow"]["fog_lag64"] = snappedf(fog_lag, 0.000001)
+	_ok("前提：取景窗压在雾层梯度最陡的地方（它若≈0，说明窗里是一片饱和区，"
+		+ "「挪没挪」在那儿本来就看不出来，阴性对照会连带变成 0）",
+		fog_lag > 0.004, "窗里雾层平移 64px 的自身差 %.6f" % fog_lag)
+	# ── 三张图，共用**同一张旧贴图**（都是在 cam_keep 处烘出来的），
+	#    于是三个 diff 之间唯一的变量就是"着色器里那一下位移 Δ = cam − 锚"：
+	#      (a) img_stale  —— 本版行为：Δ = +64px（旧快照按相机挪回世界上）
+	#      (b) img_nomove —— 修复前的行为：把锚强设成当前相机 → Δ = 0（快照钉在屏幕上）
+	#      (c) img_fresh  —— 真值：在新相机处**重建**一次（Δ = 0，而且贴图换成了新的）。
+	#     「(a) 与 (c) 逐像素相同」就是这次修复的命题本身：
+	#      **把旧快照按相机挪回去 == 在新相机处重新采一遍。**
+	#
+	# ⚠️ **顺序在这里是有意义的**，(b) 必须夹在 (a) 与 (c) 之间。第一版没在意，
+	#    把 (b) 写在了 `_rebuild` **之后** —— 拿到的就是**新贴图**，而"新贴图 + Δ=0"
+	#    与 (c) 是**同一个状态**，于是 nomove ≡ fresh ≡ stale 全 0。看着像"阴性对照
+	#    没牙"，其实是**两条腿量了同一张图**（典型的"断言读错了层"，只是这一回
+	#    错的是"哪张图"，不是"哪个变量"）。
+	w.draw_cam = cam_keep + Vector2(64.0, 0.0)
+	w.fog.sync(w, 0.0)                       # cam_xy ← cam_keep+64；dt=0 → 不重建
+	# ⚠️ 读 uniform **一律走 `_shader_vec2()`**（见它的注释）：这两个参数里
+	#    `rebuild_cam` 是"可能从没被 set 过"的那种，而"从没被 set 过"正是这一组
+	#    要抓的失败方式。写死 `var x: Vector2 = mat.get_shader_parameter(...)` 的话，
+	#    变异「`_rebuild` 不把锚写进着色器」会在这里抛类型错误 → **段内截断**，
+	#    后面所有断言（含预期该红的那两条）连登记都没有，只剩一条"断言凭空变少"。
+	#    哨兵/前置读数必须站在"它坏掉"的那一边也跑得下去。
+	var u_cam := _shader_vec2("cam_xy", Vector2.ZERO)
+	var u_anc := _shader_vec2("rebuild_cam", Vector2.ZERO)
+	var sh_shift := u_cam.x - u_anc.x
+	var img_stale := await _grab()           # (a) 旧贴图 + Δ=+64
+	w.fog.mat.set_shader_parameter("rebuild_cam", w.draw_cam)   # 锚 ← 当前相机 → Δ=0
+	var img_nomove := await _grab()          # (b) 旧贴图 + Δ=0  ← 修复前
+	w.fog.mat.set_shader_parameter("rebuild_cam", cam_keep)     # 锚 ← 还原，再重建
+	w.fog._rebuild(w, 10.0)
+	var img_fresh := await _grab()           # (c) 新贴图 + Δ=0   ← 真值
+	# 再单独问一句：重建有没有把**着色器里**那个锚更新掉？先把 uniform 设成哨兵、
+	# 重建一次再看它变没变 —— 只更新到 GDScript 变量上是**不够的**
+	# （`rebuild_cam_xy()` 照样对，画面却不动）。这一步顺便把世界还原。
+	w.draw_cam = cam_keep
+	w.fog.mat.set_shader_parameter("rebuild_cam", Vector2(-9999.0, -9999.0))
+	w.fog._rebuild(w, 10.0)
+	# ⚠️ 读回来时**要能接住 null**：`ShaderMaterial.get_shader_parameter()` 对
+	#    "从没被 set 过"的参数返回 null，而"从没被 set 过"**正是这条要抓的失败方式**
+	#    （`_rebuild` 里那一行被摘掉的话，它一次都没被 set 过）。
+	#    写死 `var uni_anchor: Vector2 = w.fog.mat.get_shader_parameter(...)` 的话，
+	#    这一行会**在断言之前**抛类型错误 —— 于是它自己变成"段内运行时错误"，
+	#    把后面的断言整段截断（实测：变异「`_rebuild` 不把锚写进着色器」下，
+	#    预期该红的两条**根本没被登记**，只留下一条"断言凭空变少"）。
+	#    哨兵要能站在"它坏了"的那一边，不能反过来靠"它没坏"才能跑。
+	var uni_anchor := _shader_vec2("rebuild_cam", Vector2(-9999.0, -9999.0))
+	var d_stale := _region_diff(img_stale, img_fresh, roll)
+	var d_nomove := _region_diff(img_nomove, img_fresh, roll)
+	# ── "着色器真的读了那个锚"的前提：**同一张贴图、同一个世界，只把 Δ 从 0 改成 64** ──
+	# (a) 与 (b) 之间一个字节都没有别的差别 —— 画面若因此不同，那只可能是着色器
+	# 真的用了 `rebuild_cam`。这条比"把锚设成一个荒唐值"那种哨兵强得多，见下面的注。
+	var d_delta := _region_diff(img_stale, img_nomove, roll)
+	# "动了的像素占比"是这里更好的口径：绝对差会被雾的浓淡摊薄（实测只有 0.007），
+	# 而"这一片里有多少像素真的变了"直接把信号和噪声分开（挪对了 → 0.00%）。
+	var m_stale := _region_moved(img_stale, img_fresh, roll, 0.01)
+	var m_nomove := _region_moved(img_nomove, img_fresh, roll, 0.01)
+	var m_delta := _region_moved(img_stale, img_nomove, roll, 0.01)
+	_num("墙影_旧快照挪回去后与重建的差", d_stale)
+	_num("墙影_旧快照挪回去后动了的像素占比", m_stale)
+	_num("墙影_阴性对照（不挪）动了的像素占比", m_nomove)
+	_num("墙影_阴性对照（不挪）的平均差", d_nomove)
+	_num("墙影_只改 Δ（0→64）造成的平均差", d_delta)
+	_num("墙影_只改 Δ（0→64）动了的像素占比", m_delta)
+	_num("墙影_着色器里算出来的位移 px", sh_shift)
+	_num("墙影_验证用的位移 px", 64.0)
+	report["cases"]["fog_wall_shadow"]["roll"] = {
+		"shift_px": 64.0, "rect": [roll.position.x, roll.position.y,
+			roll.size.x, roll.size.y],
+		"stale": snappedf(d_stale, 0.000001), "nomove": snappedf(d_nomove, 0.000001),
+		"delta": snappedf(d_delta, 0.000001),
+		"moved_stale": snappedf(m_stale, 0.0001), "moved_nomove": snappedf(m_nomove, 0.0001),
+		"moved_delta": snappedf(m_delta, 0.0001),
+		"uni_anchor": [snappedf(uni_anchor.x, 0.01), snappedf(uni_anchor.y, 0.01)],
+	}
+	# ── 前提两条：任何一条红了，下面的 ★ 都不作数（它们保的是"这条判据有牙"）──
+	_ok("前提：着色器这一刻算出来的位移正好是 64px（uniform 真的送到了）",
+		absf(sh_shift - 64.0) < 0.5, "cam−锚 = %.2f px" % sh_shift)
+	# ⚠️ 这里**刻意不用**"把锚设成一个荒唐值（如 −9999）再看画面变没变"那种哨兵 ——
+	#    实测过：ruv 被推到贴图外面之后会被夹到**同一个 texel**上，整屏塌成一个常数，
+	#    于是差异只剩下"常数 vs 真值"那一点，量出来 0.010（阈值 0.010，只有 1.04 倍）。
+	#    "同一张贴图、同一个世界，只把 Δ 从 0 改成 64"才是直问：它量的是你真正要的
+	#    那一下位移，信号大一个量级（见 report 里的 delta / moved_delta）。
+	_ok("前提：那个锚真的接在画面上（同一张贴图、同一个世界，只把 Δ 从 0 改成 64px，"
+		+ "画面必须明显变）—— 它若红了，说明 `rebuild_cam` 根本没被着色器用上，"
+		+ "这一整段都是在量同一张图",
+		m_delta >= 0.10 and d_delta >= 0.002,
+		"只改 Δ 动了 %.2f%%（差 %.6f）" % [m_delta * 100.0, d_delta])
+	_ok("★ 【用户要的】旧快照按相机位移挪回去之后，与**在新相机处重建**得到同一张画面 "
+		+ "（世界完全冻结，只有相机挪了 64px；64 = 4 × 16px，正好落在照亮场的格子边界上）",
+		# ⚠️ `sh_shift == 64` 这一个合取项**不是装饰**：少了它，判据有一个**平凡通过**的
+		#    后门 —— 如果那个 uniform 从来没被发出去（引擎侧的默认值一直生效），
+		#    (a) 与 (c) 会用**同一个错的锚**，两张图照样逐像素相同，这条 ★ 就是绿的。
+		#    实测过：变异「`_rebuild` 不把锚写进着色器」下，只有把这一项并进来它才红。
+		#    判据问的必须是"位移**等于相机位移**"这件事，不是"两张图恰好一样"。
+		d_stale <= 0.002 and m_stale <= 0.005 and snap_ok and absf(sh_shift - 64.0) < 0.5,
+		"差 %.6f　动了 %.2f%%　快照锚对得上=%s　着色器里的位移=%.2fpx"
+			% [d_stale, m_stale * 100.0, str(snap_ok), sh_shift])
+	# ⚠️ 下面那条的 `maxf(d_stale, 1.0e-6)` 是个**下限**，不是随手加的：基线里
+	#    "挪对了"那一版的差是**精确的 0.0**，纯比值会退化成 `0 ≥ 0`（恒真、没牙）。
+	#    垫上下限之后它才真的在说"两者差 20 倍以上"；而在基线（0 / 0.007）上
+	#    仍有 350 倍余量 —— 既不擦边，也不是废话。
+	_ok("★ 阴性对照：**不挪**的话同一片里明显有一批像素变了 —— 上面那条确实在量「挪没挪」"
+		+ "（把着色器里那一下位移摘掉，红的就是这一条）",
+		m_nomove >= 0.10 and d_nomove >= 20.0 * maxf(d_stale, 1.0e-6),
+		"不挪 动了 %.2f%%（差 %.6f） vs 挪了 动了 %.2f%%（差 %.6f）"
+			% [m_nomove * 100.0, d_nomove, m_stale * 100.0, d_stale])
+	_ok("★ 那一下位移用的是**着色器里的**锚：哨兵法问过 `_rebuild` 有没有更新 uniform —— "
+		+ "只在 GDScript 里记一笔（`rebuild_cam_xy()` 照样对）而 uniform 不更新的话，"
+		+ "画面根本不会挪（这条红=着色器那层没接上）",
+		uni_anchor.distance_to(w.draw_cam) < 0.001,
+		"uniform %s vs 当前相机 %s" % [str(uni_anchor), str(w.draw_cam)])
+
+	# 收尾：世界回到干净状态（雾开着、光照半径还原）
+	main.prog["up"]["light"] = light_bak
+	w.set_fog_enabled(true)
+	GameInput.aim_world = null
+	p.hp = p.max_hp
+	_pump(2)
+
+
+## 一条扫描行上的亮度剖面（屏幕坐标）
+func _row_lum(img: Image, y: int, x0: int, x1: int) -> PackedFloat32Array:
+	var out := PackedFloat32Array()
+	for x in range(x0, x1):
+		var c := img.get_pixel(x, y)
+		out.append((c.r + c.g + c.b) / 3.0)
+	return out
+
+
+## 雾层在某个像素上的强度：**雾开那一张减去雾关那一张**。
+##
+## 两张图里墙、地板、人物**逐像素相同**，一减就只剩雾 —— 于是这个量直接回答
+## "这块地方有没有雾、雾在不在变"，不受世界内容干扰。判"墙影稳不稳"要的正是它：
+## 墙的影子抖不抖，看的是**雾**抖不抖，不是整张画面上有没有别的东西在动。
+func _fog_prof(img_on: Image, img_off: Image, x: int, y: int) -> float:
+	var a := img_on.get_pixel(x, y)
+	var b := img_off.get_pixel(x, y)
+	return (a.r - b.r + a.g - b.g + a.b - b.b) / 3.0
+
+
+## 雾层剖面在一个窗口里"水平平移 `dx` 像素之后差多少" —— 也就是
+## **若把那一下位移摘掉，这块窗里会变多少**。
+##
+## 这就是"取景有没有牙"的那个量：它≈0 表示窗里雾是饱和的（纯亮或纯雾），
+## 那么"挪了 / 没挪"两个差会同时为 0，阴性对照红得莫名其妙，
+## 而主判据**照样通过**（0 ≤ 阈值）—— 典型的"在对一个不敏感的量下断言"。
+## 所以它得当**前提断言**守住，不能只当读数。
+func _fog_lag(img_on: Image, img_off: Image, r: Rect2i, dx: int) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(0, r.size.y, 2):
+		for x in range(0, r.size.x, 2):
+			var px := r.position.x + x
+			var py := r.position.y + y
+			acc += absf(_fog_prof(img_on, img_off, px, py)
+				- _fog_prof(img_on, img_off, px + dx, py))
+			n += 1
+	return acc / maxf(float(n), 1.0)
+
+
+## 在整屏上找"雾层沿 x 变化最陡"的那一处，返回一个以它为中心、**不含界面**的取样窗。
+##
+## ⚠️ 必须现场找，不能硬编一个矩形：64px 是**水平**位移，只有在雾层沿 x 真的在变
+##    的地方才看得出来；硬编的窗很容易整块落在饱和区，于是判据静默失效
+##    （第一版就是这么废掉的）。用 `_window_hud_free()` 排掉界面 —— 界面的边缘
+##    在"雾开 − 雾关"上也会造出一级陡台阶，但它**不跟着色器挪**，会把取景骗走。
+##
+## 返回的窗**右侧留出 `MARGIN_X` 的余量**：后面要拿它做 `+64px` 的错位比较
+## （`_fog_lag` / `_region_diff_shift`），不留余量的话 `get_pixel` 会越界。
+func _steepest_fog_window(img_on: Image, img_off: Image) -> Rect2i:
+	var win := Vector2i(160, 120)
+	var margin_x := 80
+	var half := Vector2i(win.x / 2, win.y / 2)
+	var best := -1.0
+	var best_c := Vector2i(VIEW_W / 2, VIEW_H / 2)
+	for y in range(half.y + 4, VIEW_H - half.y - 4, 8):
+		for x in range(half.x + 4, VIEW_W - half.x - margin_x, 8):
+			var r := Rect2i(x - half.x, y - half.y, win.x, win.y)
+			if not _window_hud_free(r):
+				continue
+			# 水平一阶差分：雾层在这里"陡不陡"
+			var g := absf(_fog_prof(img_on, img_off, x + 4, y)
+				- _fog_prof(img_on, img_off, x - 4, y))
+			if g > best:
+				best = g
+				best_c = Vector2i(x, y)
+	return Rect2i(best_c.x - half.x, best_c.y - half.y, win.x, win.y)
+
+
+## 从迷雾材质里读一个 `vec2` 型的 uniform，**读不到就返回 `fallback`**。
+##
+## 为什么不能直接写 `var v: Vector2 = w.fog.mat.get_shader_parameter(name)`：
+## `ShaderMaterial.get_shader_parameter()` 对**从没被 `set` 过**的参数返回 `null`，
+## 而"从没被 set 过"恰恰是本工程要抓的一类失败（`_rebuild` 里那一行被摘掉 =
+## 这个 uniform 一次都没发过）。写死类型标注的话，那一行会在**断言之前**抛类型错误，
+## 于是它自己变成"段内运行时错误"、把整段剩下的断言**静默截断** ——
+## 看起来是"预期该红的那条没红"，实际是"它根本没跑到"（实测一次）。
+##
+## ⚠️ 这与 `MIST_SCALE` 那条注释是同一个坑的两面："从没 set 过 → 读回来是 null"。
+##    凡是"先读出来、拧一下、再还原"或者"读回来当判据"的写法，都要走这里。
+func _shader_vec2(name: String, fallback: Vector2) -> Vector2:
+	var raw: Variant = main.world.fog.mat.get_shader_parameter(name)
+	return raw if raw is Vector2 else fallback
+
+
+## 剖面里"从低跨到高"的第一次穿越（线性插值到亚像素）。返回屏幕 x；-1 = 没找到。
+##
+## 用**穿越**而不是"最陡那一列"：后者会被自己的离散化绑住 ——
+## 双线性插值出来的段落是分片线性的，argmin 会一格一格地跳，
+## 量到的其实是采样器的量化，不是画面的抖动。
+func _edge_of(f: PackedFloat32Array) -> float:
+	var lo := 1.0e9
+	var hi := -1.0e9
+	for v in f:
+		lo = minf(lo, v)
+		hi = maxf(hi, v)
+	if hi - lo < 0.02:
+		return -1.0
+	var mid := (lo + hi) * 0.5
+	for i in range(1, f.size()):
+		if f[i - 1] < mid and f[i] >= mid:
+			var t := (mid - f[i - 1]) / maxf(1.0e-6, f[i] - f[i - 1])
+			return float(SHADOW_X0 + i - 1) + t
+	return -1.0
+
+
+## 同一行上"本应被照亮多少"反过来（1 - 揭示度 = 雾的浓度）——
+## 与雾层那张图用**同一个穿越判据**，两边的边界位置才可比。
+func _exact_row(w: World, sy: int, x0: int, x1: int) -> PackedFloat32Array:
+	var rects := []
+	for wl in w.walls:
+		rects.append(LightRig.occluder_rect(float(wl[0]), float(wl[1]),
+			float(wl[2]), float(wl[3]), float(wl[4])))
+	var lx := w.player.x
+	var ly := w.player.y
+	var lr := w.player_light_radius()
+	var inv_squash := 1.0 / Proj.YSQUASH
+	var wy := (float(sy) - float(VIEW_H) * 0.5) * inv_squash + w.draw_cam.y
+	var wx0 := float(x0) - float(VIEW_W) * 0.5 + w.draw_cam.x
+	var out := PackedFloat32Array()
+	for i in range(x0, x1):
+		var wx := wx0 + float(i - x0)
+		out.append(1.0 - _exact_reveal_at(wx, wy, lx, ly, lr, rects))
+	return out
+
+
+## 连续判定：这一点的光有没有被墙挡住（与灯层同源同空间，见 `LightRig.occluder_rect`）
+func _exact_reveal_at(wx: float, wy: float, lx: float, ly: float,
+		lr: float, rects: Array) -> float:
+	var ddx := wx - lx
+	var ddy := wy - ly
+	var dd := sqrt(ddx * ddx + ddy * ddy)
+	if dd >= lr or dd < 0.0001:
+		return 0.0
+	var sdy := ddy * Proj.YSQUASH
+	var sd := sqrt(ddx * ddx + sdy * sdy)
+	var ux := ddx / sd
+	var uy := sdy / sd
+	for rc in rects:
+		var t := Proj.ray_rect_dist(lx, ly * Proj.YSQUASH, ux, uy,
+			rc.position.x, rc.position.y, rc.size.x, rc.size.y)
+		if t >= 0.0 and t < sd:
+			return 0.0
+	var v := 1.0 - dd / lr
+	return v * v * (3.0 - 2.0 * v)
+
+
+## 相邻帧位移（跳过找不到边界的那几帧）
+func _step_deltas(e: PackedFloat32Array) -> Array:
+	var ds := []
+	for i in range(1, e.size()):
+		if e[i] >= 0.0 and e[i - 1] >= 0.0:
+			ds.append(e[i] - e[i - 1])
+	return ds
+
+
+## 相邻帧位移相对"匀速"的偏差（均值）
+func _step_dev(e: PackedFloat32Array) -> float:
+	var ds := _step_deltas(e)
+	if ds.is_empty():
+		return 0.0
+	var mean := 0.0
+	for v in ds:
+		mean += v
+	mean /= float(ds.size())
+	var dev := 0.0
+	for v in ds:
+		dev += absf(v - mean)
+	return dev / float(ds.size())
+
+
+func _step_med(e: PackedFloat32Array) -> float:
+	var ds := _step_deltas(e)
+	if ds.is_empty():
+		return 0.0
+	var a := PackedFloat32Array()
+	for v in ds:
+		a.append(absf(v))
+	a.sort()
+	return a[a.size() / 2]
+
+
+func _step_max(e: PackedFloat32Array) -> float:
+	var m := 0.0
+	for v in _step_deltas(e):
+		m = maxf(m, absf(v))
+	return m
+
+
+func _step_mean(e: PackedFloat32Array) -> float:
+	var ds := _step_deltas(e)
+	if ds.is_empty():
+		return 0.0
+	var s := 0.0
+	for v in ds:
+		s += v
+	return s / float(ds.size())
+
+
+## "发顿帧"占比：位移小到中位数的 1/4 以下，就算那一帧影子没动。
+##
+## 这是这一段最锋利的判据 —— 病根的表现正是**每隔三帧里有两帧位移恰好为 0**
+## （旧实现把贴图钉在屏幕上，重建之间完全不挪），所以它天然是对着病根问的。
+##
+## ⚠️ 中位数本身就是 0（整段一动不动）时**必须返回 1.0**，不能返回 0.0 ——
+## 那是"全都在发顿"，是这个判据最该抓住的情形；判 0 会把它读成"一点也不发顿"。
+func _stall_frac(e: PackedFloat32Array) -> float:
+	var ds := _step_deltas(e)
+	if ds.is_empty():
+		return 1.0
+	var a := PackedFloat32Array()
+	for v in ds:
+		a.append(absf(v))
+	a.sort()
+	var med := a[a.size() / 2]
+	if med < 1.0e-4:
+		return 1.0
+	var n := 0
+	for v in ds:
+		if absf(v) < 0.25 * med:
+			n += 1
+	return float(n) / float(ds.size())
+
+
 # ================================================================ 第三张地图 · 三图风格 · 敌人样貌
 
 func _section_level3_art() -> void:
@@ -5909,6 +6498,312 @@ func _section_fullscreen() -> void:
 	# 确定性就没了：同一份代码两次跑会因为 WM 记着上次的尺寸而写出不同的报告）。
 	DisplayServer.window_set_size(size_ambient)
 	await _settle()
+
+
+# ================================================================ 开始界面 / 自定义快捷键
+#
+# 用户原话：「添加一个开始界面，并且可以自定义快捷键，放在开始界面的设置里」。
+#
+# 这一段里的**每一个动作都走玩家那条路**（`main.advance()` + `GameInput.set_override()`），
+# 不直接调 `_pick_title()` / `_pick_setting()` —— 直接调函数只能证明函数自己是对的，
+# 证明不了「界面把它接上了没有」。
+#
+# ⚠️ 按键的判据压在 **InputMap** 上，不只看 `GameInput.binds`：
+#    `binds` 只是内存里那张表。改对了却没 `_install()` 的话，玩家按键依然毫无反应、
+#    旧键甚至还能按 ——「改了没用」正是这条链路上最容易出的那种失败，而它
+#    在只看 `binds` 的断言下是全绿的。所以下面每条改键断言都成对地量两层。
+#
+# ⚠️ 判据还要**逐个动作**比对，不能只看被改的那一行：`reset_bindings()` 少洗一个动作
+#    在单行断言下是看不出来的。
+#
+# 排在**最后一段**：`show_title()` 会把世界释放掉，而别的段落都要一个活着的世界。
+
+func _section_title_keys() -> void:
+	# ── ⓪ 先别把玩家自己的键位存档弄丢 ────────────────────────────
+	# 这一段要反复写 `user://keybindings.json`（改键即存盘）。先原样备份、跑完放回去 ——
+	# 否则跑一次自检就把玩家改好的键位洗回出厂了。
+	var had_bind_file := FileAccess.file_exists(GameInput.BIND_PATH)
+	var bind_backup := ""
+	if had_bind_file:
+		var bf := FileAccess.open(GameInput.BIND_PATH, FileAccess.READ)
+		if bf != null:
+			bind_backup = bf.get_as_text()
+			bf.close()
+		# 备份之后**先把它挪开**：下面 ⑦ 要问"改键有没有立刻写盘"，
+		# 盘上留着一个旧文件的话那条断言恒真（不管写没写都在）—— 判据又变成没牙的。
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(GameInput.BIND_PATH))
+	GameInput.reset_bindings(false)
+	var bind_dir_clean := not FileAccess.file_exists(GameInput.BIND_PATH)
+
+	main.show_title()
+	await _settle()
+
+	# ── ① 开始界面是一张**菜单**，不是一块"按空格开始"的告示牌 ──────
+	_num("开始界面_菜单行数", float(main.hud.menu_rows))
+	_num("开始界面_菜单高亮行", float(main.hud.menu_index))
+	_num("开始界面_此时世界是否已释放", 1.0 if main.world == null else 0.0)
+	_num("开始界面_菜单页名", 0.0, main.title_page())
+	_ok("★ 【用户要的】进的是**开始界面菜单**：三行选项、第一行高亮、世界已释放",
+		main.state == "title" and main.title_page() == "menu" and main.hud.overlay.visible
+			and main.hud.menu_rows == 3 and main.hud.menu_index == 0 and main.world == null,
+		"state=%s page=%s rows=%d idx=%d world=%s" % [main.state, main.title_page(),
+			main.hud.menu_rows, main.hud.menu_index, str(main.world)])
+
+	# ── ② 菜单真能用方向键选，越界**回绕**而不是卡住 ────────────────
+	_tap("move_down")
+	var i_down := main._title_index
+	_tap("move_up")
+	_tap("move_up")			# 已经在第一行，再往上 → 应回绕到最后一行
+	var i_wrap := main._title_index
+	var hi_wrap := main.hud.menu_index
+	_num("开始界面_按一下下移后的高亮行", float(i_down))
+	_num("开始界面_从第一行再上移后的高亮行", float(i_wrap))
+	_num("开始界面_回绕后界面显示的高亮行", float(hi_wrap))
+	_ok("★ 菜单能用方向键选（按下即动），并且越界会**回绕**（不是撞墙停住）",
+		i_down == 1 and i_wrap == 2 and hi_wrap == i_wrap,
+		"下移→%d，再连按两下上移→%d，界面显示 %d" % [i_down, i_wrap, hi_wrap])
+
+	# ── ③「设置」进去就是按键重绑表 ───────────────────────────────
+	main._title_index = 1
+	main._redraw_title()
+	var n_rows := main._settings_rows().size()
+	var n_reb := GameInput.REBINDABLE.size()
+	var n_act := GameInput.ACTIONS.size()
+	_tap("confirm")
+	var page_set := main.title_page()
+	var miss_reb := _missing_from_rebindable()
+	var miss_def := _missing_default_key()
+	_num("开始界面_设置表总行数", float(n_rows))
+	_num("开始界面_可重绑动作数", float(n_reb))
+	_num("开始界面_动作总数", float(n_act))
+	_ok("★ 【用户要的】「设置」里就是按键重绑表：行数 = 可重绑动作数 + 「全部恢复默认」+「返回」",
+		page_set == "settings" and n_reb > 0 and n_rows == n_reb + 2,
+		"page=%s 行数=%d（动作 %d）" % [page_set, n_rows, n_reb])
+	_ok("★ 重绑表与动作表**一一对应** —— 只把动作装进 InputMap 而不进这张表，"
+		+ "它在设置界面里根本不出现（玩家想改也改不到）；反过来表里多一项则点了没反应",
+		n_reb == n_act and miss_reb == "", "动作 %d / 可重绑 %d，错位：%s" % [n_act, n_reb, miss_reb])
+	_ok("★ 每个动作都有出厂按键（`DEFAULT_KEYS` 覆盖 `ACTIONS`）—— 漏一个，"
+		+ "那一项在设置界面里显示空白，而且改完**恢复不回来**",
+		miss_def == "", "缺：" + miss_def)
+
+	# 行序与文案：**只有一个出处**（`GameInput.REBINDABLE`），抄歪一行就红
+	var rows := main._settings_rows()
+	var order_bad := ""
+	for i in n_reb:
+		var r: Dictionary = rows[i]
+		if str(r["id"]) != str(GameInput.REBINDABLE[i][0]) \
+				or str(r["label"]) != str(GameInput.REBINDABLE[i][1]):
+			order_bad = "第 %d 行：%s / %s" % [i, str(r["id"]), str(r["label"])]
+			break
+	_ok("★ 设置表的行序与文案和 `GameInput.REBINDABLE` **逐行一致**（不是界面里另抄一份）",
+		order_bad == "", order_bad)
+	var id_reset := str((rows[n_reb] as Dictionary)["id"])
+	var id_back := str((rows[n_reb + 1] as Dictionary)["id"])
+	_ok("★ 尾部两项是「全部恢复默认」与「返回」，不属于按键表本身",
+		id_reset == "__reset" and id_back == "__back", "%s / %s" % [id_reset, id_back])
+
+	# 表比一屏长 → 高亮必须被"带进屏内"（滚动窗口）。拿最后一行（返回）验：
+	var vis_n := main.hud.menu_rows
+	main._set_index = n_rows - 1
+	main._redraw_settings()
+	var last_shown := str((main.hud.ov_rows.get_child(main.hud.menu_rows - 1) as Label).text)
+	_num("开始界面_设置页一屏显示行数", float(vis_n))
+	_num("开始界面_高亮挪到末行时它在屏内的位置", float(main.hud.menu_index))
+	_ok("★ 设置表比一屏长，高亮会被滚进屏内：挪到末行（返回）时它真的显示在屏内最后一行 —— "
+		+ "否则玩家按方向键会「看不着自己在选什么」",
+		vis_n < n_rows and main.hud.menu_index == main.hud.menu_rows - 1 and last_shown.contains("返"),
+		"一屏 %d 行 / 共 %d 行，末行「%s」，高亮在第 %d 行"
+			% [vis_n, n_rows, last_shown.strip_edges(), main.hud.menu_index])
+
+	# ── ④ 改键：走玩家的完整路径（进设置 → 选中一项 → 按一个新键）────
+	# 挑「冲刺」：出厂是 Shift + 空格**两个键**，重绑之后必须**只剩新键** ——
+	# "只加不清"是最常见的写法，症状就是玩家说的"改了没用"（新键没装上、旧键还在）。
+	var act := "dash"
+	var keys_before := GameInput.keys_of(act).duplicate()
+	main._set_index = _settings_row_of(act)
+	main._redraw_settings()
+	_tap("confirm")
+	var page_cap := main.title_page()
+	var cap := GameInput.capture_action()
+	_ok("★ 点「冲刺」那一行会进入「等一个键」状态（不是在设置页里干等着）",
+		page_cap == "bind" and cap == act, "page=%s capture=%s" % [page_cap, cap])
+	# 按一个新键。真键盘那条路（`_input()` 收到键之后）调的就是 `inject_key()`。
+	GameInput.inject_key(KEY_P)
+	main.advance(STEP)
+	var keys_after := GameInput.keys_of(act).duplicate()
+	var im_after := _inputmap_keys(act)
+	_num("开始界面_该动作改键前有几个键", float(keys_before.size()))
+	_num("开始界面_该动作改键后有几个键", float(keys_after.size()))
+	_num("开始界面_该动作改键后的键名", 0.0, GameInput.key_names(act))
+	_ok("★ 【用户要的】改键真的落到 **InputMap** 上：`binds` 与 InputMap 都只剩新键 P —— "
+		+ "只改内存那层表而不重装 InputMap，玩家按键毫无反应（这条就是钉它的）",
+		keys_after == [KEY_P] and im_after == [KEY_P],
+		"binds=%s / InputMap=%s" % [str(keys_after), str(im_after)])
+	_ok("★ 重绑之后**旧键不再属于这个动作**（Shift / 空格都不该再触发它）",
+		not im_after.has(KEY_SHIFT) and not im_after.has(KEY_SPACE), str(im_after))
+	_ok("★ 改完自动回到设置页，并且这一行会标成「已改」（改没改玩家看得见）",
+		main.title_page() == "settings" and not GameInput.is_default(act),
+		"page=%s is_default=%s" % [main.title_page(), str(GameInput.is_default(act))])
+
+	# ── ⑤ 冲突：两个动作不许抢同一个键（核心层 / 界面层各验一次）────
+	var err_core := GameInput.set_bind(act, KEY_W)		# W 是「上移」的出厂键
+	var keys_rej := GameInput.keys_of(act).duplicate()
+	_num("开始界面_核心层拒绝冲突时的提示", 0.0, err_core)
+	_ok("★ 核心层拒绝冲突：把「冲刺」改到 W（「上移」正在用）不生效，"
+		+ "而不是把「上移」静默顶成没有按键的死动作（静默改掉玩家没碰过的东西更糟）",
+		err_core != "" and keys_rej == [KEY_P], "err=「%s」 之后=%s" % [err_core, str(keys_rej)])
+
+	var atk_before := GameInput.keys_of("attack").duplicate()
+	main._set_index = _settings_row_of("attack")
+	main._redraw_settings()
+	_tap("confirm")
+	GameInput.inject_key(KEY_W)			# 同样抢 W
+	main.advance(STEP)
+	var page_conf := main.title_page()
+	var ui_err := GameInput.bind_error
+	var atk_after := GameInput.keys_of("attack").duplicate()
+	_tap("pause")						# Esc 退出抓键
+	var page_esc := main.title_page()
+	var cap_esc := GameInput.capture_action()
+	_ok("★ 【界面那一层】改到一个被占用的键：不生效、**不退出抓键**、并把原因显示给玩家 —— "
+		+ "把错误吞掉比拒绝更糟（玩家只会觉得「按了没反应」）",
+		page_conf == "bind" and ui_err != "" and atk_after == atk_before,
+		"page=%s err=「%s」 attack=%s→%s" % [page_conf, ui_err, str(atk_before), str(atk_after)])
+	_ok("★ 抓键状态下按 Esc 能退出来（否则玩家就卡在「按一个新键」里出不去了）",
+		page_esc == "settings" and cap_esc == "",
+		"page=%s capture=%s" % [page_esc, cap_esc])
+
+	# ── ⑥「全部恢复默认」真的把**每一个**改过的动作洗回去 ────────────
+	GameInput.set_bind("swap_weapon", KEY_G)
+	var dirty := not GameInput.is_default("swap_weapon")
+	main._set_index = n_reb				# 「全部恢复默认」那一行
+	main._redraw_settings()
+	_tap("confirm")
+	var changed_n := 0
+	var still_changed := ""
+	for a in GameInput.ACTIONS:
+		if not GameInput.is_default(a):
+			changed_n += 1
+			still_changed += str(a) + " "
+	_num("开始界面_恢复默认后仍非出厂的动作数", float(changed_n))
+	_ok("★ 【用户要的】「全部恢复默认」把**每个**动作都洗回出厂（逐个动作比对，"
+		+ "不是只看被改的那一行）",
+		dirty and changed_n == 0, "改坏过=%s 恢复后仍非出厂：%s" % [str(dirty), still_changed])
+
+	# ── ⑦ 存盘 / 读盘：改过的键要活过一次重启 ──────────────────────
+	#
+	# ⚠️ 量"立刻存盘"之前**必须先把盘上那份清掉**。⑥ 的「全部恢复默认」走的是
+	#    `reset_bindings()`（默认 `persist = true`），它**自己就会写一次盘** ——
+	#    于是"改完之后盘上有文件"早就成立了，这条断言**被两条独立的路径同时满足**
+	#    = 没牙。实测：变异「改键不存盘」下它照样绿，真正的红落在下面"读回来"那条上，
+	#    而那条红的**原因**会被读成"读盘坏了"——把人引到错误的一层。
+	#    清掉之后还要比**内容**：文件在只是"有人写过盘"，里面带着新键才是"玩家改的这一次存进去了"。
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(GameInput.BIND_PATH))
+	var disk_wiped := not FileAccess.file_exists(GameInput.BIND_PATH)
+	GameInput.set_bind("swap_weapon", KEY_G)
+	var saved := GameInput.keys_of("swap_weapon").duplicate()
+	var saved_on_disk := FileAccess.file_exists(GameInput.BIND_PATH)
+	var saved_text := ""
+	if saved_on_disk:
+		var rf := FileAccess.open(GameInput.BIND_PATH, FileAccess.READ)
+		if rf != null:
+			saved_text = rf.get_as_text()
+			rf.close()
+	GameInput.reset_bindings(false)		# 内存洗回出厂，但**不写盘**
+	var mem_is_default := GameInput.is_default("swap_weapon")
+	GameInput.load_bindings()			# 相当于"重启之后再读回来"
+	var reloaded := GameInput.keys_of("swap_weapon").duplicate()
+	var im_reload := _inputmap_keys("swap_weapon")
+	_num("开始界面_改键后盘上那份里有这个动作", 1.0 if saved_text.contains("swap_weapon") else 0.0)
+	_ok("★ 改键会**立刻存盘**（先把盘上那份清干净再改：改完那一刻文件必须出现，"
+		+ "而且里面就带着这个动作 —— ⑥ 的「恢复默认」也会写盘，不清掉的话这条没牙；"
+		+ "内存被洗回出厂也不影响盘上那份）",
+		disk_wiped and bind_dir_clean and saved_on_disk and mem_is_default
+			and saved_text.contains("swap_weapon"),
+		"起手干净=%s 改成前清干净=%s 改完文件在=%s 内容含该动作=%s 内存已洗回出厂=%s"
+			% [str(bind_dir_clean), str(disk_wiped), str(saved_on_disk),
+				str(saved_text.contains("swap_weapon")), str(mem_is_default)])
+	_ok("★ 【用户要的】存盘能被读回来（模拟重启）：`binds` 与 InputMap 都恢复成改过的键 —— "
+		+ "只改 `binds` 而不重装 InputMap 的话，重启之后按键还是没反应",
+		reloaded == saved and im_reload == saved,
+		"存盘=%s 读回=%s InputMap=%s" % [str(saved), str(reloaded), str(im_reload)])
+
+	# ── ⑧ 开始界面上，鼠标左键（攻击键）也算确认 ──────────────────
+	main.show_title()
+	await _settle()
+	main._title_index = 0
+	main._redraw_title()
+	GameInput.set_override("attack", true)
+	main.advance(STEP)
+	GameInput.set_override("attack", false)
+	var clicked_start := main.state == "play" and main.world != null
+	_ok("★ 开始界面上**点一下（鼠标左键 / 攻击键）也能开局** —— `_activate()` 只认 confirm 的话，"
+		+ "「点一下开始」这条路就断在这儿了",
+		clicked_start, "state=%s 有世界=%s" % [main.state, str(main.world != null)])
+
+	# ── ⑨ 收尾：把玩家自己的键位存档原样放回去 ────────────────────
+	# 退场时留给下一段（以及手动玩）的必须是"刚开机"那个状态：标题菜单 + 出厂键位。
+	main.show_title()
+	GameInput.reset_bindings(false)
+	if had_bind_file:
+		var wf := FileAccess.open(GameInput.BIND_PATH, FileAccess.WRITE)
+		if wf != null:
+			wf.store_string(bind_backup)
+			wf.close()
+	elif FileAccess.file_exists(GameInput.BIND_PATH):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(GameInput.BIND_PATH))
+	var restored := FileAccess.file_exists(GameInput.BIND_PATH)
+	await _settle()
+	_ok("★ 自检不弄丢玩家自己的键位存档：跑完把原文件原样放回（本来没有就删掉自检写出来的那个）",
+		restored == had_bind_file, "跑之前有=%s 跑之后有=%s" % [str(had_bind_file), str(restored)])
+	_num("开始界面_退场时的界面页", 0.0, main.title_page())
+	_num("开始界面_退场时是否在出厂键位", 1.0 if GameInput.is_default("dash") else 0.0)
+
+
+## 某个动作在设置界面里的行号。**行序只有一个出处**（`GameInput.REBINDABLE`）——
+## 自检自己再抄一份顺序的话，"界面把行序搞错了"就永远验不出来。
+func _settings_row_of(action: String) -> int:
+	for i in GameInput.REBINDABLE.size():
+		if str(GameInput.REBINDABLE[i][0]) == action:
+			return i
+	return -1
+
+
+## InputMap 里这个动作**当前**绑着的键（物理键码）。
+## 判据要压在它上面：`GameInput.binds` 只是内存里那张表，没重装 InputMap 的话
+## 玩家按键依然没反应 —— 表对了、键没装上是真实存在的一种失败。
+func _inputmap_keys(action: String) -> Array:
+	var out := []
+	if not InputMap.has_action(action):
+		return out
+	for e in InputMap.action_get_events(action):
+		if e is InputEventKey:
+			out.append(int(e.physical_keycode))
+	return out
+
+
+## `ACTIONS` 里哪些动作没进 `REBINDABLE`、以及 `REBINDABLE` 里哪些动作不属于 `ACTIONS`
+func _missing_from_rebindable() -> String:
+	var out := ""
+	var have := {}
+	for it in GameInput.REBINDABLE:
+		var a := str(it[0])
+		have[a] = true
+		if not GameInput.ACTIONS.has(a):
+			out += "多:" + a + " "
+	for a in GameInput.ACTIONS:
+		if not have.has(str(a)):
+			out += "缺:" + str(a) + " "
+	return out.strip_edges()
+
+
+## `ACTIONS` 里哪些动作没有出厂按键（设置界面里那一项会是空白）
+func _missing_default_key() -> String:
+	var out := ""
+	for a in GameInput.ACTIONS:
+		if not GameInput.DEFAULT_KEYS.has(a):
+			out += str(a) + " "
+	return out.strip_edges()
 
 
 ## 从整屏截图里裁出玩家特写并放大 k 倍（对照图用）

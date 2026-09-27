@@ -55,6 +55,11 @@ var _fx_lights := {}
 ## 用扁平数组而不是字典数组 —— 迷雾每格都要遍历一次，字典取值太贵。
 var src_x := PackedFloat32Array()
 var src_y := PackedFloat32Array()
+## 灯的屏幕相对 y = `世界 y · YSQUASH − z`。**z 必须跟着一起给**：
+## 灯层的 `PointLight2D.position` 就是这么摆的（火盆抬 22、敌人抬 h·0.45…），
+## 而迷雾层的遮挡射线是在**同一个空间**里投的 —— 少给这一项，
+## 两层的遮挡边界又会差开几十像素（和"雾与墙不协调"是同一类病）。
+var src_z := PackedFloat32Array()
 var src_r := PackedFloat32Array()
 var src_kind := PackedStringArray()
 var _tex_floor: ImageTexture
@@ -143,7 +148,7 @@ func build_occluders(walls: Array) -> void:
 		_occluders.append(occ)
 
 
-## 一面墙的遮挡体多边形（屏幕相对坐标）。
+## 一面墙的遮挡矩形（**屏幕相对坐标**：x 直接用世界 x，y = 世界 y × YSQUASH − z）。
 ##
 ## 墙上屏幕后由两块拼成（与 Web 版 drawFloor / drawWall 的画法一致）：
 ##   顶面   = 足迹整体上移 h
@@ -152,19 +157,32 @@ func build_occluders(walls: Array) -> void:
 ##
 ## 贴「地面足迹」会让光从墙顶翻过去照到墙后（实测墙后比轮廓模型亮 10 倍）；
 ## 贴「轮廓四边均匀内缩」会从墙顶漏光。所以是：贴轮廓，只削底边。
-static func occluder_polygon(x: float, y: float, w: float, d: float, h: float,
-		trim := OCC_TRIM) -> PackedVector2Array:
+##
+## ⚠️ **这是遮挡几何的唯一出处**：灯层拿它拼 `LightOccluder2D` 的多边形
+## （`occluder_polygon`），**雾层拿它做射线扇**（`Fog._cast_fan`）。
+## 两层必须同源、而且必须在**同一个空间**里判 —— 否则就会出现
+## 「灯说墙脚是亮的、雾说墙脚是全雾」（2026-09-27 用户反馈的那处不协调，
+## 实测：墙南立面下 16px，灯层=亮 / 雾层 reveal=0.000）。
+static func occluder_rect(x: float, y: float, w: float, d: float, h: float,
+		trim := OCC_TRIM) -> Rect2:
 	var y_foot := y * Proj.YSQUASH          # 足迹北沿（屏幕）
 	var fh := d * Proj.YSQUASH              # 足迹屏幕高度
 	var y_top := y_foot - h                 # 轮廓上沿 = 墙顶
 	var height := fh + h - trim             # 轮廓总高减掉底边削掉的量
 	if height < 4.0:
 		height = 4.0
+	return Rect2(x, y_top, w, height)
+
+
+## 遮挡体多边形 —— 由 `occluder_rect` 折出来（**不再自己算一遍几何**）。
+static func occluder_polygon(x: float, y: float, w: float, d: float, h: float,
+		trim := OCC_TRIM) -> PackedVector2Array:
+	var r := occluder_rect(x, y, w, d, h, trim)
 	return PackedVector2Array([
-		Vector2(x, y_top),
-		Vector2(x + w, y_top),
-		Vector2(x + w, y_top + height),
-		Vector2(x, y_top + height),
+		r.position,
+		Vector2(r.position.x + r.size.x, r.position.y),
+		r.position + r.size,
+		Vector2(r.position.x, r.position.y + r.size.y),
 	])
 
 
@@ -177,6 +195,7 @@ func sync(world) -> void:
 	position = Proj.cam_offset(world.draw_cam.x, world.draw_cam.y)
 	src_x.clear()
 	src_y.clear()
+	src_z.clear()
 	src_r.clear()
 	src_kind.clear()
 
@@ -214,9 +233,10 @@ func sync(world) -> void:
 	_sync_fx_lights(world)
 
 
-func _add_source(x: float, y: float, r: float, kind: String) -> void:
+func _add_source(x: float, y: float, r: float, kind: String, z := 0.0) -> void:
 	src_x.append(x)
 	src_y.append(y)
+	src_z.append(z)
 	src_r.append(r)
 	src_kind.append(kind)
 
@@ -264,7 +284,7 @@ func _sync_fx_lights(world) -> void:
 		l.texture_scale = (reach * 0.95 + 46.0) / TEX_HALF
 		l.color = world.element_color_of()
 		l.energy = 1.05 * t01
-		_add_source(wx, wy, l.texture_scale * TEX_HALF, "fx")
+		_add_source(wx, wy, l.texture_scale * TEX_HALF, "fx", 16.0)
 
 	# ── ② 玩家弹丸 ──
 	for q in world.projs:
@@ -282,7 +302,8 @@ func _sync_fx_lights(world) -> void:
 		l2.texture_scale = (float(q["r"]) * 7.5 + 26.0) / TEX_HALF
 		l2.color = Color.html(str(q["color"]))
 		l2.energy = 1.15
-		_add_source(float(q["x"]), float(q["y"]), l2.texture_scale * TEX_HALF, "fx")
+		_add_source(float(q["x"]), float(q["y"]), l2.texture_scale * TEX_HALF, "fx",
+			float(q["z"]))
 
 	# ── ③ 留场物（灯球 / 光柱）──
 	# 这两个是"留在原地继续照亮"的东西，用不投影的柔光就够：
@@ -305,7 +326,8 @@ func _sync_fx_lights(world) -> void:
 		l3.texture_scale = (rr3 * 1.5 + 60.0) / TEX_HALF
 		l3.color = Color.html(str(f["color"]))
 		l3.energy = (0.9 if kind == "zone" else 0.7) * (1.0 - t03 * 0.35)
-		_add_source(float(f["x"]), float(f["y"]), l3.texture_scale * TEX_HALF, "fx")
+		_add_source(float(f["x"]), float(f["y"]), l3.texture_scale * TEX_HALF, "fx",
+			float(f["z"]))
 
 	# 回收：这一帧没被点到的都熄掉
 	for k in _fx_lights.keys():
@@ -339,7 +361,8 @@ func _sync_prop_lights(world) -> void:
 		var flick := 0.92 + 0.08 * sin(world.time * 7.0 + float(i) * 2.1)
 		l.energy = (1.0 if lit else 0.0) * flick
 		if lit:
-			_add_source(float(pr["x"]), float(pr["y"]), 210.0, "brazier")
+			# 这盏灯抬了 22px（见上面 `l.position`），z 要一起交出去
+			_add_source(float(pr["x"]), float(pr["y"]), 210.0, "brazier", 22.0)
 
 
 func _sync_enemy_lights(world) -> void:
@@ -360,7 +383,8 @@ func _sync_enemy_lights(world) -> void:
 		l.energy = 0.62 + (0.35 if e.state == "windup" else 0.0)
 		# 敌人自光也开雾（半径系数见 Fog.KIND_SCALE.enemy）：雾里能看见一团逼近的亮，
 		# 是这套黑暗机制里最重要的一条"预警"。
-		_add_source(e.x, e.y, lr * 2.6, "enemy")
+		# 同样把抬高量交出去（上面 `l.position` 用的就是 e.h * 0.45）
+		_add_source(e.x, e.y, lr * 2.6, "enemy", e.h * 0.45)
 	# 回收死掉的
 	for id in _enemy_lights.keys():
 		if not live.has(id):

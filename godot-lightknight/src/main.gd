@@ -131,18 +131,208 @@ func show_title() -> void:
 	_pending_chest = []
 	_pending_shop = false
 	_panel_kind = "draft"
-	hud.show_overlay(
-		"灯 骑 士",
-		"第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗　→　第三关 · 灯河渡口\n"
-		+ "「外庭的灯还亮着，这是你最好的日子。」\n\n"
-		+ "WASD 移动　鼠标瞄准　J 挥击　Shift 冲刺　1/2/3 技能　E 交互\n"
-		+ "X 换手（手持 ↔ 背包武器）　C 喝灯油（背包里的回血道具）　F11 全屏\n"
-		+ "每开一局，八把武器各随机带一种元素（火/冰/雷/毒/光），攻击会上状态。\n"
-		+ "地图上有宝箱，能开出带词条的武器；守灯人能重铸 / 锤炼武器、卖灯油。\n"
-		+ "清空一波会跳出三选一：Q / E 左右看，空格拿走。死了就重来一趟。\n"
-		+ "连击就是你的光：打得越顺，灯越亮；停下来，黑暗会咬住你。",
-		"按 空格 / 点击 开始"
-	)
+	_title_page = "menu"
+	_title_index = 0
+	_set_index = 0
+	_set_scroll = 0
+	GameInput.end_capture()
+	GameInput.bind_error = ""
+	_redraw_title()
+
+
+# ---------------------------------------------------------------- 开始界面
+#
+# 用户原话：「添加一个开始界面，并且可以自定义快捷键，放在开始界面的设置里」。
+#
+# 所以标题不再是一块"按空格开始"的告示牌，而是一张**菜单**：
+#   开始游戏 / 设置 / 操作说明
+# 「设置」进去就是按键重绑表（`GameInput.REBINDABLE`）。改键走的是
+# `GameInput.set_bind()`（带冲突检查 + 存盘），不是直接改 InputMap ——
+# 那样"两个动作绑到同一个键"要等到玩家进游戏发现某个键没反应才会暴露。
+#
+# ⚠️ 这一页的**行序只有一个出处**（`GameInput.REBINDABLE`），
+# 界面、自检、存盘都用它 —— 三份各写一遍迟早会漏掉一处。
+
+## 标题界面的四个页：主菜单 / 设置 / 等一个键 / 操作说明
+var _title_page := "menu"
+var _title_index := 0
+var _set_index := 0
+var _set_scroll := 0
+## 设置界面一屏显示几行（超出的靠滚动，高亮行始终在屏内）
+const SETTINGS_PAGE := 9
+
+const TITLE_BODY := "第一关 · 灯堡外庭　→　第二关 · 灯堡深处 · 无芯之暗　→　第三关 · 灯河渡口\n" \
+	+ "「外庭的灯还亮着，这是你最好的日子。」\n\n" \
+	+ "每开一局，八把武器各随机带一种元素（火/冰/雷/毒/光），攻击会上状态。\n" \
+	+ "地图上有宝箱，能开出带词条的武器；守灯人能重铸 / 锤炼武器、卖灯油。\n" \
+	+ "清空一波会跳出三选一：Q / E 左右看，空格拿走。死了就重来一趟。\n" \
+	+ "连击就是你的光：打得越顺，灯越亮；停下来，黑暗会咬住你。\n\n" \
+	+ "按键默认是 WASD / 鼠标 / J / Shift / 1·2·3 / E。\n" \
+	+ "不顺手就进「设置」里改 —— 改完立刻生效，也会记在你的存档里。"
+
+
+func _title_items() -> Array:
+	return ["开始游戏", "设置", "操作说明"]
+
+
+## 设置界面的行。**顺序与内容都取自 `GameInput.REBINDABLE`**，
+## 末尾两项是"全部恢复默认"和"返回"（由这一层补上，不是按键表的一部分）。
+func _settings_rows() -> Array:
+	var out := []
+	for it in GameInput.REBINDABLE:
+		var a := str(it[0])
+		var nm := GameInput.key_names(a)
+		if not GameInput.is_default(a):
+			nm += "　（已改）"
+		out.append({"id": a, "label": str(it[1]), "value": nm})
+	out.append({"id": "__reset", "label": "全部恢复默认", "value": ""})
+	out.append({"id": "__back", "label": "返　回", "value": ""})
+	return out
+
+
+func _redraw_title() -> void:
+	match _title_page:
+		"settings", "bind":
+			_redraw_settings()
+		"help":
+			hud.show_overlay("操 作 说 明", TITLE_BODY,
+				"空格 / 回车 / Esc　返回", "title")
+		_:
+			hud.show_menu("灯 骑 士", _title_items(), _title_index,
+				"↑ ↓ / W S 选择　·　空格 / 回车 / 点击 确认", "title")
+
+
+func _redraw_settings() -> void:
+	var rows := _settings_rows()
+	var n := rows.size()
+	# 高亮行**始终留在屏内**：设置表比一屏长，滚动窗口跟着高亮走
+	if _set_index < _set_scroll:
+		_set_scroll = _set_index
+	if _set_index >= _set_scroll + SETTINGS_PAGE:
+		_set_scroll = _set_index - SETTINGS_PAGE + 1
+	_set_scroll = clampi(_set_scroll, 0, maxi(0, n - SETTINGS_PAGE))
+	var labels := []
+	for i in range(_set_scroll, mini(n, _set_scroll + SETTINGS_PAGE)):
+		var r: Dictionary = rows[i]
+		var val := str(r["value"])
+		if _title_page == "bind" and str(r["id"]) == GameInput.capture_action():
+			val = "按一个新键…（Esc 取消）"
+		labels.append("%s　　%s" % [str(r["label"]), val])
+	var hint := "↑ ↓ / W S 选择　·　空格 / 回车 改键　·　Esc 返回"
+	if _title_page == "bind":
+		hint = "按一个新键　·　Esc 取消"
+	elif GameInput.bind_error != "":
+		hint = GameInput.bind_error
+	hud.show_menu("设 置", labels, _set_index - _set_scroll, hint, "title")
+
+
+## 上下（或 Q/E）—— 菜单导航只认这一个入口，免得每处各写一遍
+func _nav_delta() -> int:
+	if GameInput.just("move_up") or GameInput.just("draft_prev"):
+		return -1
+	if GameInput.just("move_down") or GameInput.just("draft_next"):
+		return 1
+	return 0
+
+
+## 确认。**鼠标左键也算** —— 标题上"点一下开始"是玩家教的第一个动作。
+func _activate() -> bool:
+	return GameInput.just("confirm") or GameInput.just("attack")
+
+
+func _back_to_title_menu() -> void:
+	Sound.play("ui")
+	GameInput.end_capture()
+	GameInput.bind_error = ""
+	_title_page = "menu"
+	_title_index = 0
+	_redraw_title()
+
+
+func _title_input() -> void:
+	var nav := _nav_delta()
+	match _title_page:
+		"menu":
+			var n := _title_items().size()
+			if nav != 0:
+				_title_index = (_title_index + nav + n) % n
+				Sound.play("ui")
+				_redraw_title()
+			elif _activate():
+				_pick_title()
+		"settings":
+			var n := _settings_rows().size()
+			if nav != 0:
+				_set_index = (_set_index + nav + n) % n
+				Sound.play("ui")
+				_redraw_settings()
+			elif _activate():
+				_pick_setting()
+			elif GameInput.just("pause"):
+				_back_to_title_menu()
+		"bind":
+			# 抓键**只走 `poll_capture()`**：真键盘与自检注入在这条路上是同一个口子
+			var k := GameInput.poll_capture()
+			if k != 0:
+				var err := GameInput.set_bind(GameInput.capture_action(), k)
+				if err == "":
+					Sound.play("ui_big")
+					GameInput.end_capture()
+					_title_page = "settings"
+				else:
+					GameInput.bind_error = err
+				_redraw_settings()
+			elif GameInput.just("pause"):
+				GameInput.end_capture()
+				GameInput.bind_error = ""
+				_title_page = "settings"
+				_redraw_settings()
+		"help":
+			if _activate() or GameInput.just("pause"):
+				_back_to_title_menu()
+		_:
+			_back_to_title_menu()
+
+
+func _pick_title() -> void:
+	Sound.play("ui_big")
+	match _title_index:
+		0:
+			new_run()
+		1:
+			_title_page = "settings"
+			_set_index = 0
+			_set_scroll = 0
+			GameInput.end_capture()
+			GameInput.bind_error = ""
+			_redraw_settings()
+		_:
+			_title_page = "help"
+			_redraw_title()
+
+
+func _pick_setting() -> void:
+	var rows := _settings_rows()
+	if _set_index < 0 or _set_index >= rows.size():
+		return
+	var id := str((rows[_set_index] as Dictionary)["id"])
+	if id == "__back":
+		_back_to_title_menu()
+		return
+	if id == "__reset":
+		GameInput.reset_bindings()
+		Sound.play("ui_big")
+		_redraw_settings()
+		return
+	Sound.play("ui")
+	GameInput.begin_capture(id)
+	_title_page = "bind"
+	_redraw_settings()
+
+
+## 自检/调试：开始界面现在在哪一页、高亮在第几行
+func title_page() -> String:
+	return _title_page
 
 
 ## 开新的一局：**换一张地图**（宝箱与敌人的位置重新生成）。
@@ -305,10 +495,7 @@ func advance(dt: float) -> void:
 
 	match state:
 		"title":
-			if GameInput.just("confirm") or GameInput.just("attack"):
-				Sound.play("ui_big")
-				# 从标题开局 = 新的一局 → 重新摇一张地图（宝箱与敌人换位置）
-				new_run()
+			_title_input()
 		"play":
 			if GameInput.just("pause"):
 				_menu_kind = "pause"
@@ -811,6 +998,13 @@ func debug_state() -> Dictionary:
 		"level": int(prog["level"]),
 		"boon_count": prog["boons"].size() if typeof(prog["boons"]) == TYPE_DICTIONARY else 0,
 		"weapon": str(prog["weapon"]),
+		"title_page": _title_page,
+		"title_index": _title_index,
+		"set_index": _set_index,
+		"menu_index": hud.menu_index if hud != null else -1,
+		"menu_rows": hud.menu_rows if hud != null else 0,
+		"bind_capture": GameInput.capture_action(),
+		"bind_error": GameInput.bind_error,
 	}
 	if world != null:
 		d["hp"] = world.player.hp

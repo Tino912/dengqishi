@@ -62,6 +62,12 @@ var ov_card: PanelContainer
 var ov_title: Label
 var ov_body: Label
 var ov_hint: Label
+## 菜单行容器（开始界面 / 设置 / 按键重绑）。与 `ov_body` 互斥：
+## `show_overlay()` 用正文，`show_menu()` 用行。
+var ov_rows: VBoxContainer
+## 菜单状态：高亮在第几行、一共几行（自检与调试读它）
+var menu_index := -1
+var menu_rows := 0
 var vignette: TextureRect
 var skill_chips: Array = []
 var draft_layer: Control
@@ -440,6 +446,14 @@ func _build_overlay() -> void:
 	ov_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	ov_hint.custom_minimum_size = Vector2(880, 0)
 
+	# 菜单行（开始界面 / 设置）。`show_overlay()` 用正文、`show_menu()` 用这些行，
+	# 同一张卡片承担两种用途 —— 标题界面本来就是"一屏能放下的一小段文字 + 几个选项"。
+	ov_rows = VBoxContainer.new()
+	ov_rows.add_theme_constant_override("separation", 6)
+	ov_rows.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ov.add_child(ov_rows)
+	ov_rows.visible = false
+
 
 func _build_draft() -> void:
 	# 单独一层，放在 overlay 之后 → 层级更高，暂停/通关的遮罩不会盖住它。
@@ -786,6 +800,8 @@ func toast(text: String) -> void:
 func show_overlay(title: String, body: String, hint: String, mode := "title") -> void:
 	ov_title.text = title
 	ov_body.text = body
+	ov_body.visible = true
+	_clear_menu_rows()
 	ov_hint.text = hint
 	ov_art.mode = mode
 	ov_art.visible = mode != "pause"
@@ -794,12 +810,52 @@ func show_overlay(title: String, body: String, hint: String, mode := "title") ->
 	toast_box.visible = false
 
 
+## 覆盖层换成一张**菜单**：一列可选的行，`index` 那一行高亮。
+##
+## 与 `show_overlay()` 共用同一块卡片与同一层遮罩 —— 开始界面本来就是
+## "一屏能放下的一小段文字 + 几个选项"，没必要再开一套控件树。
+## 行里已经拼好了"名称 + 当前值"（按键名由 `GameInput.key_names()` 给）。
+func show_menu(title: String, rows: Array, index: int, hint: String, mode := "title") -> void:
+	ov_title.text = title
+	ov_body.visible = false
+	_clear_menu_rows()
+	menu_index = index
+	menu_rows = rows.size()
+	for i in rows.size():
+		var hl := i == index
+		var l := _mk_label(ov_rows, 27 if hl else 21,
+			C_GOLD_HI if hl else Color(0.80, 0.78, 0.72), hl, 7 if hl else 5)
+		l.text = ("▸ " if hl else "　") + str(rows[i])
+		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		l.custom_minimum_size = Vector2(880, 0)
+		ov_rows.add_child(l)
+	ov_rows.visible = true
+	ov_hint.text = hint
+	ov_art.mode = mode
+	ov_art.visible = mode != "pause"
+	overlay.visible = true
+	hud_box.visible = false
+	toast_box.visible = false
+
+
+func _clear_menu_rows() -> void:
+	menu_index = -1
+	menu_rows = 0
+	if ov_rows == null:
+		return
+	for c in ov_rows.get_children():
+		ov_rows.remove_child(c)
+		c.queue_free()
+	ov_rows.visible = false
+
+
 func update_overlay_body(body: String) -> void:
 	ov_body.text = body
 
 
 func hide_overlay() -> void:
 	overlay.visible = false
+	_clear_menu_rows()
 	hud_box.visible = true
 	toast_box.visible = true
 

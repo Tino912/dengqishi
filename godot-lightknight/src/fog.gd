@@ -12,6 +12,11 @@ extends Node2D
 ## ── 怎么算 ──
 ##   ① 屏幕切成 80×45 的小格（16px 一格），每格问一句"这里被照亮了多少"；
 ##   ② 照亮值 = max over 灯（径向衰减 × 视线有没有被墙挡住）；
+##      ⚠️ 这两个因子在**两个不同的空间**里算，而且都必须那样算：
+##        衰减按**地面**距离（灯贴图是竖压椭圆，地面等距才等亮）；
+##        遮挡按**屏幕相对空间** `(x, y·YSQUASH − z)`（灯层的遮挡体就在那个空间里，
+##        见 `LightRig.occluder_rect`）。竖直方向乘一个 `YSQUASH` 就是两套坐标的
+##        全部分歧 —— 2026-09-27 之前这里两样都按地面算，于是"雾与墙不协调"。
 ##   ③ 写进一张 80×45 的贴图，交给一个全屏着色器：照亮值低的地方画成雾、
 ##      高的地方留空，再叠一层缓慢飘动的噪声当雾絮。
 ##
@@ -48,9 +53,14 @@ const GRID_N := GRID_W * GRID_H
 ## 落在雾的柔边里看不出来。
 const RAYS := 192
 
-## 墙往外"胖"一圈再当遮挡物：不胖的话雾会贴着墙面留下一条缝，
-## 而墙在屏幕上是有高度的（画出来比它的地面足迹高 46px 左右）。
-const WALL_PAD := 10.0
+## ⚠️ **这一层不再自己定遮挡几何**。旧版这里是 `WALL_PAD := 10.0`：
+## 把墙的地面足迹往外胖一圈当遮挡矩形。那与灯层（`LightOccluder2D`，贴的是
+## **画出来的轮廓**、底边削 16px 让墙脚受光）是两套完全不同的几何 —— 于是同一个
+## 墙脚，灯说"亮"、雾说"全雾"（实测：墙南立面下 16px 那一带，灯层=亮 / 雾层 reveal=0.000，
+## 而雾的揭开区要再往南 20px 才开始）。用户 2026-09-27 报的「雾与墙壁碰撞时的不协调」就是它。
+## 现在两层同源（`LightRig.occluder_rect`）、同空间（屏幕相对空间）。
+## 粗筛时才在包围盒上放宽一点，见 `_near_occluders()`。
+const OCC_MARGIN := 8.0
 
 ## 重建间隔（秒）。雾不需要 60Hz，20Hz 又省 2/3 的算力。
 const REBUILD_PERIOD := 0.05
@@ -213,6 +223,16 @@ uniform vec2 cam_xy = vec2(0.0, 0.0);
 uniform float view_w = 1280.0;
 uniform float ysquash = 0.62;
 
+// ── 照亮场的"时间锚定" ──
+// 照亮场（reveal_tex）只在每 REBUILD_PERIOD 秒重算一次，中间那两三帧**是旧数据**。
+// 但它的**语义**是世界锚定的（每一格问的是"它脚下的世界点被照亮多少"），
+// 于是"旧数据"正确用法不是钉在屏幕上不动，而是**按相机位移挪回去再采**：
+// 相机往东走 10px 之后，屏幕上第 590 列画的世界点，就是重建时第 600 列那一格。
+// 少了这一下，影子的边界会"冻 3 帧、再窜一大步"—— 玩家看到的就是
+// 「墙周围的阴影一直乱晃」（2026-09-27 用户反馈，探针实测：灯层边界相邻帧
+// 偏差 0.50px、来回 0 次；雾层 1.65px、来回 30 次，而且抖动**全落在重建帧上**）。
+uniform vec2 rebuild_cam = vec2(0.0, 0.0);
+
 float h21(vec2 p) {
 	p = fract(p * vec2(0.1031, 0.1030));
 	p += dot(p, p.yx + 33.33);
@@ -231,7 +251,14 @@ float vnoise(vec2 p) {
 void fragment() {
 	// reveal_tex 两个通道都有用：R = 被照亮多少（0 = 全雾），
 	// G = **这一像素看到的表面有多高**（0 = 地面，1 = 到雾顶）。
-	vec2 rp = texture(reveal_tex, SCREEN_UV).rg;
+	//
+	// ⚠️ 采样点**不是** `SCREEN_UV`：这张贴图是"重建那一刻"的屏幕快照，
+	// 语义却是世界锚定的。相机在两次重建之间挪了多远，就把它挪回去多少
+	// —— 推导见 `rebuild_cam` 上面的注释。少了这一下，影子的边界会
+	// "冻几帧、再窜一步"，看着就是乱晃。
+	vec2 ruv = SCREEN_UV + vec2(cam_xy.x - rebuild_cam.x,
+		(cam_xy.y - rebuild_cam.y) * ysquash) / vec2(view_w, view_h);
+	vec2 rp = texture(reveal_tex, ruv).rg;
 	float reveal = rp.r;
 	float alt = clamp(rp.g, 0.0, 1.0);
 
@@ -319,6 +346,9 @@ var _hgh := 0
 var _hg_oy := 0.0
 ## 射线扇缓存：同一盏灯（同一个位置、同一个半径）不必每帧重投
 var _fan_cache := {}
+## 上一次重建用的相机位置。着色器用它把"旧快照"挪回世界锚定（见 SHADER_SRC 里
+## `rebuild_cam` 的推导）。**自检会核对它跟着重建走**。
+var _rebuild_cam := Vector2.ZERO
 var _mist := Color(0.16, 0.19, 0.27)
 ## 整体浓淡系数：清关时从 1 掉到 0（"这一关的雾散了"）
 var _fade := 1.0
@@ -471,15 +501,33 @@ func _rebuild(w: World, dt: float) -> void:
 		var row := j * GRID_W
 		for i in GRID_W:
 			var wx := (float(i) + 0.5) * _step_x - half_w + camx
+			# 这一格"看到的表面有多高"，先算出来 —— 它不依赖别的格。
+			var alt := height_at(wx, wy)
+			_alt[row + i] = alt
+			# ⚠️ 这一格问灯的时候，**两个因子在两个空间里算**（两个都必须那样算）：
+			#   ① 衰减要的是**地面距离**（灯贴图是竖压椭圆 → 地面等距才等亮）；
+			#   ② 遮挡要的是**屏幕相对空间**的距离：竖直方向乘一个 YSQUASH。
+			#      这不是近似 —— 屏幕相对坐标是 `(x, y·S − z)`，而"屏幕 y 落在这一格"
+			#      的表面满足 `地面y = wy + z/S`，于是 `sr_y = (wy + z/S)·S − z = wy·S`：
+			#      **z 自己消掉了**，任何高度的像素、它的屏幕相对 y 就是 `wy·S`。
+			#      所以射线直接打到"这一像素"，不需要按高度挪。
+			# 旧实现两样都按地面算（竖直方向少乘一个 S），于是墙脚那 16px
+			# 灯层说亮、雾层说全雾 —— 正是用户报的「雾与墙不协调」。
 			var best := 0.0
 			for k in n:
 				var ddx := wx - lx[k]
 				var ddy := wy - ly[k]
-				var dd := sqrt(ddx * ddx + ddy * ddy)
+				# ① 衰减：地面距离。**先用平方比**，免得给每格都白算一次 sqrt
+				#    （这一层每步要跑 GRID_N × 灯数 次，实测 sqrt 是这里最贵的一步）。
 				var rr := lr[k]
-				if dd >= rr:
+				var d2 := ddx * ddx + ddy * ddy
+				if d2 >= rr * rr:
 					continue
-				if dd > _fan_lookup(fans[k], ddx, ddy, dd):
+				var dd := sqrt(d2)
+				# ② 遮挡：屏幕相对空间的距离（与灯层的遮挡体同空间）
+				var sdy := ddy * Proj.YSQUASH
+				var sd := sqrt(ddx * ddx + sdy * sdy)
+				if sd > _fan_lookup(fans[k], ddx, sdy, sd):
 					continue
 				var v := 1.0 - dd / rr
 				v = v * v * (3.0 - 2.0 * v)     # smoothstep：中心平、边缘柔
@@ -488,9 +536,6 @@ func _rebuild(w: World, dt: float) -> void:
 					if best >= 0.999:
 						break
 			_target[row + i] = best
-			# 同一趟里把"这一格看到的表面有多高"也查出来（世界空间高度场，
-			# 一张 152x120 的查表，比在这里遍历墙便宜得多）。
-			_alt[row + i] = height_at(wx, wy)
 
 	# 照亮立刻生效；没被照到的地方按 REFILL 慢慢合拢
 	var k2 := REFILL * dt
@@ -507,6 +552,9 @@ func _rebuild(w: World, dt: float) -> void:
 			_img.set_pixel(i, j, Color(v2, _alt[row2 + i], 0.0, 1.0))
 	_tex.update(_img)
 	mat.set_shader_parameter("mist_time", w.time)
+	# 这一次重建用的是哪台相机 —— 着色器靠它把"旧快照"挪回世界锚定（见 rebuild_cam）
+	_rebuild_cam = Vector2(camx, camy)
+	mat.set_shader_parameter("rebuild_cam", _rebuild_cam)
 
 
 ## 把「能开雾的灯」收集成扁平数组（避免每格去查字典）。
@@ -523,7 +571,7 @@ func _collect_openers(w: World, lx: PackedFloat32Array, ly: PackedFloat32Array,
 		var rr := rig.src_r[i] * scale
 		if rr < MIN_OPENER_R:
 			continue
-		picks.append([rr, kind, rig.src_x[i], rig.src_y[i], i])
+		picks.append([rr, kind, rig.src_x[i], rig.src_y[i], i, rig.src_z[i]])
 	picks.sort_custom(func(a, b): return float(a[0]) > float(b[0]))
 	for k in mini(picks.size(), OPENER_MAX):
 		var pk: Array = picks[k]
@@ -533,7 +581,11 @@ func _collect_openers(w: World, lx: PackedFloat32Array, ly: PackedFloat32Array,
 		lx.append(cx)
 		ly.append(cy)
 		lr.append(rr2)
-		fans.append(_fan_for("%s:%d" % [str(pk[1]), int(pk[4])], cx, cy, rr2))
+		# 射线扇在屏幕相对空间里投 —— 那里才是遮挡几何的空间
+		# （灯层也是那个空间，见 `LightRig.occluder_rect` 的注释）。
+		# `src_z` 必须一起带上：灯层的灯就是摆在 `y·S − z` 上的。
+		fans.append(_fan_for("%s:%d" % [str(pk[1]), int(pk[4])],
+			cx, cy * Proj.YSQUASH - float(pk[5]), rr2))
 
 
 # ---------------------------------------------------------------- 高度场
@@ -652,51 +704,55 @@ func height_cache_size() -> int:
 
 # ---------------------------------------------------------------- 射线扇
 
-func _fan_for(key: String, cx: float, cy: float, radius: float) -> PackedFloat32Array:
+func _fan_for(key: String, sx: float, sy: float, radius: float) -> PackedFloat32Array:
 	var c: Dictionary = _fan_cache.get(key, {})
 	if not c.is_empty() \
-			and is_equal_approx(float(c["x"]), cx) \
-			and is_equal_approx(float(c["y"]), cy) \
+			and is_equal_approx(float(c["x"]), sx) \
+			and is_equal_approx(float(c["y"]), sy) \
 			and is_equal_approx(float(c["r"]), radius):
 		return c["fan"]
-	var fan := _cast_fan(cx, cy, radius)
-	_fan_cache[key] = {"x": cx, "y": cy, "r": radius, "fan": fan}
+	var fan := _cast_fan(sx, sy, radius)
+	_fan_cache[key] = {"x": sx, "y": sy, "r": radius, "fan": fan}
 	return fan
 
 
 ## 一盏灯朝 RAYS 个方向各投一条射线，得到"这个角度上光最远到哪儿"。
-func _cast_fan(cx: float, cy: float, radius: float) -> PackedFloat32Array:
+##
+## ⚠️ 入参是**屏幕相对空间**的灯位（`x` = 世界 x，`y` = 世界 y·YSQUASH）——
+## 因为矩形来自 `LightRig.occluder_rect()`，灯层的 `LightOccluder2D` 用的就是它。
+## 这个函数（连同它的缓存）**与相机无关**：几何在屏幕相对空间里是静态的，
+## 相机只挪整块画布。所以同一盏灯的扇形可以一直复用。
+func _cast_fan(sx: float, sy: float, radius: float) -> PackedFloat32Array:
 	var fan := PackedFloat32Array()
 	fan.resize(RAYS)
-	var rects := _near_walls(cx, cy, radius)
+	var rects := _near_occluders(sx, sy, radius)
 	for i in RAYS:
 		var a := TAU * float(i) / float(RAYS)
 		var dx := cos(a)
 		var dy := sin(a)
 		var best := radius
-		for r in rects:
-			var t: float = Proj.ray_rect_dist(cx, cy, dx, dy, r[0], r[1], r[2], r[3])
+		for rc in rects:
+			var t := Proj.ray_rect_dist(sx, sy, dx, dy,
+				rc.position.x, rc.position.y, rc.size.x, rc.size.y)
 			if t >= 0.0 and t < best:
 				best = t
 		fan[i] = best
 	return fan
 
 
-## 粗筛：只把（胖过一圈的）包围盒和这盏灯的圆有交集的墙留下。墙只有十几面，
+## 粗筛：只把（包围盒放宽一圈后）和这盏灯有交集的遮挡矩形留下。墙只有十几面，
 ## 但一帧要投十几盏灯的射线，这一步能省掉大半。
-func _near_walls(cx: float, cy: float, radius: float) -> Array:
+func _near_occluders(sx: float, sy: float, radius: float) -> Array:
 	var out := []
-	var r := radius + WALL_PAD
+	var r := radius + OCC_MARGIN
 	for wl in world.walls:
-		var x := float(wl[0]) - WALL_PAD
-		var y := float(wl[1]) - WALL_PAD
-		var ww := float(wl[2]) + WALL_PAD * 2.0
-		var dd := float(wl[3]) + WALL_PAD * 2.0
-		if x > cx + r or x + ww < cx - r:
+		var rc := LightRig.occluder_rect(float(wl[0]), float(wl[1]),
+			float(wl[2]), float(wl[3]), float(wl[4]))
+		if rc.position.x > sx + r or rc.position.x + rc.size.x < sx - r:
 			continue
-		if y > cy + r or y + dd < cy - r:
+		if rc.position.y > sy + r or rc.position.y + rc.size.y < sy - r:
 			continue
-		out.append([x, y, ww, dd])
+		out.append(rc)
 	return out
 
 
@@ -762,6 +818,11 @@ func alt_tex_at(x: float, y: float) -> float:
 
 func grid_target_copy() -> PackedFloat32Array:
 	return _target
+
+
+## 上一次重建用的相机位置（着色器把旧快照挪回世界锚定时用的就是它）
+func rebuild_cam_xy() -> Vector2:
+	return _rebuild_cam
 
 
 func grid_cur_copy() -> PackedFloat32Array:
