@@ -767,6 +767,14 @@ SubViewport，所以窗口怎么变都不影响前面的判定）。
   `cc2cc44`(F11 全屏，442) →
   **`0dfc222`(迷雾高度/体积/翻涌/飘移，466 · 变异 58) —— 已推送，远程复核
   `git ls-remote origin refs/heads/master` = 该哈希**。
+- 之后两轮（都已推送、都已远程复核）：
+  `846e13c`(灯河渡口/全图照亮/不刷怪/留在地图中，528 · 变异 69) →
+  `40262c5`(**墙影的时间锚定 / 开始界面 / 自定义快捷键**，558 · 变异 76 · md5
+  `f18ea9fd96f99d49512f52dba390a13b`)，中间夹一条 memory 收尾提交 `6f17e6d`。
+- ⚠️ 推远端照 skill `git-remote-in-sandbox`：`-F /dev/null` 绕开系统 ssh 配置的属主校验、
+  显式 `-i` + `UserKnownHostsFile`（uid 与 `$HOME` 不一致）、
+  **Bash 必须加 `dangerouslyDisableSandbox`**（读私钥那一层只能申请），
+  推完用 `git ls-remote origin refs/heads/master` **问远程本人**复核（别信本地跟踪 ref）。
 
 ## 已知待办（未做）
 - 设计稿"盲女被吃→化为力量"那一关未做（盲女只在第二关**同行**）；**无升级/存档/传送**。
