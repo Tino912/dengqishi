@@ -905,6 +905,147 @@ MUTATIONS: list[dict] = [
             "★ 标题界面这一轮也把尺寸还原干净了",
         ],
     },
+    # ── 迷雾的高度 / 体积 / 飘移（README 二.19）──────────────────────────
+    {
+        "name": "高度没写进 G 通道（只在 GDScript 里算了算）",
+        # _rebuild 里那张照亮场贴图是"世界 → 屏幕"的唯一通道：
+        # G 通道不写的话，着色器里 alt 恒为 0 —— 高度整条链在 GPU 那侧断掉，
+        # 而 GDScript 侧的 height_at / 高度场断言全部照常绿（它们不经过贴图）。
+        "edits": [
+            (
+                "fog.gd",
+                "\t\t\t_img.set_pixel(i, j, Color(v2, _alt[row2 + i], 0.0, 1.0))",
+                "\t\t\t_img.set_pixel(i, j, Color(v2, 0.0, 0.0, 1.0))",
+            ),
+        ],
+        "expect": [
+            "★ 高度真的从世界进了贴图的 G 通道（不是只在 GDScript 里算了算）",
+            "★ 旋钮 height_fall 真的接在画面上",
+            "★ 雾沉在地面：墙顶剩的雾明显少于墙脚",
+        ],
+    },
+    {
+        "name": "照亮场算了但不上传（贴图不 update）",
+        # 与上一条是**两层**：上一条坏在"写进 `_img`"，这条坏在"把 `_img` 送上 GPU"。
+        # 断言必须两边都覆盖 —— 它读的是 `ImageTexture.get_image()`（真回读），
+        # 所以这条也能红。⚠️ 这条的爆炸半径**故意很大**（雾永远不揭晓），
+        # 报告里会连带红一片；它验的是"接线"，不是"雾好不好看"。
+        "edits": [
+            (
+                "fog.gd",
+                "\t_tex.update(_img)\n",
+                "\tif false:\n\t\t_tex.update(_img)\n",
+            ),
+        ],
+        "expect": [
+            "★ 高度真的从世界进了贴图的 G 通道（不是只在 GDScript 里算了算）",
+        ],
+    },
+    {
+        "name": "着色器无视高度衰减（退回一层平的灰）",        "edits": [
+            (
+                "fog.gd",
+                "\tfloat dens = mist_max * (1.0 - height_fall * alt);",
+                "\tfloat dens = mist_max;",
+            ),
+        ],
+        "expect": [
+            "★ 旋钮 height_fall 真的接在画面上",
+            "★ 雾沉在地面：墙顶剩的雾明显少于墙脚",
+        ],
+        "forbid": [
+            "★ 旋钮 height_parallax 真的接在画面上",
+            "★ 旋钮 height_mix 真的接在画面上",
+        ],
+    },
+    {
+        "name": "去掉高度视差（图案不再锚在地面）",
+        "edits": [
+            (
+                "fog.gd",
+                "\tfloat sink = height_parallax * alt * height_top / view_h;",
+                "\tfloat sink = 0.0;",
+            ),
+        ],
+        "expect": [
+            "★ 旋钮 height_parallax 真的接在画面上",
+        ],
+        "forbid": [
+            "★ 旋钮 height_fall 真的接在画面上",
+            "★ 旋钮 height_mix 真的接在画面上",
+        ],
+    },
+    {
+        "name": "退回单层雾（浮雾层没了）",
+        "edits": [
+            (
+                "fog.gd",
+                "\tfloat n = mix(n1, n2, clamp(alt * height_mix, 0.0, 1.0));",
+                "\tfloat n = n1;",
+            ),
+        ],
+        "expect": [
+            "★ 旋钮 height_mix 真的接在画面上",
+        ],
+        "forbid": [
+            "★ 旋钮 height_fall 真的接在画面上",
+            "★ 旋钮 height_parallax 真的接在画面上",
+        ],
+    },
+    {
+        "name": "屋顶与南立面的判高反了（高度场贴错段）",
+        # _prism_z 的两段（南立面 0→h 渐变 / 屋顶恒 h）对调：
+        # 屋顶带会读到 (y1-wy)*s（比 h 大、被夹到 1），南立面反而恒定 ——
+        # "墙顶那一格就是墙高"与屋顶窗前提这两条直接红。
+        "edits": [
+            (
+                "fog.gd",
+                "\tif wy >= y1 - h / s:\n\t\treturn (y1 - wy) * s\n\tif wy >= y0 - h / s:\n\t\treturn h\n",
+                "\tif wy >= y1 - h / s:\n\t\treturn h\n\tif wy >= y0 - h / s:\n\t\treturn (y1 - wy) * s\n",
+            ),
+        ],
+        "expect": [
+            "★ 墙顶那一格在高度场里就是墙高（不是 0，也不是整屏一个值）",
+            "高度测试窗整块都坐在屋顶上",
+        ],
+    },
+    {
+        "name": "雾不会动（漂速归零）",
+        "edits": [
+            (
+                "fog.gd",
+                "const MIST_SPEED := 0.16",
+                "const MIST_SPEED := 0.0",
+            ),
+        ],
+        "expect": [
+            "★ 雾会飘：翻涌关掉后推进 6 秒",
+            "★ 剂量-反应：漂速减半",
+            "★ 漂速够快：2 秒窗的平均差",
+        ],
+        "forbid": [
+            "★ 雾会翻涌",
+        ],
+    },
+    {
+        "name": "_rebuild 不写 mist_time（雾的时间与世界脱钩）",
+        # 摘掉这一行后，自检里手动 set 的 mist_time 会一直留着 ——
+        # ②d/②e 全都照样绿（它们本来就直接拧 uniform），只有"泵世界之后
+        # uniform 必须跟上来"这条管道断言抓得住它。
+        "edits": [
+            (
+                "fog.gd",
+                "\tmat.set_shader_parameter(\"mist_time\", w.time)\n",
+                "",
+            ),
+        ],
+        "expect": [
+            "★ 雾的时间跟着世界走",
+        ],
+        "forbid": [
+            "★ 雾会飘：翻涌关掉后推进 6 秒",
+        ],
+    },
 ]
 
 

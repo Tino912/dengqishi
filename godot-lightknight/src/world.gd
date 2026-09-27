@@ -615,6 +615,16 @@ func fog_density_at(x: float, y: float) -> float:
 	return 1.0 - fog_reveal_at(x, y)
 
 
+## 世界坐标上"可见表面多高 / 雾顶"（0 = 地面，1 = 到雾顶）。烘出来的真值。
+func fog_height_at(x: float, y: float) -> float:
+	return 0.0 if fog == null else fog.height_at(x, y)
+
+
+## 屏幕上那一格实际拿到的表面高度 —— 与 `fog_height_at` 是两层，见 fog.gd 的说明。
+func fog_alt_at(x: float, y: float) -> float:
+	return 0.0 if fog == null else fog.alt_at(x, y)
+
+
 ## 暴击概率（灯芯·锐 + 词条「锐」）
 func crit_chance() -> float:
 	return minf(0.75, float(boon("crit")) * 0.12 + float(affix_lv("crit")) * 0.08)

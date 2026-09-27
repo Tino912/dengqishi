@@ -94,6 +94,74 @@ const MIST_MAX := 0.45
 ## 清关时"雾散尽"用的时间（秒）
 const FADE_T := 1.2
 
+# ================================================================ 高度与体积
+#
+# 需求：「迷雾还只是一层会飘的灰，没有高度和体积」。
+#
+# 原实现是一张**平的**全屏噪声：浓度只由「被照亮多少」决定，跟场景里任何东西的
+# 高低都没关系 —— 所以一面 64px 的墙和它脚前的地面，被糊上**一样厚**的雾，
+# 看上去就是一层挡在镜头前的灰纱，不是"空气里悬着的东西"。
+#
+# 这一版给雾装上三个互相独立的性质，每个都留了一个**只乘 alt** 的旋钮：
+#
+#   ① 高度：`alt` 是"这一像素看到的表面有多高"。雾沉在地面，
+#      于是墙顶/石柱顶/灯塔顶上剩的雾明显更薄 —— 高的东西从雾里探出来。
+#   ② 体积：雾是**两层**（贴地雾 + 浮雾），各自有自己的尺度与飘速；
+#      表面越高，看到的越多是浮雾。再叠一层"图案锚在地面"的视差
+#      （`sink`），所以同一片雾在墙面上会顺着高度滑动。
+#   ③ 翻涌：噪声在**垂直**方向也动（两个不同频率的慢 sin），
+#      不再只是"整块往东北平移"。
+#
+# ⚠️ 三个高度旋钮（height_fall / height_mix / height_parallax）都是 `× alt` 的形式，
+# 于是**纯地面（alt = 0）上无论怎么拧，画面逐字节不变**。这不是巧合，是刻意设计的：
+# 自检要证明"高度真的接在画面上"就得让旋钮转一下，而"转了但别处也该不动"这件事
+# 必须有一个**精确**对照 —— alt = 0 就是这个对照。（同一个理由见类头 ②：量哪一层就把别层冻住。）
+
+## 雾的"顶"（世界像素）。`alt = min(1, 表面高度 / FOG_TOP)`。
+## 取 110 的理由：关内的墙大多 46~64 高（alt 0.42~0.58 → 雾只剩 5~6 成），
+## 边界墙 64、石柱 66（0.6），而灯塔 200 会被夹到 1（塔身整根从雾里露出来）。
+## 这是量出来的观感，不是拍的 —— 见 README 二.19。
+const FOG_TOP := 110.0
+
+## 高度场的格子边长（世界像素）。16 与照亮场同分辨率：雾本来就糊，再细是浪费。
+const HCELL := 16.0
+## 高度场往北多留的行数。一面墙的**屋顶**在屏幕上盖住的是它**北边**那条地面带
+## （屋顶上边比地面足迹高 h/YSQUASH 个世界像素），不留这一段的话，地图最北边那圈
+## 边界墙的屋顶会缺一块高度。FOG_TOP/YSQUASH/HCELL ≈ 11.1，取 12 行。
+const H_PAD_ROWS := 12
+
+## 越高越薄：alt = 1 时只剩 (1 - HEIGHT_FALL) 的雾。0.85 → 灯塔顶只剩 15%。
+## 这一条是**物理**的（雾沉在下面），所以取值不需要商量 —— 实测屋顶的雾只剩地面的
+## 0.637（= 1 − 0.85×0.418，与公式逐位吻合，见 README 二.19）。
+const HEIGHT_FALL := 0.85
+## 越高的表面，越多看到"浮雾"。`clamp(alt * HEIGHT_MIX, 0, 1)` 就是"多少比例是浮雾"。
+##
+## 1.2 → 46 高的墙一半浮雾、66 高的石柱 79%、到 **92px** 高才完全泡在浮雾里
+## （比地图上除灯塔外的任何东西都高，所以全程不会顶到 clamp 的上限）。
+## 这是**取过值**的：0.8 时那面墙上只有 1/3 是浮雾 —— 自检里"分层"那条旋钮
+## 量出来只有 0.0038（三个旋钮里最弱，比"浓淡"那条弱 4 倍），肉眼也读不出"换了一层雾"。
+## 1.2 之后到 0.0057 左右，与"视差"那条同量级（见 README 二.19 的剂量表）。
+const HEIGHT_MIX := 1.20
+## 图案锚在地面的视差强度（1.0 = 物理正确：表面高 z，图案就按 z 像素在屏幕上错开）
+const HEIGHT_PARALLAX := 1.0
+## 垂直翻涌强度
+const MIST_BILLOW := 1.0
+
+## 雾絮的尺度与漂速。**必须在这里也写一份并显式下发**（`_ready()` 里），
+## 不能只靠着色器源码里的默认值 —— `ShaderMaterial.get_shader_parameter()` 对
+## "从没被 set 过"的参数返回的是 **null**，不是着色器里那个默认值。
+## 后果很隐蔽：读回来是 null（`float(null)` 直接报 "Nonexistent 'float' constructor"），
+## 而且任何"先读出来、拧一下、再还原"的自检写法都会悄悄失效。
+const MIST_SCALE := 13.0
+## 漂速（噪声单位/秒）。换算到屏幕像素：贴地雾 ≈ 9px/s 向东北、浮雾 ≈ 23px/s 向东南
+## （两层方向相反 → 看得出"不是一整块板在平移"）。
+## **这个数是量过两版的**：0.022（≈1.2px/s）时基本读不出"在动"——盯着看十几秒
+## 才挪一个雾胞（55px），于是有了需求「顺便让迷雾可以动」；0.16 之后 2 秒就能看出
+## 雾纹明显换了位置（自检 ②e：2 秒窗的平均差 0.0026 → 0.0133，动了的像素 0.819 → 0.951）。
+## ⚠️ 它与着色器里的默认值必须**两处同步**（见上面那条注释：`_ready()` 会用它
+## 显式覆盖 uniform，所以真正生效的永远是**这里**）。
+const MIST_SPEED := 0.16
+
 ## 每类灯"开雾半径"相对它自己光照半径的系数。
 ## 玩家灯 <1：让雾在光亮区的**边缘**留一圈，看得见"雾退到哪儿为止"。
 ## 敌人 <1：它那圈自光本身就得比"照亮地面"小一档，是"雾里透出一点亮"。
@@ -111,7 +179,17 @@ uniform vec4 mist_hi : source_color = vec4(0.33, 0.38, 0.48, 1.0);
 uniform float mist_max : hint_range(0.0, 1.0) = 0.45;
 uniform float mist_time = 0.0;
 uniform float mist_scale = 13.0;
-uniform float mist_speed = 0.022;
+uniform float mist_speed = 0.16;
+
+// ── 高度 / 体积的旋钮 ──
+// 前三个**只乘 alt**，所以纯地面（alt = 0）上无论怎么拧，画面逐字节不变 ——
+// 自检里那三条"精确对照"就是这么来的（见 fog.gd 常量区的说明）。
+uniform float height_fall : hint_range(0.0, 1.0) = 0.85;
+uniform float height_mix : hint_range(0.0, 1.0) = 0.80;
+uniform float height_parallax : hint_range(0.0, 2.0) = 1.0;
+uniform float mist_billow : hint_range(0.0, 2.0) = 1.0;
+uniform float height_top = 110.0;   // 世界像素：alt = min(1, 表面高度 / height_top)
+uniform float view_h = 720.0;
 
 float h21(vec2 p) {
 	p = fract(p * vec2(0.1031, 0.1030));
@@ -129,16 +207,42 @@ float vnoise(vec2 p) {
 }
 
 void fragment() {
-	// reveal: 1 = 被照亮（没有雾），0 = 没被照到（雾最浓）
-	float reveal = texture(reveal_tex, SCREEN_UV).r;
-	// 三个倍频叠出"雾絮"：只有两个倍频时，整屏只有十来个噪声格，
-	// 看着像一块灰板（第一版就是这样）；第三个倍频给出细一点的絮状结构。
-	// 整片缓慢往东北飘。
-	vec2 q = SCREEN_UV * vec2(mist_scale * 1.78, mist_scale);
-	q += vec2(mist_time * mist_speed, mist_time * mist_speed * 0.55);
-	float n = vnoise(q) * 0.54 + vnoise(q * 2.3 + 11.0) * 0.31 + vnoise(q * 5.1 + 31.0) * 0.15;
+	// reveal_tex 两个通道都有用：R = 被照亮多少（0 = 全雾），
+	// G = **这一像素看到的表面有多高**（0 = 地面，1 = 到雾顶）。
+	vec2 rp = texture(reveal_tex, SCREEN_UV).rg;
+	float reveal = rp.r;
+	float alt = clamp(rp.g, 0.0, 1.0);
 
-	float a = mist_max * clamp(1.0 - reveal, 0.0, 1.0);
+	// 图案锚在**地面**上：表面越高，这一像素看到的雾絮越是"它脚下那片地面"的。
+	// 于是同一片雾在墙面上会顺着高度滑开 —— 这是"雾是个体积、不是一层纱"最直接的线索。
+	// alt = 0 时 sink 恰好为 0，所以平地上这个旋钮转了也等于没转（自检拿它当精确对照）。
+	float sink = height_parallax * alt * height_top / view_h;
+
+	// 贴地雾：细、慢，主要往东北飘；另加一点缓慢的**垂直翻涌**
+	//
+	// ⚠️ 翻涌那两个系数（0.70 / 1.00）是**量出来的**，不是拍的：它们乘上 `mist_scale`
+	// 就是"雾纹在屏幕上上下挪多少像素"—— `0.70 / 13 * 720 ≈ 39px`（一个周期 37 秒）。
+	// 第一版取 0.35（≈19px），自检里"推进时间后动了的像素"只有 9.6%，
+	// 而且**肉眼基本看不出来**在翻涌；翻倍到 39px / 58px 之后才读得出来"雾是一团在呼吸的东西"。
+	// 剂量-反应表见 README 二.19（`mist_billow` 拧 0 / 0.5 / 1.0 的量法）。
+	vec2 q1 = (SCREEN_UV + vec2(0.0, sink)) * vec2(mist_scale * 1.78, mist_scale);
+	q1 += vec2(mist_time * mist_speed, mist_time * mist_speed * 0.55);
+	q1.y += sin(mist_time * 0.17) * 0.70 * mist_billow;
+	float n1 = vnoise(q1) * 0.54 + vnoise(q1 * 2.3 + 11.0) * 0.31
+		+ vnoise(q1 * 5.1 + 31.0) * 0.15;
+
+	// 浮雾：更大一团、飘得更快、垂直分量明显 —— 与贴地雾不是同一张图
+	vec2 q2 = (SCREEN_UV + vec2(0.0, sink)) * vec2(mist_scale * 0.62 * 1.78, mist_scale * 0.62);
+	q2 += vec2(mist_time * mist_speed * 1.6, -mist_time * mist_speed * 0.9);
+	q2.y += sin(mist_time * 0.11 + 1.7) * 1.00 * mist_billow;
+	float n2 = vnoise(q2) * 0.62 + vnoise(q2 * 2.7 + 7.0) * 0.38;
+
+	// 看到的表面越高，越少"贴地雾"、越多"浮雾"（这就是"分层"）
+	float n = mix(n1, n2, clamp(alt * height_mix, 0.0, 1.0));
+
+	// 总量：雾沉在地面，越高越薄；到雾顶只剩 (1 - height_fall)
+	float dens = mist_max * (1.0 - height_fall * alt);
+	float a = dens * clamp(1.0 - reveal, 0.0, 1.0);
 	// 噪声不只改浓度，也改"絮"的厚薄：低到 0.5、高到 1.25，才有飘动感
 	a *= mix(0.50, 1.25, n);
 	vec3 col = mix(mist_lo.rgb, mist_hi.rgb, n * n);
@@ -161,6 +265,14 @@ var _step_y := 1.0
 var _acc := 0.0
 var _rebuilds := 0
 var _openers := []
+## 每个屏幕格子"看到的表面有多高"（0..1），写进照亮场的 G 通道
+var _alt := PackedFloat32Array()
+## 世界空间高度场（一格 HCELL 世界像素）。**只烘一次**：墙和道具是静态的。
+var _hgt := PackedFloat32Array()
+var _hgw := 0
+var _hgh := 0
+## 高度场第 0 行对应的世界 y（是负的 —— 往北多留了 H_PAD_ROWS 行）
+var _hg_oy := 0.0
 ## 射线扇缓存：同一盏灯（同一个位置、同一个半径）不必每帧重投
 var _fan_cache := {}
 var _mist := Color(0.16, 0.19, 0.27)
@@ -174,6 +286,7 @@ func _ready() -> void:
 	_step_y = float(Proj.VIEW_H) / float(GRID_H)
 	_target.resize(GRID_N)
 	_cur.resize(GRID_N)
+	_alt.resize(GRID_N)
 	# 起始状态：整屏都是雾（`_cur` = 0 = 揭示度 0 = 雾最浓）
 	_img = Image.create(GRID_W, GRID_H, false, Image.FORMAT_RGBA8)
 	_img.fill(Color(0.0, 0.0, 0.0, 1.0))
@@ -184,6 +297,16 @@ func _ready() -> void:
 	mat.shader = sh
 	mat.set_shader_parameter("reveal_tex", _tex)
 	mat.set_shader_parameter("mist_max", MIST_MAX)
+	mat.set_shader_parameter("height_fall", HEIGHT_FALL)
+	mat.set_shader_parameter("height_mix", HEIGHT_MIX)
+	mat.set_shader_parameter("height_parallax", HEIGHT_PARALLAX)
+	mat.set_shader_parameter("mist_billow", MIST_BILLOW)
+	mat.set_shader_parameter("height_top", FOG_TOP)
+	mat.set_shader_parameter("view_h", float(Proj.VIEW_H))
+	# 这三个原本"只靠着色器默认值"（见 MIST_SCALE 的注释：不显式下发的话读回来是 null）
+	mat.set_shader_parameter("mist_scale", MIST_SCALE)
+	mat.set_shader_parameter("mist_speed", MIST_SPEED)
+	mat.set_shader_parameter("mist_time", 0.0)      # 真正的值每 0.05s 由 `_rebuild()` 写
 	material = mat
 
 
@@ -193,6 +316,8 @@ func setup(level: Dictionary) -> void:
 	_mist = Color.html(str(pal.get("mist", "#2b3448")))
 	mat.set_shader_parameter("mist_lo", _mist)
 	mat.set_shader_parameter("mist_hi", _mist.lerp(Color(1.0, 1.0, 1.0), 0.38))
+	# 高度场在这里烘一次。**每关一次**，不是每帧 —— 墙与道具都是静态的。
+	_bake_heights(level)
 
 
 func set_enabled(on: bool) -> void:
@@ -311,6 +436,9 @@ func _rebuild(w: World, dt: float) -> void:
 					if best >= 0.999:
 						break
 			_target[row + i] = best
+			# 同一趟里把"这一格看到的表面有多高"也查出来（世界空间高度场，
+			# 一张 152x120 的查表，比在这里遍历墙便宜得多）。
+			_alt[row + i] = height_at(wx, wy)
 
 	# 照亮立刻生效；没被照到的地方按 REFILL 慢慢合拢
 	var k2 := REFILL * dt
@@ -323,7 +451,8 @@ func _rebuild(w: World, dt: float) -> void:
 		var row2 := j * GRID_W
 		for i in GRID_W:
 			var v2 := _cur[row2 + i]
-			_img.set_pixel(i, j, Color(v2, v2, v2, 1.0))
+			# R = 照亮（揭雾），G = 表面高度（雾的高度/体积就靠它）
+			_img.set_pixel(i, j, Color(v2, _alt[row2 + i], 0.0, 1.0))
 	_tex.update(_img)
 	mat.set_shader_parameter("mist_time", w.time)
 
@@ -353,6 +482,120 @@ func _collect_openers(w: World, lx: PackedFloat32Array, ly: PackedFloat32Array,
 		ly.append(cy)
 		lr.append(rr2)
 		fans.append(_fan_for("%s:%d" % [str(pk[1]), int(pk[4])], cx, cy, rr2))
+
+
+# ---------------------------------------------------------------- 高度场
+
+## 世界空间高度场的缓存。同一关会被反复重建（自检里 `start_level()` 调很多次），
+## 而墙和道具是静态的 —— 烘一次就够。键 = 关卡数据本身，值 = [格子, 宽, 高, 原点 y]。
+static var _hcells := {}
+
+
+## 把这一关的"高东西"烘成一张世界空间高度场：每格存
+## **这一格地面深度上可见表面有多高 / FOG_TOP**（0 = 地面，1 = 到雾顶）。
+##
+## 为什么按"地面深度"而不是按屏幕：投影是
+##     屏幕 y = (世界 y - 相机 y) * YSQUASH - z
+## 一个屏幕像素对应的是**一条沿高度斜下去的线**，而"地面深度"是它落在 z=0 上的那个点。
+## 于是"这一像素看到的表面有多高"变成了一个只跟世界有关的量 ——
+## 可以**烘一次、与相机无关、与帧无关**。这也是它不放进 `_rebuild()` 的原因。
+func _bake_heights(level: Dictionary) -> void:
+	var lw := float(level.get("w", 2400.0))
+	var lh := float(level.get("h", 1700.0))
+	var key := "%s|%s|%s|%s" % [str(lw), str(lh), str(level.get("walls", [])),
+		str(level.get("props", []))]
+	var hit: Array = _hcells.get(key, [])
+	if hit.is_empty():
+		var gw := int(ceil(lw / HCELL)) + 2
+		var gh := int(ceil(lh / HCELL)) + H_PAD_ROWS + 2
+		var oy := -float(H_PAD_ROWS) * HCELL
+		var prisms := _prisms(level)
+		var grid := PackedFloat32Array()
+		grid.resize(gw * gh)
+		grid.fill(0.0)
+		for j in gh:
+			var wy := oy + (float(j) + 0.5) * HCELL
+			var row := j * gw
+			for i2 in gw:
+				var wx := (float(i2) + 0.5) * HCELL
+				var z := 0.0
+				for pr in prisms:
+					var zz := _prism_z(pr, wx, wy)
+					if zz > z:
+						z = zz
+				grid[row + i2] = minf(1.0, z / FOG_TOP)
+		hit = [grid, gw, gh, oy]
+		_hcells[key] = hit
+	_hgt = hit[0]
+	_hgw = int(hit[1])
+	_hgh = int(hit[2])
+	_hg_oy = float(hit[3])
+
+
+## 静态的"高东西" → 一根根长方体，用 [x0, y0, x1, y1, 高] 表示。
+## 墙本来就是长方体（`Art.wall()` 画的正是南立面 + 屋顶）；道具（灯塔 / 石柱 /
+## 雕像 / 树…）按半径当方足印 —— 雾本来就糊，圆与方在 16px 的格子上看不出差别。
+func _prisms(level: Dictionary) -> Array:
+	var out := []
+	for wl in level.get("walls", []):
+		out.append([float(wl[0]), float(wl[1]), float(wl[0]) + float(wl[2]),
+			float(wl[1]) + float(wl[3]), float(wl[4])])
+	var table: Dictionary = Content.PROP_TABLE
+	for pr in level.get("props", []):
+		var info: Dictionary = table.get(str(pr.get("kind", "")), {})
+		if info.is_empty():
+			continue
+		var r := float(info.get("r", 12.0))
+		var cx := float(pr.get("x", 0.0))
+		var cy := float(pr.get("y", 0.0))
+		out.append([cx - r, cy - r, cx + r, cy + r, float(info.get("h", 30.0))])
+	return out
+
+
+## 一根长方体在"地面深度 wy"处的可见表面高度。分两段，与 `Art.wall()` 画出来的
+## 形状一一对应：
+##   南立面：地面深度 [y1 - h/S, y1]，高度从 0 线性升到 h
+##   屋顶：  再往北 h/S，即 [y0 - h/S, y1 - h/S]，高度恒为 h
+## ⚠️ 屋顶落在**比墙的足迹更北**的地方 —— 这是投影的必然（墙往上长，在画面上
+## 盖住的是它北边那条地面带），也正因为它会跑到 y<0，`H_PAD_ROWS` 那一段留白才必要。
+func _prism_z(pr: Array, wx: float, wy: float) -> float:
+	if wx < pr[0] or wx > pr[2]:
+		return 0.0
+	var h := float(pr[4])
+	var y0 := float(pr[1])
+	var y1 := float(pr[3])
+	var s := Proj.YSQUASH
+	if wy > y1:
+		return 0.0
+	if wy >= y1 - h / s:
+		return (y1 - wy) * s
+	if wy >= y0 - h / s:
+		return h
+	return 0.0
+
+
+## 世界坐标上"可见表面多高 / FOG_TOP"（0 = 地面，1 = 到雾顶）。查烘好的那张表。
+func height_at(x: float, y: float) -> float:
+	if _hgt.is_empty():
+		return 0.0
+	var i := int(floor(x / HCELL))
+	var j := int(floor((y - _hg_oy) / HCELL))
+	if i < 0 or j < 0 or i >= _hgw or j >= _hgh:
+		return 0.0
+	return _hgt[j * _hgw + i]
+
+
+func fog_top() -> float:
+	return FOG_TOP
+
+
+func height_cells() -> Vector2i:
+	return Vector2i(_hgw, _hgh)
+
+
+## 高度场缓存里有几关 —— 自检用它证明"烘一次、复用"这件事真的发生了。
+func height_cache_size() -> int:
+	return _hcells.size()
 
 
 # ---------------------------------------------------------------- 射线扇
@@ -439,6 +682,30 @@ func target_at(x: float, y: float) -> float:
 func reveal_at(x: float, y: float) -> float:
 	var g := grid_of(x, y)
 	return _cur[g.y * GRID_W + g.x]
+
+
+## 这一格"看到的表面有多高"（0..1）—— 也就是写进照亮场 G 通道的那个值。
+## 自检用它核对"高度真的从世界进了贴图"（与 `height_at` 是两层：
+## 前者是世界空间的真值，后者是屏幕上那一格实际拿到的数）。
+func alt_at(x: float, y: float) -> float:
+	var g := grid_of(x, y)
+	return _alt[g.y * GRID_W + g.x]
+
+
+## **贴图里**那一格的 G 通道（0..1）。与 `alt_at()` 是两回事：那个读的是 GDScript
+## 里的 `_alt` 数组，**已经算过但还没写进 GPU 也会照常返回真值**。
+##
+## ⚠️ 这条是**变异测试逼出来的**：原来那条"高度真的进了 G 通道"的断言用的就是
+## `alt_at()` —— 于是把 `_img.set_pixel(...)` 的 G 通道改成恒 0（高度整条链在 GPU
+## 那侧断掉）之后，它照样绿。断言**问错了地方**：它问的是"GDScript 算没算"，
+## 而不是"贴图里有没有"。现在这里真的去读 `_img` 的像素。
+func alt_tex_at(x: float, y: float) -> float:
+	var g := grid_of(x, y)
+	# 向**渲染服务器**要回贴图内容（`ImageTexture.get_image()` 是真的回读），
+	# 读不到才退回 CPU 侧的 `_img` —— 于是"算了但没 `update()` 上去"也会被抓住。
+	var back := _tex.get_image()
+	var im: Image = back if back != null else _img
+	return im.get_pixel(g.x, g.y).g
 
 
 func grid_target_copy() -> PackedFloat32Array:

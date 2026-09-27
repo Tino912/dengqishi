@@ -69,37 +69,60 @@ func _run() -> void:
 	# 每一段都必须 await。GDScript 的协程在第一个 await 处就会让出控制权；
 	# 如果这里漏掉 await，后面的段落会和它并发推进——断言前提错位、
 	# 截图也会拍成"别人已经改过的世界"。
-	await _check_boot()
-	await _section_assets()
-	await _section_move()
-	await _section_combat()
-	await _section_light_occlusion()
-	await _section_weapons_skills()
-	await _section_enemy_ai()
-	await _section_waves_boss()
-	await _section_drops_death()
-	await _section_bot_playthrough()
-	await _section_level2()
-	await _section_bag_chest()
-	await _section_shop()
-	await _section_layout()
+	# 全部走 `_sec()`（而不是直接 await）—— 它只是"跑完记一笔"，见 `_sec` 的注释。
+	await _sec(_check_boot)
+	await _sec(_section_assets)
+	await _sec(_section_move)
+	await _sec(_section_combat)
+	await _sec(_section_light_occlusion)
+	await _sec(_section_weapons_skills)
+	await _sec(_section_enemy_ai)
+	await _sec(_section_waves_boss)
+	await _sec(_section_drops_death)
+	await _sec(_section_bot_playthrough)
+	await _sec(_section_level2)
+	await _sec(_section_bag_chest)
+	await _sec(_section_shop)
+	await _sec(_section_layout)
 	# 元素 / 攻击发光 / 第三关 / 三图风格 —— 都排在最后：
 	# 命中火花与粒子要吃 `_rng`，插在中间会把前面那些依赖位置与随机的段落整体挪掉。
-	await _section_elements()
-	await _section_attack_light()
-	await _section_level3_art()
+	await _sec(_section_elements)
+	await _sec(_section_attack_light)
+	await _sec(_section_level3_art)
 	# 迷雾 / 夜色排在**最末**：这一段会重建世界、搬动玩家、还会把这一关的雾放掉。
-	await _section_fog_night()
-	await _section_pose_anim()
+	await _sec(_section_fog_night)
+	await _sec(_section_pose_anim)
 	# 挥击范围线 vs 判定。**同样排在最后**：它也要重建世界（理由同上）。
-	await _section_swing_cone()
+	await _sec(_section_swing_cone)
 	# 伤害数字的可读性（不重建世界，接着上一段的世界用）
-	await _section_text_readability()
+	await _sec(_section_text_readability)
 	# F11 全屏。**排在最末**：这一段会真去切真实窗口（全屏 ↔ 窗口），
 	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
 	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
-	await _section_fullscreen()
+	await _sec(_section_fullscreen)
 	_finish()
+
+
+## 段数。**加了新的 `_sec(...)` 就要 +1** —— 它是下面那条"段哨兵"断言的分母。
+const SECTIONS := 22
+## 已经**完整跑完**的段数。
+var _sections_done := 0
+
+
+## 跑一段，跑完记一笔。
+##
+## ⚠️ 为什么需要它（实测过一次，代价是一轮"看起来全绿其实少跑了 18 条断言"）：
+## **GDScript 的运行时错误只中断"出错的那个函数"**，调用它的 `_run()` 会若无其事地
+## 接着 await 下一段 —— 于是被中断那段剩下的断言**根本没被登记**，
+## 而 `_finish()` 里 `checks_all_pass = 通过数 == 总数` 依然为真，
+## 报告上写着"438/438 全部通过"（那一轮真的少了 18 条：迷雾段的墙面/回填/翻涌整段没了）。
+## 症状与"清关面板没点掉"那种成片变红**正好相反**：它是**悄悄地变少**。
+##
+## 所以最后必须有一条**绝对**断言钉住"段数"，它才不会被截断一起吃掉；
+## 单靠 `checks_all_pass` 是不够的 —— 那是个相对量，"少跑"在它眼里不是失败。
+func _sec(f: Callable) -> void:
+	await f.call()
+	_sections_done += 1
 
 
 # ================================================================ 基础设施
@@ -388,6 +411,30 @@ func _drain_dialogue(max_taps := 60) -> bool:
 ## 世界坐标 → 屏幕像素（用这一帧实际的绘制相机）
 func _screen_of(w: World, x: float, y: float) -> Vector2:
 	return Vector2(Proj.sx(x, w.draw_cam.x), Proj.sy(y, 0.0, w.draw_cam.y))
+
+
+## 屏幕矩形 → 世界**地面**坐标（`_screen_of()` 的逆；投影是仿射的，所以能反解）
+func _world_of(w: World, sx: float, sy: float) -> Vector2:
+	return Vector2(sx - Proj.VIEW_W * 0.5 + w.draw_cam.x,
+		(sy - Proj.VIEW_H * 0.5) / Proj.YSQUASH + w.draw_cam.y)
+
+
+## 一个屏幕窗里，所有采样点落在的**照亮场格子**里存的高度场值的 [最小, 最大]。
+##
+## 为什么用格子值（`fog.alt_at`）而不是世界真值（`fog_height_at`）：**着色器读的是格子**。
+## 照亮场是**按屏幕 16px** 采的，于是"窗外 18px 处有一面墙"这种事情会让窗边那个像素
+## 落在"格子中心已经出界、但插值还混着墙"的格里 —— 真值查询会拍胸脯说 0，
+## 而画面并不逐字节不变（实测踩到过：墙脚窗差 2.8e-05）。查格子才是查**着色器真正读到的那个数**。
+func _window_alt_range(w: World, r: Rect2i, step := 2) -> Vector2:
+	var lo := 1.0e9
+	var hi := -1.0e9
+	for y in range(0, r.size.y, step):
+		for x in range(0, r.size.x, step):
+			var wp := _world_of(w, float(r.position.x + x), float(r.position.y + y))
+			var a := w.fog.alt_at(wp.x, wp.y)
+			lo = minf(lo, a)
+			hi = maxf(hi, a)
+	return Vector2(lo, hi)
 
 
 ## 取一块 patch 的平均亮度（Rec.709）
@@ -3050,6 +3097,363 @@ func _section_fog_night() -> void:
 	_write_png(img_fog, "20-fog-on")
 	_write_png(img_nofog, "21-fog-off")
 
+	# ── ②c 高度：雾沉在地面，高的东西从雾里探出来 ──
+	#
+	# 需求原话：「迷雾还只是一层会飘的灰，没有高度和体积」。
+	#
+	# 判据全部用**冻结世界、只拧一个 uniform**做前后对照。诀窍是三个高度旋钮都写成
+	# `× alt` 的形式，所以 alt = 0 的纯地面上无论怎么拧都**逐字节不变** ——
+	# 于是"墙脚那块必须一模一样"是一条**精确**对照，不靠阈值、不会擦边过。
+	#
+	# ⚠️ 这一段**不调 `_pump`**，只改 uniform + 等渲染帧。`_pump` 会推进 `world.time`，
+	# 而雾的噪声相位就取自它 —— 两边时间不同的话，"两张图不一样"到底是旋钮造成的
+	# 还是时间造成的就分不清了。（同一条道理见 `_settle` 的注释。）
+	var fmat := w.fog.mat
+	var wall_h := 46.0
+	var roof_w := Vector2(450.0, 950.0)        # 一面 46 高墙的屋顶（朝上、离地 46）
+	var floor_w := Vector2(450.0, 1330.0)      # 同一面墙南边 50px 的平地
+	var roof_s := _screen_of(w, roof_w.x, roof_w.y)
+	var floor_s := _screen_of(w, floor_w.x, floor_w.y)
+	# ── 采样窗为什么长这样（两个方向都被场景**算过**，不是随手取的）──
+	#
+	# ⚠️ 纵向**不对称、而且往下多取**：屋顶在屏幕上是**往下铺**的 —— 屋顶北沿落在
+	#    地面深度 y0 − h/S、南沿落在 y1 − h/S，于是这面墙的屋顶带子整个在采样点的
+	#    **下方**（从 −27px 起，往下 186px）。往上多取会吃到地板；往下多取会吃到南立面
+	#    （那里 alt 从 46 渐变到 0，不是恒定的屋顶）。
+	# ⚠️ 窗要**够大**：雾纹的相关长度 ≈ 55px（`mist_scale = 13` → 一格 55px）。
+	#    先前用 40×24 的窗 —— 那连**一个**独立花纹都装不满，量出来其实是**单个样本**，
+	#    随全局噪声相位能差 **2.4 倍**（实测同一对图 0.0130 vs 0.0053，只因为翻涌的
+	#    相位换了一下）。"擦着阈值过"就是这么来的。48×160 ≈ 3 个独立花纹才够。
+	# ⚠️ 地面那半**必须躲开一切非平地的格子**：`alt` 从 0 渐变的南立面会让
+	#    "逐字节不变"失效。第一版把地面窗开了 120 高，尾巴正好蹭到**南边界墙**
+	#    （它的屋顶带落在 wy ∈ [1640 − 64/0.62, …] = [1536.8, …]，换算到屏幕是 y ≈ 619）
+	#    —— 于是"逐字节不变"变成 2.8e-05，看着像"公式漏了 alt"。
+	#    现在只取 90 高（到 wy ≈ 1487），离 1536.8 还有 50 个世界像素（≈3 格）。
+	#    两个窗都**再断言一次前提**（窗里每一格的高度场分别是 0 / 墙高），
+	#    这样下次地图一改，红的是"前提不成立"而不是让人去猜"哪个旋钮没接上"。
+	var roof_r := Rect2i(int(roof_s.x) - 24, int(roof_s.y) - 10, 48, 160)
+	var floor_r := Rect2i(int(floor_s.x) - 24, int(floor_s.y) + 8, 48, 90)
+	var roof_alt_rng := _window_alt_range(w, roof_r)
+	var floor_alt_rng := _window_alt_range(w, floor_r)
+	_num("高度测试点·屋顶在屏幕上的 x", roof_s.x)
+	_num("高度测试点·屋顶在屏幕上的 y", roof_s.y)
+	_num("高度测试点·墙脚在屏幕上的 x", floor_s.x)
+	_num("高度测试点·墙脚在屏幕上的 y", floor_s.y)
+	_num("高度测试窗·屋顶窗里最小的高度场值", roof_alt_rng.x)
+	_num("高度测试窗·屋顶窗里最大的高度场值", roof_alt_rng.y)
+	_num("高度测试窗·墙脚窗里最大的高度场值", floor_alt_rng.y)
+	_ok("高度测试窗整块都坐在屋顶上（窗里每一格的高度场都 ≈ 墙高）",
+		roof_alt_rng.x > wall_h / Fog.FOG_TOP - 0.05
+		and roof_alt_rng.y < wall_h / Fog.FOG_TOP + 0.05,
+		"窗内高度场 %.3f ~ %.3f（墙高 %.3f）" % [roof_alt_rng.x, roof_alt_rng.y,
+			wall_h / Fog.FOG_TOP])
+	_ok("★ 对照窗整块都是平地（窗里每一格的高度场都**恰好**是 0 —— 这是下面「逐字节不变」的前提）",
+		floor_alt_rng.y < 0.001, "窗内最大高度场 %.5f" % floor_alt_rng.y)
+	var alt_roof := w.fog_height_at(roof_w.x, roof_w.y)
+	var alt_floor := w.fog_height_at(floor_w.x, floor_w.y)
+	# ⚠️ 必须读**贴图**（`fog.alt_tex_at`），不能读 GDScript 里的 `_alt` 数组：
+	# 数组是"算过"、贴图是"送进 GPU 了"。变异测试实测过这条差别 —— 把
+	# `_img.set_pixel()` 的 G 通道改成恒 0，用数组读的版本照样绿（假证人）。
+	var alt_roof_grid := w.fog.alt_tex_at(roof_w.x, roof_w.y)
+	var rev_roof := w.fog_reveal_at(roof_w.x, roof_w.y)
+	var rev_floor := w.fog_reveal_at(floor_w.x, floor_w.y)
+	_num("高度场·屋顶那一格", alt_roof)
+	_num("高度场·墙脚南边的平地", alt_floor)
+	_num("照亮场 G 通道·屋顶那一格", alt_roof_grid)
+	_num("高度测试点·屋顶的揭示度", rev_roof)
+	_num("高度测试点·墙脚的揭示度", rev_floor)
+	report["cases"]["fog"]["height"] = {
+		"fog_top": Fog.FOG_TOP, "wall_h": wall_h, "hcell": Fog.HCELL,
+		"alt_roof": snappedf(alt_roof, 0.0001), "alt_floor": alt_floor,
+		"alt_roof_grid": snappedf(alt_roof_grid, 0.0001),
+		"cells": [w.fog.height_cells().x, w.fog.height_cells().y],
+		"cache": w.fog.height_cache_size(),
+	}
+	_ok("高度场建好了（格子数是整数、缓存里有这一关）",
+		w.fog.height_cells().x > 0 and w.fog.height_cells().y > 0
+		and w.fog.height_cache_size() >= 1,
+		"%dx%d 格　缓存 %d 关" % [w.fog.height_cells().x, w.fog.height_cells().y,
+			w.fog.height_cache_size()])
+	_ok("★ 墙顶那一格在高度场里就是墙高（不是 0，也不是整屏一个值）",
+		absf(alt_roof - wall_h / Fog.FOG_TOP) < 0.03,
+		"%.3f vs 期望 %.3f" % [alt_roof, wall_h / Fog.FOG_TOP])
+	_ok("墙脚南边的平地在高度场里是 0（对照的另一半）",
+		alt_floor < 0.001, "%.4f" % alt_floor)
+	_ok("★ 高度真的从世界进了贴图的 G 通道（不是只在 GDScript 里算了算）",
+		absf(alt_roof_grid - alt_roof) < 0.05,
+		"格子里 %.3f vs 真值 %.3f" % [alt_roof_grid, alt_roof])
+	# 前提：两个点都得在**没有灯**的地方 —— 否则量到的是"灯把雾驱散了"，不是高度。
+	_ok("高度测试的两个点都在没灯的地方（对照前提）",
+		rev_roof < 0.05 and rev_floor < 0.05, "%.3f / %.3f" % [rev_roof, rev_floor])
+
+	# 关雾基线：下面所有比较都用「雾对这一点改了多少」（|开雾 - 关雾|）。
+	# 用**绝对值**是必须的：雾色比墙顶暗、比地面亮，同一个 alpha 在两种表面上
+	# 一个把画面压暗、一个提亮 —— 只有幅度在两种表面之间可比，正负号不可比。
+	w.set_fog_enabled(false)
+	_pump(2)
+	var fog_off2 := await _grab()
+	w.set_fog_enabled(true)
+	_pump(2)
+	var spot_pairs := [["屋顶", roof_s, roof_r], ["墙脚平地", floor_s, floor_r]]
+	var knob_report := {}
+	var shot_pair := []
+	# ── 三个高度旋钮，每个都**跨 3 个噪声相位**量一遍再取平均 ──
+	#
+	# 为什么非得跨相位：`height_parallax` 改的是"图案往哪儿挪"，于是它量到的是
+	# **噪声场的结构函数在某一个相位上的一次实现**。一个 48×160 的窗只装得下
+	# 2~3 个独立花纹，单相位的估计能差一倍（实测同一旋钮 0.0130 / 0.0053）——
+	# 而 `height_fall` / `height_mix` 改的是"浓淡"，量到的是噪声的**均值**，本来就没这么吵。
+	# 三个相位取平均才是"这条旋钮到底改了多少"的稳定估计（每个相位单独记进报告，
+	# 散布一眼能看见；三个相位一起做，顺带也就压掉了"阈值擦边过"）。
+	#
+	# 相位靠拧 `mist_time`：此刻世界是冻住的（这一段从不 `_pump`），着色器里还跟着
+	# 它走的只有那两个翻涌 `sin(mist_time * …)` —— 于是三个相位正好是雾纹**上下错开**
+	# 0 / +0.70 / −0.70 个噪声单位的三个**不同实现**。
+	var knob_phases := [0.0, 9.24, -9.24]
+	for knob in [["height_fall", 0.0, Fog.HEIGHT_FALL],
+			["height_parallax", 0.0, Fog.HEIGHT_PARALLAX],
+			["height_mix", 0.0, Fog.HEIGHT_MIX]]:
+		var rec := {}
+		var pairs := []
+		for ph in knob_phases:
+			fmat.set_shader_parameter(str(knob[0]), float(knob[1]))
+			fmat.set_shader_parameter("mist_time", float(ph))
+			var kd := await _grab()
+			fmat.set_shader_parameter(str(knob[0]), float(knob[2]))
+			var ku := await _grab()
+			pairs.append([kd, ku])
+			if str(knob[0]) == "height_fall" and is_equal_approx(float(ph), 0.0):
+				# 留一组前后对照图，肉眼也能看（README 二.19 用的就是这两张）
+				shot_pair = [kd, ku]
+		for sp in spot_pairs:
+			var key := str(sp[0])
+			var center: Vector2 = sp[1]
+			var rect: Rect2i = sp[2]
+			var free_sum := 0.0
+			var on_sum := 0.0
+			var diff_sum := 0.0
+			var ph_diffs := []
+			for pr in pairs:
+				free_sum += absf(_lum(pr[0], center, 10) - _lum(fog_off2, center, 10))
+				on_sum += absf(_lum(pr[1], center, 10) - _lum(fog_off2, center, 10))
+				var dp := snappedf(_region_diff(pr[0], pr[1], rect), 0.000001)
+				ph_diffs.append(dp)
+				diff_sum += dp
+			var nph := float(pairs.size())
+			rec[key] = {
+				"d_free": snappedf(free_sum / nph, 0.0001),
+				"d_on": snappedf(on_sum / nph, 0.0001),
+				"diff": snappedf(diff_sum / nph, 0.000001),
+				"phase_diffs": ph_diffs,
+			}
+		knob_report[str(knob[0])] = rec
+	if shot_pair.size() == 2:
+		_write_png(shot_pair[0], "23-fog-height-off")
+		_write_png(shot_pair[1], "24-fog-height-on")
+	# 还原成"这一帧真实的时间"（`_rebuild()` 下次也会写，但别留着假相位给后面几段）
+	fmat.set_shader_parameter("mist_time", w.time)
+	report["cases"]["fog"]["height_knobs"] = knob_report
+	for knob_name in knob_report:
+		_num("旋钮 %s·屋顶的雾贡献(平)" % knob_name, knob_report[knob_name]["屋顶"]["d_free"])
+		_num("旋钮 %s·屋顶的雾贡献(按高度)" % knob_name, knob_report[knob_name]["屋顶"]["d_on"])
+		_num("旋钮 %s·屋顶跨 3 相位的平均像素差" % knob_name,
+			knob_report[knob_name]["屋顶"]["diff"])
+		var phv := 0.0
+		for d0 in knob_report[knob_name]["屋顶"]["phase_diffs"]:
+			phv = maxf(phv, float(d0))
+		_num("旋钮 %s·屋顶 3 个相位里最强的那一个" % knob_name, phv)
+
+	var hf_free := float(knob_report["height_fall"]["屋顶"]["d_free"])
+	var hf_on := float(knob_report["height_fall"]["屋顶"]["d_on"])
+	_ok("★ 高度衰减的旋钮真的接在画面上（屋顶那块有雾可减）",
+		hf_free > 0.02, "屋顶雾贡献 %.4f" % hf_free)
+	_ok("★ 雾沉在地面：墙顶剩的雾明显少于墙脚（同一个旋钮拧出 0 → 常量）",
+		hf_on < hf_free * 0.80, "屋顶 %.4f → %.4f（应显著变小）" % [hf_free, hf_on])
+	# 三个旋钮在屋顶上"看得出来"共用**同一个阈值** —— 免得有人给每条单独调阈值把红条抹平；
+	# 谁强谁弱在报告里看得见（实测：height_fall .0177 / 视差 .0065 / 分层 .0073，
+	# 单相位最弱 0.0039 —— 见 README 二.19 的剂量表）。
+	# 取 0.0025 = 最弱那条均值的 38%、最弱单相位的 64%：三条里**视差**最弱（它把整片图案
+	# 挪一段，只在"图案换了位置"这个层面留痕，而且相位散布最大 0.0039~0.0089）；
+	# 真要再弱下去，说明那条旋钮被改没了，那就该红。
+	var height_eps := 0.0025
+	var roof_diff_min := 1.0e9
+	var roof_phase_min := 1.0e9
+	var floor_phase_max := 0.0
+	for knob_name in knob_report:
+		roof_diff_min = minf(roof_diff_min, float(knob_report[knob_name]["屋顶"]["diff"]))
+		for d0 in knob_report[knob_name]["屋顶"]["phase_diffs"]:
+			roof_phase_min = minf(roof_phase_min, float(d0))
+		for d1 in knob_report[knob_name]["墙脚平地"]["phase_diffs"]:
+			floor_phase_max = maxf(floor_phase_max, absf(float(d1)))
+	_num("三个高度旋钮里最弱的那个（屋顶·跨相位平均）", roof_diff_min)
+	_num("三个高度旋钮 × 3 个相位里最弱的那一格（屋顶）", roof_phase_min)
+	_num("三个高度旋钮 × 3 个相位下墙脚最大的差（必须为 0）", floor_phase_max)
+	# 三条**分开写**（而不是合成"最弱的一条"）：这样哪一条旋钮被改坏了，红的就是它自己 ——
+	# 合并成一条的话，三个变异（浓淡 / 视差 / 分层）会红成同一句话，定位信息就丢了。
+	for nk in knob_report:
+		_ok("★ 旋钮 %s 真的接在画面上：屋顶那块的雾纹被它改动了 ≥ %.4f" % [nk, height_eps],
+			float(knob_report[nk]["屋顶"]["diff"]) >= height_eps,
+			"%.5f（三个相位 %.5f / %.5f / %.5f）" % [
+				float(knob_report[nk]["屋顶"]["diff"]),
+				float(knob_report[nk]["屋顶"]["phase_diffs"][0]),
+				float(knob_report[nk]["屋顶"]["phase_diffs"][1]),
+				float(knob_report[nk]["屋顶"]["phase_diffs"][2])])
+	_ok("★ 每个旋钮、每个相位单独看也都看得出来（不是靠平均把一个死相位盖住）",
+		roof_phase_min >= height_eps * 0.5,
+		"最弱的一个相位 %.5f" % roof_phase_min)
+	# 这条对照是**精确**的（不是阈值）：alt = 0 时 `1 - height_fall * alt` 恰好是 1，
+	# 视差项 `sink` 恰好是 0，分层项 `mix` 的比例恰好是 0 —— 三处都是**同一个浮点数**，
+	# 所以那一块的像素必须**逐字节相同**，而且**每个相位都得相同**。
+	_ok("★ 对照：三个旋钮 × 三个相位下，墙脚那一块全都**逐字节不变**（alt = 0，公式里根本没有它）",
+		floor_phase_max == 0.0, "墙脚最大差 %.7f" % floor_phase_max)
+
+	# ── ②d 体积：雾会**翻涌**（垂直方向也在动）──
+	# 把水平漂移关掉（`mist_speed = 0`）之后，着色器里对时间还剩的依赖只有两个
+	# `sin(mist_time * …)`，而**它们都加在 `q.y` 上** —— 也就是说此刻画面若还会变，
+	# 变的只可能是**垂直**方向。于是"推进时间、画面明显不同"就等于"雾在上下翻涌"。
+	#
+	# ⚠️ 窗口必须**整块都泡在雾里**：被灯照亮的那一块没有雾，它在两张图里完全一样，
+	# 只会稀释分母（同一条道理见 README「占多少 → 窗要小」，窗一大就被空地稀释）。
+	# 所以这里真的是**逐点算过**、再把结论当**前提**断言掉的（4 个角 + 中心）。
+	# 位置也刻意避开 HUD：血灯面板在左上（x<340 且 y<130）、连击在正中偏上、
+	# 目标文案在右上、背包在右下、灯芯条在左下（y>560）—— 这一块是干净的。
+	var billow_win := Rect2i(60, 240, 220, 120)
+	var rev_in_win := 0.0
+	for corner in [Vector2(0.0, 0.0), Vector2(1.0, 0.0), Vector2(0.0, 1.0),
+			Vector2(1.0, 1.0), Vector2(0.5, 0.5)]:
+		var sc: Vector2 = Vector2(billow_win.position) + Vector2(billow_win.size) * corner
+		var wp := _world_of(w, sc.x, sc.y)
+		rev_in_win = maxf(rev_in_win, w.fog_reveal_at(wp.x, wp.y))
+	_num("翻涌测试窗里最大的揭示度（必须≈0）", rev_in_win)
+	_ok("翻涌测试窗整块都泡在雾里（被照亮的那块没有雾，只会稀释分母）",
+		rev_in_win < 0.05, "窗内最大揭示度 %.3f" % rev_in_win)
+	var sp0 := float(fmat.get_shader_parameter("mist_speed"))
+	fmat.set_shader_parameter("mist_speed", 0.0)
+	# 这两个时刻是**挑过的**：0.17*t = ∓π/2，也就是贴地雾那层翻涌的**最低点与最高点**，
+	# 于是同一个幅度旋钮能拧出最大的上下位移（0.70/13*720 ≈ 39px）。
+	var b_t0 := -9.24
+	var b_t1 := 9.24
+	var billow_tab := {}
+	var strip_frames := []
+	for bl in [0.0, 0.5, 1.0]:
+		fmat.set_shader_parameter("mist_billow", bl)
+		fmat.set_shader_parameter("mist_time", b_t0)
+		var bfa := await _grab()
+		fmat.set_shader_parameter("mist_time", b_t1)
+		var bfb := await _grab()
+		billow_tab[str(bl)] = {
+			"moved": snappedf(_region_moved(bfa, bfb, billow_win), 0.0001),
+			"diff": snappedf(_region_diff(bfa, bfb, billow_win), 0.000001),
+		}
+		_num("翻涌幅度 %.1f·推进时间后动了的像素占比" % bl,
+			billow_tab[str(bl)]["moved"])
+		_num("翻涌幅度 %.1f·推进时间后的平均像素差" % bl,
+			billow_tab[str(bl)]["diff"])
+		if is_equal_approx(bl, 1.0):
+			# 留一组"三帧画廊"：同一个窗、同一个幅度，时间走完最低 → 中位 → 最高。
+			# 静态图说不出"在动"，但三帧叠在一起就能看出雾纹**整体上下挪**了一段。
+			fmat.set_shader_parameter("mist_time", 0.0)
+			var bfm := await _grab()
+			strip_frames = [bfa, bfm, bfb]
+	report["cases"]["fog"]["billow"] = billow_tab
+	var bl_none := float(billow_tab["0.0"]["moved"])
+	var bl_half := float(billow_tab["0.5"]["moved"])
+	var bl_full := float(billow_tab["1.0"]["moved"])
+	_ok("★ 对照：把翻涌关掉，同一段时间里两帧**逐字节相同**（此刻着色器对时间已无依赖）",
+		bl_none == 0.0 and float(billow_tab["0.0"]["diff"]) < 1e-6,
+		"moved %.7f　diff %.7f" % [bl_none, float(billow_tab["0.0"]["diff"])])
+	_ok("★ 雾会翻涌：水平漂移关掉后推进时间，画面仍然明显变了（只可能是垂直方向）",
+		bl_full > 0.15, "%.4f　（关掉时 %.7f）" % [bl_full, bl_none])
+	# 相对判据（不靠阈值）：**剂量-反应**。幅度减半就该动得少一些 ——
+	# 这条能抓住"旋钮压根没接进着色器"（那三行会完全相同），而绝对阈值抓不住。
+	_ok("★ 翻涌幅度这个旋钮真的在缩放效果（剂量-反应：0 < 半档 < 满档）",
+		bl_none < bl_half and bl_half < bl_full,
+		"0 → %.4f → %.4f" % [bl_half, bl_full])
+	if strip_frames.size() == 3:
+		var gap := 8
+		var src0: Image = strip_frames[0]
+		# 用源图自己的格式建画布：`blit_rect` 要求两块格式一致（不一样会直接报错返回）
+		var strip := Image.create(billow_win.size.x, billow_win.size.y * 3 + gap * 2,
+			false, src0.get_format())
+		strip.fill(Color(0.04, 0.04, 0.06, 1.0))
+		for k in 3:
+			strip.blit_rect(strip_frames[k], billow_win,
+				Vector2i(0, k * (billow_win.size.y + gap)))
+		_write_png(strip, "25-fog-billow")
+	# 还原：翻涌 / 漂移 / 时间都放回去（时间在下次 `_pump` 里也会被 `_rebuild` 写回）
+	fmat.set_shader_parameter("mist_billow", Fog.MIST_BILLOW)
+	fmat.set_shader_parameter("mist_speed", sp0)
+	fmat.set_shader_parameter("mist_time", w.time)
+
+	# ── ②e 飘移：雾**真的在动**（需求原话：「顺便让迷雾可以动」）──
+	# 判定与 ②d 同一路数：把翻涌关掉后，着色器对时间的依赖只剩"沿风向平移"。
+	# 于是冻结世界、只把 mist_time 推几秒 —— 窗里动了的像素占比就是"雾在飘"的直接证据。
+	# ⚠️ 这个窗整块都是平地（alt = 0），量到的只有**贴地雾**那层（满速 ≈ 9px/s）；
+	#    浮雾层快 2.5 倍但只在高处的表面上出现，不在这个窗里 —— 别拿这条去否定它。
+	# ⚠️ `_region_moved` 的默认 eps（0.10，三通道之和 ≈ 26 级）是为"抗锯齿别误报"取的，
+	#    对雾纹这种低对比变化太钝（实测 2 秒的平均差只有 0.003）。这里传小 eps：
+	#    占比判据问的是"有多少像素**真的变了**"（>1 个 8bit 级），而误报由下面的
+	#    **字节级对照**兜底（速度归零后两帧逐字节相同），不靠 eps。
+	# ⚠️ 剂量-反应用的是 2 秒窗的**平均差**而不是"动了多少"：满速 2 秒挪 17.7px、
+	#    半速 8.9px，都远小于一个雾胞（55px），结构函数在这个区间对位移单调；
+	#    挪过一个雾胞之后"动了多少"在 1.0 附近饱和，分不出满速与半速。
+	fmat.set_shader_parameter("mist_billow", 0.0)
+	fmat.set_shader_parameter("mist_speed", sp0)
+	fmat.set_shader_parameter("mist_time", 0.0)
+	var d_a := await _grab()
+	fmat.set_shader_parameter("mist_time", 2.0)
+	var d_b := await _grab()
+	fmat.set_shader_parameter("mist_time", 6.0)
+	var d_c := await _grab()
+	var drift_moved := _region_moved(d_a, d_c, billow_win, 0.004)
+	var drift_diff := _region_diff(d_a, d_b, billow_win)
+	# 剂量-反应：漂速减半，同一段时间里挪的就少（位移 < 一个雾胞时，结构函数对位移单调）
+	fmat.set_shader_parameter("mist_speed", sp0 * 0.5)
+	fmat.set_shader_parameter("mist_time", 0.0)
+	var d_d := await _grab()
+	fmat.set_shader_parameter("mist_time", 2.0)
+	var d_e := await _grab()
+	var drift_half := _region_diff(d_d, d_e, billow_win)
+	# 对照：漂移也关掉 —— 着色器对时间**完全没有**依赖，两帧必须逐字节相同
+	fmat.set_shader_parameter("mist_speed", 0.0)
+	fmat.set_shader_parameter("mist_time", 0.0)
+	var d_f := await _grab()
+	fmat.set_shader_parameter("mist_time", 2.0)
+	var d_g := await _grab()
+	var drift_still := _region_diff(d_f, d_g, billow_win)
+	_num("飘移·满速推进 6 秒后动了的像素占比（eps=1 级）", drift_moved)
+	_num("飘移·满速推进 2 秒后的平均像素差", drift_diff)
+	_num("飘移·半速推进 2 秒后的平均像素差", drift_half)
+	_num("飘移·关掉后两帧的差（必须为 0）", drift_still)
+	report["cases"]["fog"]["drift"] = {
+		"moved": snappedf(drift_moved, 0.0001), "diff": snappedf(drift_diff, 0.000001),
+		"half_diff": snappedf(drift_half, 0.000001), "still_diff": drift_still}
+	_ok("★ 雾会飘：翻涌关掉后推进 6 秒，窗里过半的像素都挪了（不是一层死纱）",
+		drift_moved > 0.5, "%.3f" % drift_moved)
+	# ⚠️ 上面那条**在旧漂速（0.022）下也绿**（实测 0.819）—— 它证明的是"雾在动"，
+	#    不是"动得看得出来"。所以必须再钉一条**量级**：0.022 时 2 秒的平均差是
+	#    0.0026，0.16 时是 0.0133（7 倍）。取 0.007 = 实测的一半 ——
+	#    这条是「改了漂速但没落盘」这类失败的唯一牙齿（本轮真踩过：
+	#    同一条消息里两次 Edit 打同一个文件，第二次把第一次整个盖掉，
+	#    自检照样 465/465 全绿，因为绿的是一份**没改成的**源码）。
+	_ok("★ 漂速够快：2 秒窗的平均差 ≥ 0.007（旧值 0.022 只有 0.0026，会红在这条）",
+		drift_diff > 0.007, "%.5f" % drift_diff)
+	_ok("★ 剂量-反应：漂速减半，同一段时间里雾纹挪得就少",
+		drift_half < drift_diff, "半速 %.5f < 满速 %.5f" % [drift_half, drift_diff])
+	_ok("★ 对照：漂移也关掉后，同一段时间里两帧逐字节相同（此刻着色器对时间已无依赖）",
+		drift_still < 1e-6, "%.7f" % drift_still)
+	# 还原，然后补一条**管道**证据：mist_time 是 `_rebuild()` 从 `w.time` 写进去的，
+	# 不是只在自检里手动设过 —— 泵 12 步世界（0.2s，几个重建周期），uniform 必须跟上来，
+	# 落后不超过一个重建周期（0.05s）。
+	fmat.set_shader_parameter("mist_billow", Fog.MIST_BILLOW)
+	fmat.set_shader_parameter("mist_speed", sp0)
+	_pump(12)
+	var mt_now := float(fmat.get_shader_parameter("mist_time"))
+	_num("飘移·泵 12 步后 uniform 里的时间", mt_now)
+	_num("飘移·泵 12 步后世界的时间", w.time)
+	_ok("★ 雾的时间跟着世界走（_rebuild 每 0.05s 把 w.time 写进 uniform）",
+		absf(mt_now - w.time) < 0.06, "uniform %.3f vs w.time %.3f" % [mt_now, w.time])
+
 	# ── ③ 墙会把"散雾"也挡住（这是遮挡的**第二个独立证人**）──
 	# 迷雾用的是自己那套射线扇求交（`Proj.ray_rect_dist`），与 `PointLight2D`
 	# 的影子系统是两套代码。同距离两点、一墙之隔，差别只可能来自那面墙。
@@ -3445,6 +3849,11 @@ func _finish() -> void:
 	report["samples"]["draft_taken"] = draft_taken
 	report["samples"]["draft_log"] = draft_log
 	_ok("整趟跑下来反复发生三选一（肉鸽循环成立）", draft_taken >= 5, str(draft_taken))
+	# ⚠️ 这条是**绝对**断言，专门钉"少跑"这件事：一个运行时错误会让某一段从中途断掉，
+	# 它剩下的断言不会被登记 —— 而 `checks_all_pass` 是个相对量，对"变少"毫无感觉。
+	# 详见 `_sec()` 的注释。
+	_ok("★ 全部段都完整跑到了段尾（运行时错误会静默截断后面所有断言）",
+		_sections_done == SECTIONS, "%d/%d 段" % [_sections_done, SECTIONS])
 	var passed := 0
 	for k in _checks.keys():
 		if bool(_checks[k]):

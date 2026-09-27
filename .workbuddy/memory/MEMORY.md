@@ -52,8 +52,8 @@
    推广：**判据只有一个出处时，才对得起"改坏它就会红"**。
 
 ## 当前基线
-- `tools/godot-lightknight.sh` — 自检 **442/442**，约 50 秒，连跑两遍 `report.json`
-  **逐字节相同**（md5 `9b82023f140037875c12bc2949c2594d`，F11 全屏之后）。
+- `tools/godot-lightknight.sh` — 自检 **466/466**，约 85 秒，连跑两遍 `report.json`
+  **逐字节相同**（md5 `89041cac94b8e3b0943b23e8c7440002`，雾高度/体积/飘移之后）。
   超过两分钟没好通常是脚本没起来，先 grep `SCRIPT ERROR|Parse Error`
   —— **GDScript 解析错误会让 Godot 挂住不退出**，外面只看得出"这轮自检好慢"。
   ⚠️ **rc=1 不等于断言红** —— 必须单独看 `report.json.errors`。
@@ -67,17 +67,31 @@
   ⚠️ **新加了 `class_name` 的脚本要先刷全局类缓存**，否则报
   `Parse Error: Identifier "xxx" not declared`（看着像语法错，其实是缓存旧）。
   脚本已自愈（`find src -name '*.gd' -newer <缓存>` → 先 `--import`）。
-- `tools/godot-mutate.py` — **50 个变异**（全量约 45 分钟），备份 `~/.cache/dq-mutate/src.bak`。
+  ⚠️ **断言段中途 runtime error 会静默截断该段后面所有断言**（`checks_all_pass`
+  照样 true）→ `_run()` 里每段后跟 `_section_done()`，`_finish()` 断言
+  "全部 N 段都跑到段尾"（09-27 加的守卫）。
+- `tools/godot-mutate.py` — **58 个变异**（全量约 80 分钟），备份 `~/.cache/dq-mutate/src.bak`。
   ⚠️ 刻意不用 `rmtree`（沙箱批量删除保护会拦 → 还原失败、坏源码留盘），改用
   `copytree(dirs_exist_ok=True)` 覆盖还原；⚠️ src 改过后它拒绝覆盖旧备份，先把 `src.bak`
   **改名存档**（别删）再重跑。⚠️ 多个名字子串是 **OR** 过滤。
   ⚠️ 开跑前有 `unknown_targets()` **前置校验**：`expect/forbid` 的字符串对不上任何
   断言名就直接退出（否则抄错名字只会伪装成"预期变红却没有"）。**改断言措辞后要
   顺手 grep 变异表里的同名子串** —— 本轮就这么拦下一条。
+  ⚠️ **后台跑时日志是块缓冲**（python stdout 重定向后不逐行 flush，看着像"卡住"，
+  任务状态才是真相）。
 - 另有 `godot-probe*.sh`（迁移前遮挡探针）、`browser-verify.sh` + `make-*.py`（Web 版）。
-- **最近一轮：「F11 全屏」** —— `src/window_mode.gd`（纯状态机：决策与真窗口分开验）+
-  `main.advance()` 里在状态机分发**之前**处理（任何界面都生效）。断言 442，变异 50。
-  细节见 DETAIL-godot.md 同名小节。
+- **最近一轮：「迷雾的高度 / 体积 / 飘移」** —— 世界空间高度场（每关烘一次）写进
+  照亮场贴图 G 通道；着色器三个 `× alt` 旋钮（height_fall / height_parallax /
+  height_mix）+ 翻涌 sin + MIST_SPEED 0.022→0.16（「让雾可以动」）。
+  **只乘 alt → 纯地面拧旋钮逐字节不变**，对照从阈值变精确。断言 442→466，变异 50→58。
+  细节见 README 二.19 与 DETAIL-godot.md 同名小节。
+  ⚠️ **断言"读错层"最隐蔽**：那条"高度真的进了贴图 G 通道"原本读的是 GDScript 数组，
+  把 `set_pixel` 的 G 改成恒 0 它照样绿（变异批 56/57 才暴露）。→ 断言里的每个名词
+  都要问"它真的经过我想验的那一层了吗"；改坏实现确认对应断言变红才算数。
+  ⚠️ **本轮又踩了 18.6（同一消息两条 Edit 打同一文件，后一条盖掉前一条）两次**
+  —— 而且两次都"看起来全绿"：`fog.gd` 的漂速常量被盖掉后，运行时其实还是旧速度
+  （`_ready()` 用常量覆盖 uniform），自检照样 466/466、两遍逐字节相同。
+  → **改完 src 立刻 grep 那个值**；并给"改动本身"配一条**量级**断言。
 
 ## 七个最容易踩的坑（其余见 DETAIL-godot.md）
 1. **沙箱「批量删除保护」**：**按 turn 累计**，同一条命令里删 >50 个（或同 turn 累计超 50）
