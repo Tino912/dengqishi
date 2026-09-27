@@ -98,6 +98,10 @@ func _run() -> void:
 	await _sec(_section_text_readability)
 	# 伤害产生的光圈有多大（同样接着上面那个世界用；排在 F11 之前）
 	await _sec(_section_damage_glow)
+	# 灯河：过关 / 回溯 / 留在地图。**排在 F11 之前**：它要真把 Boss 打死、
+	# 真的渡河换关（`prog["cleared"]` 会被写），所以只能放在"世界随便重建"的末尾几段；
+	# 它自己收尾时会 `forget_cleared()` 并重建第一关，退出时世界与别段看到的一致。
+	await _sec(_section_lamp_river)
 	# F11 全屏。**排在最末**：这一段会真去切真实窗口（全屏 ↔ 窗口），
 	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
 	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
@@ -105,8 +109,29 @@ func _run() -> void:
 	_finish()
 
 
-## 段数。**加了新的 `_sec(...)` 就要 +1** —— 它是下面那条"段哨兵"断言的分母。
-const SECTIONS := 23
+## 段数。加了新的 `_sec(...)` 就 +1。
+##
+## ⚠️ **它已经没有牙了，别拿它当哨兵** —— 真正有牙的是 `CHECKS_MIN`（见下）。
+##    2026-09-27 实测：把 `Main.stay_here()` 里的一行摘掉，灯河段从 ⑤ 就抛错断掉、
+##    **24 条断言凭空消失**（总数 526 → 502），而"段数对不对"报的是 ✓。
+##    原因见 `_sec()`：段内抛错时 `await f.call()` 照样返回、`_sections_done += 1`
+##    照样执行 —— 于是"段数"这个量对"段内少跑了一半"完全无感。
+##    留着它只当个信息量（`report["samples"]["sections_done"]`）。
+const SECTIONS := 24
+## **各段跑完之后、`_finish()` 登记哨兵之前**，应该已经跑过的断言条数下限。
+##
+## 为什么不能用段数当哨兵（见 `SECTIONS` 上面那条实测），而必须**数断言本身**：
+## 段内抛错只吃掉"那一段剩下的"断言，段边界上什么都看不出来。
+## 数条数才能看见它 —— `checks_all_pass` 是相对量（"通过数 == 总数"），
+## 少跑几条它照样为真；只有"总数不许变少"这种绝对量才拦得住。
+##
+## ⚠️ **加了断言就要把它改大**（改大不会红，但会悄悄把哨兵变松）。
+##    抄法：全绿跑一遍，把 `report["samples"]["checks_ran"]` 原样抄过来。
+##    用"**哨兵之前**"这个口径（而不是 `checks_total`）是为了让以后在
+##    `_finish()` 里加/减哨兵都不必回来改它 —— 实测踩过一次：
+##    第一版抄的是 `checks_total`（含哨兵自己），哨兵里就得补个 `+ 1`，
+##    那个 `+ 1` 极容易忘、忘了就恒红。
+const CHECKS_MIN := 526
 ## 伤害光圈的判据（见 `_section_damage_glow`）：
 ## `GLOW_OLD_MUL` 是把旋钮拧回**旧尺寸**那一档要用的倍数。旋钮同时缩放半径与不透明度，
 ## 于是能量按 m³ 走，m 就取两个"旧/新能量比"开三次方的几何中点：
@@ -134,8 +159,17 @@ const GLOW_E_MAX := 0.0044
 ## （非暴击那一发）而两处加起来 400+，单独给它一条上限才拦得住这种**局部回退**。
 ## 实测（暴击那一档）554 / 拧到旧尺寸 3060 → 中点 1300，两边各 ~2.35 倍。
 const GLOW_HIT_PX_MAX := 1300
-## 已经**完整跑完**的段数。
+## 已经**完整跑完**的段数（只当信息量，别拿它当哨兵 —— 理由见 `_sec()`）。
 var _sections_done := 0
+## **`_ok()` 被调用的次数** —— 这才是"这次到底跑了多少条断言"。
+##
+## ⚠️ 为什么数**次数**而不是数 `_checks` 的名字数：`_checks` 是按名字索引的字典，
+##    两条**同名**断言会塌成一条。哨兵若看名字数，就会把"同一个断言跑了两次"
+##    误报成"有断言没跑" —— **报的还是"段内抛了运行时错误"，而那轮根本没有**。
+##    实测（2026-09-27 变异「回到地图不记账」）：上游失败让每个渡口只剩「留步」，
+##    `for target in [1, 0]` 两次都停在「灯河渡口」→ 断言名重复 → 名字数 526→525，
+##    哨兵误报。**数调用次数就完全不受影响**（那一轮 `_ok` 一次都没少跑）。
+var _checks_called := 0
 
 
 ## 跑一段，跑完记一笔。
@@ -147,8 +181,13 @@ var _sections_done := 0
 ## 报告上写着"438/438 全部通过"（那一轮真的少了 18 条：迷雾段的墙面/回填/翻涌整段没了）。
 ## 症状与"清关面板没点掉"那种成片变红**正好相反**：它是**悄悄地变少**。
 ##
-## 所以最后必须有一条**绝对**断言钉住"段数"，它才不会被截断一起吃掉；
-## 单靠 `checks_all_pass` 是不够的 —— 那是个相对量，"少跑"在它眼里不是失败。
+## 所以最后必须有一条**绝对**断言钉住"这次到底登记了多少条断言"，它才不会被截断
+## 一起吃掉；单靠 `checks_all_pass` 是不够的 —— 那是个相对量，"少跑"在它眼里不是失败。
+##
+## ⚠️ **别拿这里的 `_sections_done` 当哨兵**：段内抛错时 `await f.call()` 照样返回、
+##    下面这行 `+= 1` 照样执行 —— 于是"段数"对"段内少跑了一半"完全无感（2026-09-27
+##    实测：灯河段从 ⑤ 断掉、24 条断言消失，段数哨兵仍然 ✓）。
+##    有牙的是 `_finish()` 里数 `_ok()` 调用次数的 `CHECKS_MIN`；这里只当信息量。
 func _sec(f: Callable) -> void:
 	await f.call()
 	_sections_done += 1
@@ -157,6 +196,7 @@ func _sec(f: Callable) -> void:
 # ================================================================ 基础设施
 
 func _ok(name: String, cond: bool, detail := "") -> void:
+	_checks_called += 1
 	_checks[name] = cond
 	if not cond:
 		report["errors"].append("[断言失败] " + name + "  " + detail)
@@ -4016,9 +4056,27 @@ func _finish() -> void:
 	_ok("整趟跑下来反复发生三选一（肉鸽循环成立）", draft_taken >= 5, str(draft_taken))
 	# ⚠️ 这条是**绝对**断言，专门钉"少跑"这件事：一个运行时错误会让某一段从中途断掉，
 	# 它剩下的断言不会被登记 —— 而 `checks_all_pass` 是个相对量，对"变少"毫无感觉。
-	# 详见 `_sec()` 的注释。
-	_ok("★ 全部段都完整跑到了段尾（运行时错误会静默截断后面所有断言）",
-		_sections_done == SECTIONS, "%d/%d 段" % [_sections_done, SECTIONS])
+	# 详见 `_sec()` 与 `CHECKS_MIN` 的注释。
+	#
+	# ⚠️ **判据是"断言**条数**"，不是"段数"**。段数那版没有牙：段内抛错照样会让
+	#    `_sections_done += 1`（实测：24 条断言消失，段哨兵仍然 ✓）。
+	# 先把两个量**在登记哨兵之前**定住：这样以后在 `_finish()` 里加减哨兵
+	# 都不会动到判据，`CHECKS_MIN` 也不用跟着改。
+	var ran := _checks_called      # 这次一共跑了多少条断言（调用次数）
+	var named := _checks.size()    # 其中有多少个**不同**的名字
+	report["samples"]["sections_done"] = _sections_done
+	report["samples"]["checks_ran"] = ran
+	report["samples"]["checks_named"] = named
+	# ① 绝对条数哨兵：段内抛运行时错误会让那一段剩下的断言**根本没被登记**，
+	#    而 `checks_all_pass` 是相对量，对"变少"毫无感觉。
+	#    ⚠️ 判据是**调用次数**不是名字数 —— 名字数会因重名而变小，把
+	#    "同一个断言跑了两次"误报成"少跑了"（见 `_checks_called` 的注释）。
+	_ok("★ 断言没有凭空变少（段内抛运行时错误会静默截断那一段剩下的所有断言）",
+		ran >= CHECKS_MIN, "%d 条（下限 %d）" % [ran, CHECKS_MIN])
+	# ② 重名哨兵：两条断言共用一个名字时，后一条会**覆盖**前一条 —— `_checks`
+	#    里静默少一条，而"通过数 == 总数"照样为真。与 ① 配成一对才拦得住。
+	_ok("★ 没有两条断言共用一个名字（重名会让后一条覆盖前一条，静默吃掉一条）",
+		named == ran, "%d 个名字 / %d 次调用" % [named, ran])
 	var passed := 0
 	for k in _checks.keys():
 		if bool(_checks[k]):
@@ -5169,6 +5227,475 @@ func _section_damage_glow() -> void:
 	w.shake = 0.0
 	w.hitstop = 0.0
 	w.mark_redraw()
+
+
+# ================================================================ 灯河：过关 / 回溯 / 留在地图
+#
+# 用户原话：「请在一关打通后通过灯河到达下一关，并且可以通过灯河回到上一关，
+#            打通的关卡被全图照亮并且不刷怪，在所有关卡通过后可以选择留在地图中，
+#            此时所有地图都应该被照亮并且没有敌人。」
+#
+# 这一段刻意**走真实路径**，不摆状态：
+#   ① 真把 Boss 打死（`damage_enemy` → `_kill_enemy` → `_on_boss_dead`，游戏里只有这一个入口）；
+#   ② 真走到灯塔下，让 `_update_interaction` 自己给出"灯河渡口"的提示，再按 E 走 `interact`；
+#   ③ 真在面板上按 Q/E 移高亮 + 空格确认（和玩家按的键一模一样）。
+#
+# ⚠️ **自检全程共用一份 `main.prog`**，而"已打通"会改变世界的样子 —— 所以这一段
+#    跑完必须 `forget_cleared()` 并重建：退出时世界要和别的段看到的一致。
+func _section_lamp_river() -> void:
+	## "全图照亮"的两条阈值，都是**量出来再定的**（实测值见下面的 `_num`）：
+	##   · 单变量那条（同一个世界、同一帧，只关掉亮色阶）：实测就在 `LIT_PALETTE_K`
+	##     附近，阈值取 1.8 —— 与"这一档根本没接上"的 1.0 之间留出余量。
+	##   · 跨状态那条（对比未通关那一版）：实测是 cm 1.18 × 色阶 2.4 上下，阈值取 2.0。
+	const LIT_PAL_MIN := 1.8
+	const LIT_DARK_MIN := 2.0
+	## 亮的**绝对带**：下限是"确实亮起来了"，上限是"没糊成一片"。
+	## 上限不是凑数 —— 过曝时"更亮"根本量不出来（乘积顶到 1.0），
+	## 所以"这一档够亮"与"这一档还没顶到天花板"必须一起守。
+	const LIT_BAND := Vector2(0.25, 0.88)
+
+	main.waves_off = true
+	# 局种子**钉死**：这一段里 ⑤（已打通那一版）与 ⑨（未打通那一版）必须是
+	# **同一张地图**才比得公平 —— 前面的段落可能把 run_seed 改过（布局段的常规操作），
+	# 所以这里显式钉一次，别指望别人。
+	main.run_seed = LAYOUT_SEED
+	main.forget_cleared()
+	main.prog["level"] = 0
+	main.start_level()
+	_pump(3)
+	var w := _w()
+	_ok("前提：第一关还没打通（暗、有雾、有影子那一版）",
+		not w.cleared and not w.revisiting and w.ambient > 0.85 and w.fog.enabled,
+		"ambient %.3f　雾 %s" % [w.ambient, w.fog.enabled])
+	_ok("前提：没打通时灯河还没亮 —— 渡口一条船都没有（面板开不出来）",
+		w.ferry_options().is_empty(), str(w.ferry_options().size()))
+	await _shot("39-lamp-river-dark")
+
+	# ── ① 打通这一关（走真实的击杀链）──
+	var bd: Dictionary = w.level["boss"]
+	var pt := w.find_spawn_point(float(bd["x"]), float(bd["y"]), 80.0, 40.0)
+	var be := w.spawn_enemy(str(bd["type"]), pt.x, pt.y, false)
+	w.boss_enemy = be
+	w.boss_spawned = true
+	w.damage_enemy(be, 999999.0, 0.0, 0.0)
+	_pump(40)
+	_ok("① 打死 Boss → 这一关已恢复光明（灯塔亮起，雾开始散）",
+		w.cleared and bool(w.goal_prop["lit"]),
+		"cleared=%s　灯塔=%s" % [w.cleared, bool(w.goal_prop["lit"])])
+	_ok("① 清关面板出现", main.state == "menu" and main._menu_kind == "clear",
+		"%s/%s" % [main.state, main._menu_kind])
+	_ok("★ 清关面板指的是**灯河**：换关要走地图上的渡口，而不是在面板上点一下按钮就跳关",
+		main.hud.ov_hint.text.find("灯河") >= 0, main.hud.ov_hint.text)
+	_ok("① 打死 Boss 还**不算**「已打通」—— 要等你按下空格（回到地图 / 留下）那一刻才记账",
+		(main.prog["cleared"] as Dictionary).is_empty(), str(main.prog["cleared"]))
+	_tap("confirm")            # 空格 = 回到地图
+	_pump(4)
+	_ok("① 空格之后回到地图上（关卡没有自己往前跳）",
+		main.state == "play" and int(main.prog["level"]) == 0,
+		"%s　level=%d" % [main.state, int(main.prog["level"])])
+	# ①b / ①c 把"记账"与"落定"**分开钉**（它们是两个独立的层，
+	# 合成一条的话，只改坏其中一层不会红 —— 实测变异批里两条各打各的）。
+	_ok("★ ①b 按下空格那一刻就记上了账 —— 这一关从此是「已打通」",
+		main.level_cleared(0), str(main.prog["cleared"]))
+	_ok("★ ①c 而且这一关**就地**落定成「已恢复光明」：雾散尽、波次记成已清（人还站在原地，没被弹回出生点）",
+		_w().cleared and not _w().fog.enabled
+		and _w().waves_cleared_count() == _w().waves.size(),
+		"cleared=%s　雾 %s　波次 %d/%d" % [_w().cleared, _w().fog.enabled,
+			_w().waves_cleared_count(), _w().waves.size()])
+
+	# ── ② 走到灯河渡口登船 ──
+	# ⚠️ 站位**要紧贴**灯塔：灯塔的交互半径是 110，但同一片里还可能有守灯人（76）
+	#    与宝箱（78），提示给的是**最近的那一个**。站在 d≈80 处会被它们抢走，
+	#    于是"提示变了、按 E 开出来的是商店" —— 实测踩过一次。
+	var gp: Dictionary = w.goal_prop
+	w.teleport(float(gp["x"]), float(gp["y"]) + 40.0)
+	_pump(4)
+	_ok("② 灯塔下给出的是「灯河渡口」的登船提示（不再是「这里是庇护所」）",
+		w.prompt.find("灯河") >= 0, w.prompt)
+	_tap("interact")
+	_pump(1, {}, false)        # 面板开着时别让 _pump 替我们选（auto_draft = false）
+	_ok("② 按 E 打开灯河渡口面板", main.state == "draft" and main._panel_kind == "ferry",
+		"%s/%s" % [main.state, main._panel_kind])
+	_ok("② 第一关**只有下游**：顺流而下 + 留步（上游没有关，就不该给出「逆流」这一项）",
+		_panel_index_of("down") == 0 and _panel_index_of("up") < 0
+		and _panel_index_of("stay") > 0, _panel_ids())
+	_ferry_sail("down")
+	_ok("★ 顺流而下 → 真的到了第二关",
+		int(main.prog["level"]) == 1 and int(_w().level["index"]) == 1,
+		"level=%d　index=%d" % [int(main.prog["level"]), int(_w().level["index"])])
+	_ok("★ ② 顺流到第二关之后，**第二关还没被记成「已打通」** —— 记账发生在"
+		+ "「回到地图 / 留下」那一刻，不在「到达」那一刻",
+		not main.level_cleared(1), str(main.prog["cleared"]))
+	_ok("第二关是**没打通**的那一版（还暗着、还有影子）",
+		not _w().revisiting and not _w().cleared and _w().ambient > 0.9,
+		"ambient %.3f" % _w().ambient)
+
+	# ── ③ 第二关也打通，然后逆流而上回第一关 ──
+	var w2 := _w()
+	var bd2: Dictionary = w2.level["boss"]
+	var pt2 := w2.find_spawn_point(float(bd2["x"]), float(bd2["y"]), 80.0, 40.0)
+	var be2 := w2.spawn_enemy(str(bd2["type"]), pt2.x, pt2.y, false)
+	w2.boss_enemy = be2
+	w2.boss_spawned = true
+	w2.damage_enemy(be2, 999999.0, 0.0, 0.0)
+	_pump(40)
+	_tap("confirm")            # 回地图
+	_pump(3)
+	var gp2: Dictionary = _w().goal_prop
+	_w().teleport(float(gp2["x"]), float(gp2["y"]) + 40.0)
+	_pump(4)
+	_tap("interact")
+	_pump(1, {}, false)
+	_ok("③ 第二关的渡口**同时给出两个方向**（用户要的「可以通过灯河回到上一关」）",
+		_panel_index_of("down") >= 0 and _panel_index_of("up") >= 0, _panel_ids())
+	_ferry_sail("up")
+	var w0 := _w()
+	_ok("★ 逆流而上 → 真的回到了第一关",
+		int(main.prog["level"]) == 0 and int(w0.level["index"]) == 0,
+		"level=%d　index=%d" % [int(main.prog["level"]), int(w0.level["index"])])
+	_ok("★ 回到的是「已恢复光明」的那一版（是**世界状态**已打通，不只是画面亮）",
+		w0.revisiting and w0.cleared)
+
+	# ── ④ 已打通的那一关：全图照亮（状态层）──
+	_ok("★ 全图照亮·夜色：清关那一档把夜色滤镜推到全白（不再压暗任何东西）",
+		w0.light_rig.cm.color.r > 0.999 and w0.light_rig.cm.color.g > 0.999
+		and w0.light_rig.cm.color.b > 0.999, str(w0.light_rig.cm.color))
+	_ok("★ 全图照亮·雾：回来时雾是**散尽**的（不是又盖上一层）", not w0.fog.enabled)
+	_ok("★ 全图照亮·灯：这一关的灯全亮着（灯塔 + 三座火盆）",
+		bool(w0.goal_prop["lit"]) and w0.braziers_lit == w0.braziers.size(),
+		"%d/%d 座火盆" % [w0.braziers_lit, w0.braziers.size()])
+
+	# ── ⑤ 全图照亮（像素层·单变量）──
+	# 机位钉死：`teleport` 会把 cam 一起设到同一点，所以窗口是确定的。
+	w0.teleport(900.0, 1100.0)
+	_pump(12)
+	var probe_f := _screen_of(w0, 1200.0, 1100.0)  # 空地上的一处：离玩家灯 / 火盆 / 灯塔都远
+	var pr := Rect2i(int(probe_f.x) - 120, int(probe_f.y) - 90, 240, 180)
+	pr = pr.intersection(Rect2i(0, 0, Proj.VIEW_W, Proj.VIEW_H))
+	_ok("⑤ 前提：取样窗完整落在画面里（跑到画面外会静默地量到别的东西）",
+		pr.size.x >= 200 and pr.size.y >= 150, str(pr))
+	# 前提之二：取样窗里**不能有界面**。HUD 画在独立的 CanvasLayer 上，但自检抓的是
+	# **整帧**（`SubViewport`），界面照样进图 —— 而界面**不跟着色阶变**，
+	# 于是它像一块恒定的底噪把比值稀释掉：实测窗压在左上统计面板上时，
+	# 2.4 倍的色阶只剩 **1.26×** ，看着像"色阶没接上"。
+	_ok("⑤ 前提：取样窗落在 HUD 之外（面板 / 技能条 / 背包都不许压上来）",
+		_window_hud_free(pr), "窗 %s　界面 %s" % [str(pr), str(_hud_boxes())])
+	# `cleared` 这一档**同时**管着"亮色阶"和"灯河"两处 —— 两个一起扳，
+	# 窗里亮的是谁就分不清了（两条独立的层都能单独满足同一条断言 = 没牙）。
+	# 所以先把浮灯**冻住**（`lamp_river_on = false`），这一步只问色阶；
+	# 浮灯由 ⑥ 用同一个旋钮单独问一次。这也是 ⑨ 能跟它配成一对的前提：
+	# 对照那一边（未打通）本来就没有浮灯，两边一样干净才比得公平。
+	w0.lamp_river_on = false
+	w0.cleared = true
+	w0.mark_redraw()
+	var im_lit := await _grab()
+	w0.cleared = false            # **只**把"已恢复光明"这一档关掉（色阶那一处）
+	w0.mark_redraw()
+	var im_dimpal := await _grab()
+	w0.cleared = true
+	w0.lamp_river_on = true
+	w0.mark_redraw()
+	var lum_lit := _region_lum(im_lit, pr)
+	var lum_dimpal := _region_lum(im_dimpal, pr)
+	_num("灯河·已恢复光明那一档（窗内平均亮度）", lum_lit)
+	_num("灯河·同一世界只关掉这一档（窗内平均亮度）", lum_dimpal)
+	_ok("★ 全图照亮真的画在屏幕上：同一个世界里只关掉这一档，远处那扇窗的亮度掉到 1/%.2f 以下"
+		% LIT_PAL_MIN, lum_lit >= lum_dimpal * LIT_PAL_MIN,
+		"%.3f → %.3f（%.2f×）" % [lum_lit, lum_dimpal, lum_lit / maxf(lum_dimpal, 0.0001)])
+	_ok("★ 全图照亮是「看得见的亮」：那扇窗的绝对亮度落在 %.2f ~ %.2f 之间（太低 = 没照亮；太高 = 糊成一片）"
+		% [LIT_BAND.x, LIT_BAND.y],
+		lum_lit >= LIT_BAND.x and lum_lit <= LIT_BAND.y, "%.3f" % lum_lit)
+
+	# ── ⑥ 灯河的浮灯真的画出来了（像素层·单变量 + 0 对照）──
+	# 机位挪到能看清河身的地方：灯河从灯塔脚下朝上游 / 下游各流一股。
+	# 判据是**同一帧、同一机位，只关掉浮灯**（`lamp_river_on`）—— 不关掉它，
+	# 窗里变亮的是色阶还是浮灯就分不清。
+	w0.teleport(1900.0, 700.0)
+	_pump(12)
+	var river_win := Rect2i(150, 150, 560, 240)    # 罩住河身中段（对角线穿过这扇窗）
+	var ctl_win := Rect2i(150, 520, 560, 190)      # 同样大小、但离河身足够远（0 对照）
+	w0.mark_redraw()
+	var rv_on := await _grab()
+	w0.lamp_river_on = false
+	w0.mark_redraw()
+	var rv_off := await _grab()
+	w0.lamp_river_on = true
+	w0.mark_redraw()
+	var px_river := _gain_count(rv_on, rv_off, river_win)
+	var px_ctl := _gain_count(rv_on, rv_off, ctl_win)
+	_num("灯河·河身那扇窗里被浮灯点亮的像素数", float(px_river))
+	_num("灯河·对照窗（离河很远）里被点亮的像素数", float(px_ctl))
+	_ok("★ 打通之后地图上真的有「灯河」：关掉浮灯，河身那扇窗暗下一片",
+		px_river > 60, "%d 个像素（要 > 60）" % px_river)
+	_ok("★ 灯河只流在河身那一带（对照窗几乎一个像素都不动）—— 与上一条配成一对",
+		px_ctl <= px_river / 8, "河身 %d 像素　对照窗 %d 像素" % [px_river, px_ctl])
+	_write_png(_grid([_pose_tile(rv_off, river_win, 2), _pose_tile(rv_on, river_win, 2)], 2),
+		"41-lamp-river-on")
+
+	# ── ⑦ 已打通的关卡**不刷怪**（端到端：站在刷怪点上待够时间）──
+	# 这一条是"状态本身"的判据，不是"某个开关把刷怪语句挡住了"：
+	# 波次在状态里就已经是"已刷已清"、Boss 已经"出现过且死了"，
+	# 所以 `_update_waves` 那两条链**自然走完**，站在锚点上也不会重来一遍。
+	#
+	# ⚠️ **必须先把全局停链开关放开**（`waves_disabled = false`）。自检默认把它开着，
+	#    那样"一只都不出"是那个开关的功劳，跟"已打通"没有关系 ——
+	#    一条断言被两个独立的层各能单独满足，它就是一条没牙的烟测。
+	#    放开之后，"不刷怪"只可能是**状态**在起作用（见 ⑦b 的阳性对照）。
+	w0.waves_disabled = false
+	var stand_list := []
+	for wv in w0.waves:
+		stand_list.append(Vector2(float(wv["def"]["x"]), float(wv["def"]["y"])))
+	stand_list.append(w0.boss_anchor)
+	var most := 0
+	for a in stand_list:
+		w0.teleport(a.x, a.y)
+		_pump(45)
+		most = maxi(most, w0.alive_enemy_count())
+	_ok("★ 已打通的关卡不刷怪：停链开关**已经放开**，在每一处波次锚点与 Boss 场地上各站 45 步，一只都没出来",
+		w0.alive_enemy_count() == 0 and most == 0, "最多同时 %d 只" % most)
+	_ok("★ 那一关的波次在**状态里**就是已清空（不只是「没刷出来」）",
+		w0.waves_cleared_count() == w0.waves.size(),
+		"%d/%d 波" % [w0.waves_cleared_count(), w0.waves.size()])
+	_ok("★ 那一关的 Boss 也不会再来一遍（场上没有 Boss 实例，状态是已死）",
+		w0.boss_dead and w0.boss_enemy == null)
+	_ok("那一关也不会有「死掉的东西再生」（第二关那条机制的队列是空的）",
+		w0.respawn_count == 0 and w0.respawn_queue.is_empty(),
+		"再生 %d 次" % w0.respawn_count)
+
+	# ⑦b **阳性对照**：同一个世界、同一个机位、同一个量法，只把第 0 段波次那两个
+	#     "已刷已清"标记抹掉 —— 立刻就能在同一处锚点刷出怪来。
+	#     于是上面那条"一只都没出"是"已打通"在起作用，不是停链开关、也不是量法失灵。
+	#     （"让旋钮转一下"：同一帧只改一个变量做前后对照，**不是把阈值调松**。）
+	w0.waves[0]["spawned"] = false
+	w0.waves[0]["cleared"] = false
+	w0.teleport(stand_list[0].x, stand_list[0].y)
+	_pump(45)
+	var ctl_spawn := w0.alive_enemy_count()
+	_num("灯河·阳性对照（同一世界里只抹掉第 0 段的已刷已清）刷出来的敌人数", float(ctl_spawn))
+	_ok("★ 阳性对照：只把那一波记成「没刷过」，同一处锚点立刻刷出来了 —— 上面那条才有牙",
+		ctl_spawn > 0, "%d 只" % ctl_spawn)
+	# 还原成"已打通"的样子，并把阳性对照刷出来的东西清干净（后面几段要靠它继续走）
+	w0.waves[0]["spawned"] = true
+	w0.waves[0]["cleared"] = true
+	w0.enemies.clear()
+	w0.particles.clear()
+	w0.texts.clear()
+	_pump(2)
+	_ok("⑦b 还原：清掉阳性对照刷出来的东西之后，这一关又是「一只敌人也没有」的",
+		w0.alive_enemy_count() == 0 and w0.waves_cleared_count() == w0.waves.size(),
+		"%d 只　%d/%d 波" % [w0.alive_enemy_count(), w0.waves_cleared_count(), w0.waves.size()])
+
+	# ── ⑧ 三关全通 → 选择留在地图中 → 所有地图都照亮、没有敌人 ──
+	for _i in 2:                       # 第一关 → 第二关 → 第三关
+		_ferry_from_here("down")
+	var w3 := _w()
+	_ok("⑧ 第三关是**没打通**的那一版（顺流到的新地方照旧是暗的、有影子的）",
+		int(main.prog["level"]) == 2 and not w3.revisiting and not w3.cleared,
+		"level=%d　revisiting=%s" % [int(main.prog["level"]), w3.revisiting])
+	_ok("⑧ 第三关刚顺流到达时**还没**被记成「已打通」，而离开的第二关记上了"
+		+ "（记账只发生在「按下空格回到地图 / 留下」那一刻，与 ① 同一条规矩）",
+		not main.level_cleared(2) and main.level_cleared(1), str(main.prog["cleared"]))
+	var bd3: Dictionary = w3.level["boss"]
+	var pt3 := w3.find_spawn_point(float(bd3["x"]), float(bd3["y"]), 80.0, 40.0)
+	var be3 := w3.spawn_enemy(str(bd3["type"]), pt3.x, pt3.y, false)
+	w3.boss_enemy = be3
+	w3.boss_spawned = true
+	w3.damage_enemy(be3, 999999.0, 0.0, 0.0)
+	_pump(40)
+	_ok("⑧ 第三关（最后一关）的清关面板给的是「留在地图中」",
+		main.state == "menu" and main._menu_kind == "clear"
+		and main.hud.ov_hint.text.find("留在地图") >= 0, main.hud.ov_hint.text)
+	_tap("confirm")                    # 空格 = 留在地图中
+	_pump(4)
+	_ok("★ 选择留在地图中 → 停在第三关，没有被踢回标题、也没有重开",
+		main.state == "play" and int(main.prog["level"]) == 2,
+		"%s　level=%d" % [main.state, int(main.prog["level"])])
+	_ok("★ 三关都记成了「已打通」—— 这就是「所有地图都应该被照亮」的前提",
+		(main.prog["cleared"] as Dictionary).size() == Content.level_count(),
+		str(main.prog["cleared"]))
+	var wl := _w()
+	_ok("★ 全通之后停在这一关也是照亮且没有敌人的",
+		_is_peaceful(wl), _peace_report(wl))
+	# 最后一关的渡口**没有"顺流"**（前面没有关了）—— `ferry_options()` 的边界，
+	# 也正是"所有关卡通过后留在地图中"的下半句：只剩"逆流 / 留步"。
+	var last_ids := []
+	for it in wl.ferry_options():
+		last_ids.append(str((it as Dictionary)["id"]))
+	_ok("★ 最后一关的渡口没有「顺流」那一项（前面没有关了），只剩逆流与留步：%s"
+		% ",".join(last_ids),
+		not last_ids.has("down") and last_ids.has("up") and last_ids.has("stay"),
+		",".join(last_ids))
+
+	# 逐关走一遍：**三张地图都应该是照亮且没有敌人的**
+	for target in [1, 0]:
+		_ferry_from_here("up")
+		var wt := _w()
+		_ok("★ 全通之后回到「%s」：也是照亮且没有敌人的那一版" % str(wt.level["name"]),
+			_is_peaceful(wt), _peace_report(wt))
+		# 与上一条配成一对：这一条钉的是"**是回访**"（世界重建时就知道已打通），
+		# 上面那条钉的是"**画面/状态确实到位**"。少任何一条都说得通另一个故事。
+		# ⚠️ 名字里**必须带关名**：这个循环转两圈（先回第二关、再回第一关），
+		#    不带关名的话两圈会**共用一个名字** → `_checks` 里后一条覆盖前一条，
+		#    静默吃掉一条。2026-09-27 被新加的"重名哨兵"逮到（526 次调用只有
+		#    525 个名字）—— 上一行用的是 `% str(wt.level["name"])`，所以没事；
+		#    这一行当时把关名落下了。
+		_ok("★ 而且是**回访**进来的（「%s」：世界重建时就已经知道这一关通了）"
+			% str(wt.level["name"]),
+			wt.revisiting, "revisiting=%s" % wt.revisiting)
+		if target == 1:
+			_ok("★ 第二关回访时盲女已经不在（她燃尽成了灯塔的光）", wt.girl == null)
+			await _shot("42-lamp-river-revisit")
+
+	# ── ⑨ 全图照亮（像素层·跨状态对照）──
+	# 把"没打通的第一关"重建一遍（**同一个局种子** → 同一张地图），机位与窗口都照抄 ⑤，
+	# 并且**把雾也关掉** —— 否则量到的是雾（"量哪一层，就把别层冻住"）。
+	main.forget_cleared()
+	main.prog["level"] = 0
+	main.start_level()
+	_pump(3)
+	var wd := _w()
+	wd.set_fog_enabled(false)
+	wd.teleport(900.0, 1100.0)
+	_pump(12)
+	var im_dark := await _grab()
+	var lum_dark := _region_lum(im_dark, pr)
+	_num("灯河·未打通那一版（同一关、同一机位、雾也关掉）", lum_dark)
+	_ok("⑨ 前提：未打通那一版确实够暗（不然「更亮」这条断言是空的）",
+		lum_dark < 0.35, "%.3f" % lum_dark)
+	_ok("★ 已打通的关卡比未打通那一版亮 %.1f 倍以上（跨状态判据，与 ⑤ 的单变量判据配成一对）"
+		% LIT_DARK_MIN, lum_lit >= lum_dark * LIT_DARK_MIN,
+		"%.3f vs %.3f（%.2f×）" % [lum_lit, lum_dark, lum_lit / maxf(lum_dark, 0.0001)])
+	_write_png(_grid([_pose_tile(im_dark, pr, 2), _pose_tile(im_dimpal, pr, 2),
+		_pose_tile(im_lit, pr, 2)], 3), "40-lamp-river-lit")
+
+	# ── ⑩ 收尾：擦掉通关记录并回到第一关（这一段之外的世界要和别的段看到的一致）──
+	main.forget_cleared()
+	main.prog["level"] = 0
+	main.waves_off = true
+	main.start_level()
+	_pump(3)
+	_ok("★ 擦掉通关记录后重建 → 第一关又是有影子、有雾、暗的那一版（记录真的在决定画面）",
+		not _w().revisiting and not _w().cleared and _w().fog.enabled
+		and _w().ambient > 0.85,
+		"ambient %.3f　雾 %s" % [_w().ambient, _w().fog.enabled])
+	report["cases"]["lamp_river"] = {
+		"lum_lit": snappedf(lum_lit, 0.0001), "lum_dimpal": snappedf(lum_dimpal, 0.0001),
+		"lum_dark": snappedf(lum_dark, 0.0001),
+		"pal_ratio": snappedf(lum_lit / maxf(lum_dimpal, 0.0001), 0.01),
+		"dark_ratio": snappedf(lum_lit / maxf(lum_dark, 0.0001), 0.01),
+		"lit_k": World.LIT_PALETTE_K, "window": [pr.position.x, pr.position.y, pr.size.x, pr.size.y],
+		"lamp_px_river": px_river, "lamp_px_ctl": px_ctl,
+		"ctl_spawn": ctl_spawn,
+	}
+
+
+## 面板上某一项的序号（-1 = 没有）。灯河渡口的项数是**随进度变**的
+## （第一关没有「逆流」、最后一关没有「顺流」），所以按 id 找，不按位置。
+func _panel_index_of(id: String) -> int:
+	for i in main._draft_items.size():
+		if str((main._draft_items[i] as Dictionary).get("id", "")) == id:
+			return i
+	return -1
+
+
+func _panel_ids() -> String:
+	var s := []
+	for it in main._draft_items:
+		s.append(str((it as Dictionary).get("id", "?")))
+	return ",".join(s)
+
+
+## 等面板过掉装填窗口（面板刚弹出时确认键故意不生效，见 `Main.DRAFT_ARM`）。
+func _arm_panel() -> int:
+	var guard := 0
+	while not main._draft_armed() and guard < 120:
+		guard += 1
+		main.advance(STEP)
+	return guard
+
+
+## 在灯河渡口面板上选一股水流（Q/E 移高亮 → 空格确认，与玩家同一条输入路径）。
+func _ferry_sail(id: String) -> bool:
+	if main.state != "draft" or main._panel_kind != "ferry":
+		return false
+	_arm_panel()
+	var want := _panel_index_of(id)
+	if want < 0:
+		# 渡口没给出这一股水流（上游那条断言已经红了）。
+		#
+		# ⚠️ **返回之前必须把面板收掉**。为什么：`_pump()` 默认 `auto_draft = true`，
+		#    它会替我们"选一项并确认"。面板就这么开着进下一个 `_pump(12)`，
+		#    那个自动选择会选到「顺流」→ 世界被重建 → 调用方手里攥着的世界引用
+		#    立刻变成**已释放对象**，段内在 `w0.cleared = true` 处抛
+		#    "previously freed" → **这一段剩下的断言全部静默不登记**
+		#    （2026-09-27 实测：变异「回到地图不记账」就栽在这儿，
+		#     连 `★ 三关都记成了` 都没跑到，看着像"那条断言没牙"）。
+		#    走 Esc（真实玩家路径）而不是直接改内部状态，顺带把这条退路也验着。
+		_tap("pause")
+		_pump(2)
+		return false
+	var guard := 0
+	while main._draft_index != want and guard < 8:
+		guard += 1
+		_tap("draft_next")
+	_tap("confirm")
+	_pump(4)
+	return true
+
+
+## 走到当前这一关的灯河渡口（灯塔脚下）→ 按 E 开面板 → 选一股水流。
+## 自检里所有"渡河"都走这一条：于是"提示有没有出现""面板开没开""选完去了哪"
+## 三件事都在同一条路径上被验到，不会出现"断言里是好的、玩家按下去不是"。
+func _ferry_from_here(id: String) -> bool:
+	var w := _w()
+	if w == null or (w.goal_prop as Dictionary).is_empty():
+		return false
+	# 站位紧贴灯塔（理由见 ② 的注释：离远了会被守灯人 / 宝箱抢走最近的交互目标）
+	w.teleport(float(w.goal_prop["x"]), float(w.goal_prop["y"]) + 40.0)
+	_pump(4)
+	_tap("interact")
+	_pump(1, {}, false)
+	return _ferry_sail(id)
+
+
+## "这一关是已打通的、照亮且没有敌人的那一版"吗。
+##
+## 一条断言里把四件事一起说清：世界状态（`cleared`）、夜色（落档）、
+## 雾（散尽）、敌人（一个都没有 + Boss 也没有实例）。
+##
+## ⚠️ 判据是**可观察的终态**，**不**包含 `revisiting`。
+##    因为 `revisiting` 说的是"我**进来时**这一关就已经是已打通的了"，
+##    而「选择留在地图中」是**原地落定**（世界不重建）—— 那一刻 `revisiting`
+##    仍然是 false，可地图确实已经照亮且没有敌人了。两件事分开钉：
+##    回访那一条另外单独断言 `wt.revisiting`（见下面逐关扫的循环）。
+##
+## ⚠️ 这里**不**逐处站刷怪点 —— 那是 ⑦ 那一条端到端做的（机制只有
+##    `settle_cleared_state()` 一处，所以"深测一处 + 三关各扫一遍状态"是够的，
+##    而且三关都站一遍太慢）。
+func _is_peaceful(w: World) -> bool:
+	return w.cleared and w.ambient <= 0.7 and not w.fog.enabled \
+		and w.waves_cleared_count() == w.waves.size() and w.boss_dead \
+		and w.boss_enemy == null and w.alive_enemy_count() == 0
+
+
+## 界面上被占掉的矩形（HUD 自己报的，见 `Hud.ui_boxes()`）。
+## ⚠️ 取像素的段落凡是说"这是空地 / 这是画面",都要先问一句"窗里有没有界面"。
+func _hud_boxes() -> Array:
+	return main.hud.ui_boxes()
+
+
+## 这个取样窗里**没有界面**吗（理由见 `Hud.ui_boxes()` 的注释）。
+func _window_hud_free(r: Rect2i) -> bool:
+	var rr := Rect2(r)
+	for b in _hud_boxes():
+		if (b as Rect2).intersects(rr):
+			return false
+	return true
+
+
+func _peace_report(w: World) -> String:
+	return "ambient %.3f　雾 %s　波次 %d/%d　敌人 %d" % [w.ambient, w.fog.enabled,
+		w.waves_cleared_count(), w.waves.size(), w.alive_enemy_count()]
 
 
 # ================================================================ F11 全屏

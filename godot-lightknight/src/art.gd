@@ -212,6 +212,32 @@ static func tex_at(ci: CanvasItem, name: String, p: Vector2, w: float, h: float,
 
 # ---------------------------------------------------------------- 地板
 
+## 「已恢复光明」那一版的地 / 墙色阶（用户要的"打通的关卡被**全图照亮**"）。
+##
+## 为什么不能只靠 `ambient`：`ambient` 只走 `CanvasModulate`，而它从 0.9 → 0.58
+## 不过是把整屏乘积从 0.845 抬到 1.0（**1.18×**）—— 地面的调色板本身是深蓝夜色
+## （`#2c3450`，渲染出来亮度 ~0.2），于是"清关"在画面上几乎看不出变亮。
+## 真正让一张地图"亮起来"的是**色阶本身**。
+##
+## 做法：每个通道乘同一个系数（`k`，见 `World.LIT_PALETTE_K`）——
+## **保留色相、不做去饱和**，地图还是那张地图的蓝，只是从"月光下勉强看清"
+## 变成"灯火通明"。系数由自检的像素对照量着定（见 `_section_lamp_river`）。
+##
+## ⚠️ 返回的是**新字典**：`level["palette"]` 是 const 字典，就地改会报错，
+## 而"改到了全局调色板"会顺着三关的关卡表一直漏下去。
+static func lit_palette(pal: Dictionary, k: float) -> Dictionary:
+	var out := {}
+	for key in pal.keys():
+		var v = pal[key]
+		if typeof(v) == TYPE_STRING and (v as String).begins_with("#"):
+			var c := Color.html(v as String)
+			out[key] = "#" + Color(minf(c.r * k, 1.0), minf(c.g * k, 1.0),
+				minf(c.b * k, 1.0), 1.0).to_html(false)
+		else:
+			out[key] = v
+	return out
+
+
 static func floor(ci: CanvasItem, level: Dictionary, pal: Dictionary, cam: Vector2, t: float) -> void:
 	var lw := float(level["w"])
 	var lh := float(level["h"])

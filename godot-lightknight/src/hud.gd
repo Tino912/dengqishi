@@ -312,6 +312,30 @@ func _build_objective() -> void:
 	objective_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 
 
+## 界面上被占掉的矩形，按屏幕坐标。
+##
+## 为什么需要它：自检抓图抓的是**整帧**（`SubViewport`），HUD 虽然在独立的
+## `CanvasLayer` 上，照样会进图 —— 而界面**不跟着世界的明暗变**，它像一块恒定的
+## 底噪：想量"这张地图有多亮"的窗只要压在界面上，比值立刻被稀释。
+## （实测：2.4 倍的色阶，窗压在左上那块统计面板上时只剩 **1.26×**，
+##  看起来像"色阶根本没接上"。）
+##
+## 所以"取像素的段落"要先问一句 `ui_boxes()`。框由**真实的落点常量**算出来，
+## 界面挪了它跟着挪 —— 而不是在自检里抄一份会过期的坐标。
+func ui_boxes() -> Array:
+	if hud_box == null:
+		return []
+	var out := []
+	out.append(Rect2(0.0, 0.0, 430.0, 232.0))                         # 左上：灯焰 / 灯火 / 状态文字
+	out.append(Rect2(0.0, Proj.VIEW_H - 192.0, 340.0, 192.0))         # 左下：技能条
+	out.append(Rect2(Proj.VIEW_W - 312.0, Proj.VIEW_H - 240.0, 312.0, 240.0))  # 右下：背包
+	out.append(Rect2(Proj.VIEW_W * 0.5 - 175.0, 0.0, 350.0, 100.0))   # 顶部中：连击数
+	out.append(Rect2(Proj.VIEW_W - 450.0, 0.0, 450.0, 56.0))          # 顶部右：目标
+	out.append(Rect2(Proj.VIEW_W * 0.5 - 280.0, 92.0, 560.0, 60.0))   # 顶部中下：Boss 血条
+	out.append(Rect2(Proj.VIEW_W * 0.5 - 340.0, Proj.VIEW_H - 62.0, 680.0, 58.0))  # 底部中：交互提示
+	return out
+
+
 func _build_boss() -> void:
 	boss_box = Control.new()
 	boss_box.position = Vector2(Proj.VIEW_W * 0.5 - 270.0, 96.0)
@@ -859,6 +883,8 @@ const EMBLEMS := {
 	"reach": "light_03", "vamp": "smoke_05", "combo_up": "flame_03", "combo_add": "light_01",
 	"dash": "smoke_02", "skill_cd": "magic_03", "cost_cut": "magic_01", "crit": "star_09",
 	"bounty": "star_03", "killboom": "fire_01",
+	# 灯河渡口的三项（顺流 / 逆流 / 留步）
+	"down": "trace_04", "up": "light_02", "stay": "smoke_02",
 	# 武器词条（reach / crit / vamp 与恩赐同名，复用上面那三条）
 	"edge": "spark_07", "swift": "smoke_08", "shine": "flame_05",
 	"ember": "flame_01", "frugal": "scorch_02",

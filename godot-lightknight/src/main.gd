@@ -82,6 +82,10 @@ var _shop_index := 0
 var _pending_shop := false
 var shop_opens := 0
 
+## 灯河渡口（顺流 / 逆流 / 留步）。和上面三个面板一样，可能被别的界面挡住 → 先挂起来。
+var _pending_ferry := false
+var ferry_opens := 0
+
 
 func _ready() -> void:
 	GameInput.aim_mode = "mouse"
@@ -121,6 +125,7 @@ func show_title() -> void:
 	_free_world()
 	prog["level"] = 0
 	prog["boons"] = {}
+	prog["cleared"] = {}
 	hud.hide_draft()
 	hud.hide_shop()
 	_pending_chest = []
@@ -148,6 +153,9 @@ func new_run() -> void:
 	# 新的一局 = 8 把武器的元素**全部重摇**（清空后由 World.setup 重新 roll）。
 	# 同一局内过关、死亡重开都不会重摇 —— 玩家记住的"我那把火刀"不会当场变卦。
 	prog["welem"] = {}
+	# 新的一局：通关记录也清空（`show_title()` 已经清过一次，这里再兜一次 ——
+	# 留下记录的话，第一关一开就是"已恢复光明、不刷怪"的样子）。
+	prog["cleared"] = {}
 	start_level()
 
 
@@ -177,20 +185,98 @@ func start_level() -> void:
 	_pending_draft = false
 	_pending_chest = []
 	_pending_shop = false
+	_pending_ferry = false
 	_panel_kind = "draft"
 	hud.hide_draft()
 	hud.hide_shop()
 	hud.hide_overlay()
 	hud.show_dialogue(false)
-	if not skip_dialogue:
+	# 回访**已打通**的那一关时不播入场对白："你第一次走进这里"那句话已经过去了。
+	# 取而代之的是一句报站（下面 `sail_to` 里发）。
+	if not skip_dialogue and not world.revisiting:
 		# 三关各自的入场对白：l1_start / l2_start / l3_start
 		play_dialogue("l%d_start" % (int(prog["level"]) + 1))
 
 
-## 下一关（清空当前关后由玩家确认）
+## 下一关
 func next_level() -> void:
-	prog["level"] = mini(int(prog["level"]) + 1, Content.level_count() - 1)
+	sail_to(int(prog["level"]) + 1)
+
+
+# ---------------------------------------------------------------- 灯河：渡河 / 留下
+#
+# 用户原话：「一关打通后**通过灯河**到达下一关，并且可以通过灯河回到上一关」。
+# 所以换关**不是**清关面板上的一个按钮，而是地图上的一件事：
+#   清关 → 灯塔亮起、灯河亮起（`World._draw_lamp_river`）→ 走到灯塔下按 E
+#   → 面板列"顺流 / 逆流 / 留步" → 选一处，世界重建。
+#
+# `next_level()` 保留（自检与"顺流"都走 `sail_to`），这样"关卡推进"只有一个出口。
+
+## 这一关记成打通了吗（自检与 HUD 都可以问）
+func level_cleared(i: int) -> bool:
+	return (prog["cleared"] as Dictionary).has(i)
+
+
+## 记一笔"这一关打通了"。**只在渡河离开 / 选择留下时调用**（理由见 prog["cleared"]）。
+func _mark_cleared(i: int) -> void:
+	(prog["cleared"] as Dictionary)[i] = true
+
+
+## 渡河：顺流 / 逆流都走这一条。
+##
+## ⚠️ 目标**就地夹住**（`clampi`）：逆流从第一关出发、顺流从最后一关出发，
+## 面板本来就不会给出那种选项；但这一层夹子保证"任何调用路径都不会越界出第 4 关"。
+func sail_to(target: int) -> void:
+	# ⚠️ **这里不记账**。"已打通"只在 `stay_here()` 一处写下（清关面板上按空格
+	# 回到地图那一刻）—— 两处都写的话，"第一关被记成已打通"这条断言就被两个
+	# 独立的层各能单独满足，等于没牙。**实测**：把这里原来那两行摘掉，
+	# 自检照样 524/524 全绿（变异批「渡河离开时不记账」0 条变红）——
+	# 一条断言被两层满足，就是一条没牙的烟测。
+	#
+	# 语义上收成一处也更干净：玩家**看见清关面板、按下空格**那一刻，这一关才算打完；
+	# 在那之前（Boss 刚死、面板还挂着）不算。同理，面板上按 R 重打这一关时，
+	# 不该留下"已打通"的记录。
+	prog["level"] = clampi(target, 0, Content.level_count() - 1)
 	start_level()
+	if world != null:
+		if world.revisiting:
+			hud.toast("灯河把你送到了「%s」——这里已经恢复光明。" % str(world.level["name"]))
+		else:
+			hud.toast("灯河把你送到了「%s」。" % str(world.level["name"]))
+
+
+## 留在地图中：不换关，把这一关记成打通，然后回到地图上继续走。
+##
+## 这是用户那句话的后半段：「在所有关卡通过后**可以选择留在地图中**」——
+## 此时三关都记着"已打通"，于是**每一张地图都是照亮且没有敌人的**，
+## 灯河双向都通，爱去哪儿去哪儿。
+func stay_here() -> void:
+	# ① 记账：**只有这一个出处**（`sail_to()` 不记 —— 理由见那边的注释）。
+	#    语义是"玩家看见清关面板、按下空格 → 这一关算打完了"。
+	if world != null and world.cleared:
+		_mark_cleared(int(prog["level"]))
+	# ② 就地落定成"已恢复光明"的终态。
+	#    用户原话：「在所有关卡通过后可以选择留在地图中，**此时所有地图都应该被照亮
+	#    并且没有敌人**」—— 包括脚下这一张。
+	#    ⚠️ 这里**不重建世界**：重建会把玩家弹回出生点（清关那一刻人在 Boss 场地，
+	#    一按空格就被扔回地图另一头）—— 那不像"留下来"，像被传送。
+	#    终态由 `World.settle_cleared_state()` 摆出来，与"渡河回来看到的那一版"
+	#    是**同一个出处**。
+	if world != null:
+		world.settle_cleared_state()
+	hud.hide_overlay()
+	_resume_play()
+	if world != null:
+		hud.toast("你留在了「%s」。灯河安静地流着。" % str(world.level["name"]))
+
+
+## 自检用：把所有通关记录擦掉。
+##
+## 为什么要它：自检全程共用一份 `prog`，而"已打通"会**改变世界的样子**。
+## 任何真的把 Boss 打死 / 真的渡了河的段落，跑完都要擦干净，
+## 否则后面每一段都跑在"已照亮、无敌人"的世界里（见 prog["cleared"] 的注释）。
+func forget_cleared() -> void:
+	prog["cleared"] = {}
 
 
 func _free_world() -> void:
@@ -268,12 +354,17 @@ func _menu_input() -> void:
 		elif GameInput.just("pause"):
 			show_title()
 	elif _menu_kind == "clear":
-		if GameInput.just("restart") or GameInput.just("confirm"):
-			# 还有下一关就去下一关，否则重开这一关
-			if int(prog["level"]) < Content.level_count() - 1:
-				next_level()
-			else:
-				restart_level()
+		if GameInput.just("confirm"):
+			# ⚠️ 这里**不是**"下一关"按钮。用户原话：「一关打通后**通过灯河**
+			# 到达下一关」—— 所以空格 = 回到地图，换关要走到灯塔脚下的灯河渡口
+			# 按 E 上船。面板上摆一个直达按钮，"通过灯河"就又变回一句文案了。
+			# 最后一关同一句话的后半段「在所有关卡通过后可以选择留在地图中」：
+			# 行为一模一样（回到地图继续走），只是文案不同 —— 见 `_show_clear()`。
+			stay_here()
+		elif GameInput.just("restart") and int(prog["level"]) < Content.level_count() - 1:
+			# 非最后一关：R 重打这一关。最后一关不给 R —— `_show_clear()` 的
+			# 提示里也没写它（别在面板上承诺一个做不到的事）。
+			restart_level()
 		elif GameInput.just("pause"):
 			show_title()
 
@@ -389,6 +480,18 @@ func _request_chest(items: Array) -> void:
 func _take_draft(i: int) -> void:
 	if i < 0 or i >= _draft_items.size() or world == null:
 		return
+	# 灯河渡口：拿走之后**换一张地图**，所以不走 `apply_*`（那些是换武器 / 加恩赐 / 进背包）
+	if _panel_kind == "ferry":
+		var it: Dictionary = _draft_items[i]
+		var oid := str(it.get("id", "stay"))
+		var tgt := int(it.get("target", -1))
+		Sound.play("ui_big")
+		# 先把面板收干净，再渡河：渡河会**重建整个世界**，
+		# 留着面板就会变成"新地图上挂着一块旧面板"。
+		_close_draft()
+		if oid == "down" or oid == "up":
+			sail_to(tgt)
+		return
 	if _panel_kind == "chest":
 		world.apply_chest(_draft_items[i])
 	else:
@@ -428,6 +531,13 @@ func _resume_play() -> void:
 	if _pending_shop:
 		_pending_shop = false
 		_open_shop()
+		return
+	# ⚠️ 新面板的 pending 必须也加进这一段 —— 这正是"四个面板共用一段"的理由：
+	# 分成四份写，必然会有某一份漏掉某个 pending（症状是"这次交互没反应"，
+	# 而且只在"面板被别的东西挡住"那条路径上出现，别处全绿）。
+	if _pending_ferry:
+		_pending_ferry = false
+		_open_ferry()
 		return
 	if _clear_pending:
 		_clear_pending = false
@@ -522,6 +632,40 @@ func _close_shop() -> void:
 	_resume_play()
 
 
+# ---------------------------------------------------------------- 灯河渡口（面板）
+#
+# 与三选一 / 宝箱 / 商店**共用同一个面板与同一套输入规则**（Q/E 移动、空格确认、
+# Esc 退出），**同样有装填窗口** —— 理由和商店那条一模一样：玩家是按 E 把面板叫出来的，
+# 而"开面板那一刻手正按着空格在冲刺"是同一条误触路径，一视同仁。
+# 唯一不同：拿走之后**不换手、不进货、不加恩赐**，而是**换一张地图**。
+
+## 走到灯塔下按 E → world 发 "ferry" 事件；正在播对白 / 别的面板开着的话先挂着
+func _request_ferry() -> void:
+	if state == "play":
+		_open_ferry()
+	else:
+		_pending_ferry = true
+
+
+func _open_ferry() -> void:
+	if world == null:
+		return
+	_draft_items = world.ferry_options()
+	if _draft_items.is_empty():
+		return
+	_draft_index = 0
+	_draft_t = 0.0
+	_panel_kind = "ferry"
+	_panel_title = "灯 河 渡 口"
+	_panel_sub = "灯河从灯塔脚下流过：顺流是还没点灯的地方，逆流是已经亮起来的地方。"
+	_panel_hint = "Q ◀　　▶ E　选一股水流　·　空格 / 回车 上船　·　Esc 再想想"
+	ferry_opens += 1
+	state = "draft"
+	_menu_kind = ""
+	_redraw_panel()
+	Sound.play("ui_big")
+
+
 func restart_level() -> void:
 	prog["coins"] = int(float(prog["coins"]) * 0.75)
 	# 肉鸽：重开这一趟 = 重新开始一局，恩赐清空
@@ -559,6 +703,8 @@ func _drain_events() -> void:
 				_request_chest(e["items"])
 			"shop":
 				_request_shop()
+			"ferry":
+				_request_ferry()
 			"player_died":
 				_on_player_died()
 			_:
@@ -618,12 +764,21 @@ func _show_clear() -> void:
 	]
 	var body := str(bodies[clampi(lv, 0, bodies.size() - 1)])
 	body += _stats_text()
+	var hint := ""
 	if last:
-		body += "\n\n三张地图都走完了——灯骑士站在河心，把灯举过头顶。"
+		body += "\n\n三张地图都走完了——灯骑士站在河心，把灯举过头顶。\n" \
+			+ "灯河在脚下流着，你可以留下了。"
+		# 用户原话：「在所有关卡通过后**可以选择留在地图中**」。
+		# 选"留"→ 这一关也记成打通 → 三张地图全是"照亮且没有敌人"的，
+		# 灯河双向都通，爱去哪儿去哪儿。
+		hint = "按 空格 留在地图中　·　R 从第一关重来　·　Esc 回标题"
 	else:
-		body += "\n\n灯塔已亮起——前面还有更暗的地方。"
-	hud.show_overlay(str(world.level["name"]) + "　已 恢 复 光 明", body,
-		("按 空格 前往下一关" if not last else "按 R 重新开始") + "　·　Esc 回标题", "clear")
+		body += "\n\n灯塔已亮起——灯河就从灯塔脚下流过。"
+		# ⚠️ 这里**不再给"直接前往下一关"**：换关是地图上的一件事（走到灯塔的
+		# 灯河渡口按 E）。非要在面板上给个按钮，就等于把"通过灯河"这句话
+		# 又变回一句文案 —— 那正是这一轮要改掉的东西。
+		hint = "按 空格 回到地图（去灯塔的灯河渡口渡河）　·　R 重打这一关　·　Esc 回标题"
+	hud.show_overlay(str(world.level["name"]) + "　已 恢 复 光 明", body, hint, "clear")
 
 
 func _stats_text() -> String:
@@ -667,6 +822,8 @@ func debug_state() -> Dictionary:
 		d["boss_spawned"] = world.boss_spawned
 		d["boss_dead"] = world.boss_dead
 		d["cleared"] = world.cleared
+		d["revisiting"] = world.revisiting
+		d["ferry_options"] = world.ferry_options().size()
 		d["coins"] = int(world.prog["coins"])
 		d["kills"] = int(world.prog["kills"])
 		d["deaths"] = int(world.prog["deaths"])

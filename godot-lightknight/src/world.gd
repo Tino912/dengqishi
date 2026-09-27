@@ -34,6 +34,13 @@ var flash_color := Color.WHITE
 var flash_power := 0.0
 var ambient := 0.9
 var cleared := false
+## 这一关是**已经打通**的那一版吗（判据：`prog["cleared"]` 里记着它）。
+##
+## 为真时 `setup()` 把这一关**直接摆成"已恢复光明"的样子** —— 波次全清、Boss 已死、
+## 火盆全亮、雾散尽、天色抬到清关那一档，见 `setup()` 里那一段。
+## 这不是"打了几个补丁"，而是把**状态本身**改成已打完：所以"不刷怪"能端到端地验
+## （站在刷怪点上待够时间也一个都不出），而不是靠一个开关把刷怪语句挡掉。
+var revisiting := false
 
 var walls := []            # [x, y, w, d, h]
 var props := []            # {kind,x,y,r,h,solid,seed,lit,lit_t,pulse}
@@ -98,6 +105,14 @@ var fog_enabled := true
 ## 「外沿带有变化」被月牙刃满足了，把半径写错也一样绿）。
 ## 关掉它之后，"外沿带亮、更外面那条对照带不亮"才真的在说线的位置。
 var swing_guide_only := false
+
+## 画不画灯河的浮灯（默认画）。
+##
+## 存在的理由与 `fog_enabled` / `swing_guide_only` **一模一样**：像素断言要能把
+## 别的东西关掉。验"灯河真的画出来了"时，判据是"同一帧、同一机位，只关掉浮灯，
+## 河身那扇窗亮起来的像素数"—— 不关掉它，窗里变亮的是**色阶**（"已恢复光明"那一档）
+## 还是浮灯就分不清。留一个开关，这一层才能被单独冻住做对照。
+var lamp_river_on := true
 
 func set_swing_guide_only(on: bool) -> void:
 	swing_guide_only = on
@@ -165,6 +180,11 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 	if lv_index >= 0:
 		level_index = lv_index
 	level = Content.level_at(level_index)
+	# 这一关之前打通了吗（`prog["cleared"]` 由 Main 记账）。
+	#
+	# ⚠️ **必须在这一步、在任何东西被建出来之前定下来** —— 后面的 `girl`、
+	#    波次标记、火盆、雾都按它分岔；晚一步就会得到"一半已打通、一半没打通"的世界。
+	revisiting = _level_cleared(level_index)
 	run_seed = seed_v
 	_rng = Proj.make_rng(int(level["seed"]))
 	_decor_rng = Proj.make_rng(int(level["seed"]) + 991)
@@ -268,13 +288,30 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 	for wd in rolled:
 		waves.append({"def": wd, "spawned": false, "cleared": false, "members": []})
 
-	# 盲女同行（第二关）
-	if level.has("blind_girl"):
+	# 盲女同行（第二关）。**已打通的那一版没有她** —— 第二关通关时她燃尽自己
+	# 点亮了灯塔（见 `_on_boss_dead`），再回去时她已经是那盏灯本身了。
+	if level.has("blind_girl") and not revisiting:
 		var gp: Vector2 = level["blind_girl"]
 		girl = {
 			"x": gp.x, "y": gp.y, "r": 13.0, "h": 38.0,
 			"vx": 0.0, "vy": 0.0, "wob": 0.0, "talk_cd": 0.0, "talked": false,
 		}
+
+	# ── 已打通的关卡：进来就是"已恢复光明"的那一版 ────────────────────────
+	#
+	# 用户原话：「打通的关卡被全图照亮并且不刷怪」。
+	#
+	# 做法：**不去逐个分支打补丁，而是把这一关的状态本身摆成"已经打完"** ——
+	# 具体摆成什么样、为什么那样就能"不刷怪"，全在 `settle_cleared_state()` 里。
+	#
+	# ⚠️ 这里**不**给钱、不重复加灯芯（那些是"打死 Boss 那一下"的奖赏，
+	#    写在 `_on_boss_dead` 里）。回来一趟就再领一次，是把清关当刷钱机。
+	#
+	# ⚠️ 盲女在 `settle_cleared_state()` 里会被收走（她燃尽成了灯塔的光）——
+	#    上面 `girl` 那段已经按 `revisiting` 拦过一次，这里是第二道，两道都要有：
+	#    前者管"回访时根本没建她"，后者管"就地终态时不留下她"。
+	if revisiting:
+		settle_cleared_state()
 
 	cam = Vector2(player.x, player.y)
 
@@ -2615,6 +2652,56 @@ func _on_boss_dead() -> void:
 	events.append({"type": "dialogue", "key": str(level.get("clear_dialogue", "l1_clear"))})
 
 
+## 把这一张地图摆成"已恢复光明"的**终态**。
+##
+## 终态 = 用户那两句话要的画面：
+##   · 「打通的关卡被全图照亮」：天色落到清关那一档（`cleared_ambient`）、
+##     雾散尽、火盆全亮、灯塔已亮；另有一处**亮色阶**见 `_draw` 里的
+##     `Art.lit_palette`（只抬 `ambient` 是抬不动画面的 —— 夜色那档旋钮到 0.58
+##     只值 1.18 倍，暗调色板本身得乘一个系数）。
+##   · 「并且不刷怪」：波次记成"已刷已清"、Boss 记成"已出现过且已死"——
+##     于是 `_update_waves` 里那两条链（刷新 / 清空→三选一 / 进 Boss 区）
+##     **自然走完**，不需要额外的开关。这正是它能被端到端验的原因：
+##     站在刷怪锚点上待够时间也一个都不出（见自检 `_section_lamp_river`）。
+##
+## **只有这一个出处**，两条调用路径都走它：
+##   ① `setup()` —— 渡河**回来**时（`revisiting`）一进门就是终态；
+##   ② `Main.stay_here()` —— 「选择留在地图中」是**原地**落定，不重建世界。
+## 用户原话：「此时**所有**地图都应该被照亮并且没有敌人」—— 包括脚下这一张。
+## 所以"回访看到的"和"站在原地看到的"必须是同一套东西。
+func settle_cleared_state() -> void:
+	cleared = true
+	ambient = float(level.get("cleared_ambient", 0.58))
+	for wv in waves:
+		wv["spawned"] = true
+		wv["cleared"] = true
+	boss_spawned = true
+	boss_dead = true
+	# 那具**已经死掉的** Boss 实例也收走：回访时它根本不会被建出来，
+	# 就地落定时也不该留下一具 —— 两条路径必须给出**同一个**世界状态
+	#（`boss_dead` 已经把这个事实记在状态里，不需要靠"还留着一个对象"来表达）。
+	# ⚠️ 带 `dead` 这个前提：万一有人在 Boss 还活着时调到这儿，
+	#    宁可不收，也不能把一个活着的 Boss 凭空抹掉。
+	if boss_enemy != null and boss_enemy.dead:
+		boss_enemy = null
+	for b in braziers:
+		b["lit"] = true
+		b["lit_t"] = 1.0
+	braziers_lit = braziers.size()
+	if not goal_prop.is_empty():
+		goal_prop["lit"] = true
+	# 盲女：她的结局是"燃尽成灯塔的光"（第二关清关文案，见 `_on_boss_dead`）。
+	# 回访时她不在了，留在这张地图上也一样 —— 两处不能各是各的。
+	girl = null
+	# 雾**关掉**而不是"慢慢散"：终态就是散尽的。
+	# （`disperse()` 是"清关那一下"的演出，这里要的是终态。）
+	# ⚠️ 走 `set_fog_enabled()`：它同时把 `fog` 节点内部的浓度置零。
+	#    只写 `fog_enabled` 这个变量，在"雾节点已经建好"的场合是改不动画面的
+	#    （`setup()` 那条路径上 fog 还没建，所以光写变量就够 —— 两条都走这个函数
+	#     才不用去想"现在是哪条路径"）。
+	set_fog_enabled(false)
+
+
 
 func hurt_player(dmg: float, dir: float, extra_combo_loss := 0.0) -> void:
 	var p := player
@@ -3220,7 +3307,7 @@ func _update_interaction(dt: float) -> void:
 		if d < 110.0 and d < best_d:
 			best_d = d
 			if bool(goal_prop["lit"]):
-				best = "灯塔已亮 · 这里是庇护所"
+				best = "灯河渡口：按 E 登船（顺流而下 / 逆流而上）"
 			elif braziers_required > 0 and braziers_lit < braziers_required:
 				best = "灯塔没反应 · 还差 %d 座火盆" % (braziers_required - braziers_lit)
 			else:
@@ -3286,12 +3373,54 @@ func interact() -> void:
 		return
 	if not goal_prop.is_empty() and Proj.dist(p.x, p.y, float(goal_prop["x"]), float(goal_prop["y"])) < 110.0:
 		if bool(goal_prop["lit"]):
-			events.append({"type": "dialogue", "key": "lighthouse_lit"})
+			# 灯河渡口：面板列"顺流 / 逆流（如果上一关已打通）/ 留步"，
+			# 换关由 main 做（世界不该知道别的关卡长什么样）。
+			events.append({"type": "ferry"})
 		elif braziers_required > 0 and braziers_lit < braziers_required:
 			events.append({"type": "toast", "text": "灯塔没反应——还差 %d 座火盆。" % (braziers_required - braziers_lit)})
 		else:
 			events.append({"type": "toast", "text": "灯塔还没反应——这片区域的影子还在。"})
 		return
+
+
+# ---------------------------------------------------------------- 灯河渡口
+
+## 这一关在 `prog["cleared"]` 里记着吗（= 已经打通，回来时是"全图照亮"的那一版）。
+## 记录由 `Main` 在**渡河离开 / 选择留在地图**那一刻写 —— 为什么不是"打死 Boss 就记"，
+## 见 `Main.prog["cleared"]` 那段注释。
+func _level_cleared(i: int) -> bool:
+	var m = prog.get("cleared", null)
+	if typeof(m) != TYPE_DICTIONARY:
+		return false
+	return (m as Dictionary).has(i)
+
+
+## 灯河渡口能去的方向。**只有这一个出处** —— 面板显示什么、按下去去哪、
+## 自检断言什么，都从这里走，免得出现"显示了三项、按第二项没反应"这种
+## 只在真按下去那一刻才暴露的错位。
+##
+## 每项：`id`（down / up / stay）、`target`（目标关号，-1 = 不动）、
+## 以及面板要的三行文案（`kind_label` 会印在卡片的角标上）。
+func ferry_options() -> Array:
+	var out := []
+	if not cleared:
+		return out                       # 灯河还没亮，没得选
+	var lv := level_index
+	var last := Content.level_count() - 1
+	if lv < last:
+		var nx: Dictionary = Content.level_at(lv + 1)
+		out.append({"id": "down", "target": lv + 1, "kind": "boon", "kind_label": "顺流",
+			"name": "顺流而下 · 前往「%s」" % str(nx["name"]),
+			"desc": "灯河朝下游去。那里还没点灯 —— %s" % str(nx["lore"])})
+	if lv > 0 and _level_cleared(lv - 1):
+		var pv: Dictionary = Content.level_at(lv - 1)
+		out.append({"id": "up", "target": lv - 1, "kind": "boon", "kind_label": "逆流",
+			"name": "逆流而上 · 回到「%s」" % str(pv["name"]),
+			"desc": "灯河朝上游去。那一关已经恢复光明，灯还亮着。"})
+	out.append({"id": "stay", "target": -1, "kind": "boon", "kind_label": "留步",
+		"name": "留在此地",
+		"desc": "不上船。灯河就在这儿流着，什么时候走都行。"})
+	return out
 
 
 # ---------------------------------------------------------------- 目标
@@ -3361,6 +3490,12 @@ func _draw() -> void:
 	if level.is_empty():
 		return
 	var pal: Dictionary = level["palette"]
+	# 已恢复光明的那一版：整张地图的色阶提亮一档 —— 这是"全图照亮"的主要来源
+	# （只靠 `ambient` 抬不动画面，理由见 `Art.lit_palette` 的注释）。
+	# **只在这一处分叉**：floor / wall / prop 三处拿的都是这个 `pal`，
+	# 于是"亮不亮"只有一个出处，不会出现"地板亮了、墙没亮"这种半亮。
+	if cleared:
+		pal = Art.lit_palette(pal, LIT_PALETTE_K)
 	var c := draw_cam
 
 	Art.floor(self, level, pal, c, time)
@@ -3663,4 +3798,77 @@ func draw_bloom(ci: CanvasItem) -> void:
 			Color(pc.r, pc.g, pc.b, 0.85))
 		Art.glow(ci, p2, pr * 2.2, pc, 0.7, 5)
 		ci.draw_circle(p2, pr * 0.45, Color(1.0, 0.98, 0.9, 0.95))
+
+	# 灯河压在最上面画（加色层没有遮挡关系，顺序只影响观感）。放在最后是因为
+	# 它属于"地图的地貌"，不该盖住玩家与特效的读数。
+	_draw_lamp_river(ci)
+
+
+# ================================================================ 灯河
+#
+# 用户原话：「一关打通后**通过灯河**到达下一关，并且可以通过灯河回到上一关」。
+#
+# 灯河 = **从灯塔脚下流出去的两股浮灯**：一股**顺流**（下游 → 下一关），
+# 一股**逆流**（上游 → 回到上一关）。站在灯塔下按 E，就是在这两股之间做选择
+# （面板由 `ferry_options()` 出，换关由 `Main` 做）。
+#
+# 三个决定，都有理由：
+#   ① **只在打通之后才画**（`cleared`）。这不只是"灯河还没亮"的说法 ——
+#      它让**没打通的关卡一个像素都不变**，于是所有依赖画面基线的断言
+#      （雾锚定、伤害光圈、姿态画廊…）完全不受这一轮改动影响。新功能
+#      "只在已经变过的状态里加东西"是这类改动最省事的护身符。
+#   ② 方向**从关卡表推出来**（`start → goal` 的反方向 = 上游），不新增关卡字段：
+#      三关地形各不相同，但"你是从哪边来的"永远有定义。
+#   ③ 画在**叠加层**（`draw_bloom`，ADD 混合）上：浮灯是发光体，加色才对。
+#      位置全部由 `time` 与下标推出来，**一个随机数都不抽** ——
+#      画面好看不值得拿自检的逐字节可复现去换。
+const LAMP_RIVER_N := 11            ## 每股几盏浮灯
+const LAMP_RIVER_LEN := 1500.0      ## 灯河的可见长度（世界单位）
+const LAMP_RIVER_SPEED := 52.0      ## 漂流速度（世界单位 / 秒）
+const LAMP_RIVER_AMP := 46.0        ## 横向摆动幅度
+const LAMP_RIVER_R := 12.0          ## 单盏浮灯的辉光半径
+
+## "已恢复光明"那一版的地 / 墙色阶倍率。**量出来的，不是拍的**：
+## 自检拿"同一关、同一机位、同一局种子"的**未通关**那一版做对照（还要把雾也关掉，
+## 否则量到的是雾 —— 见 DETAIL 里"量哪一层就把别层冻住"），
+## 要求远处那扇窗的平均亮度抬到 2 倍以上，见 `_section_lamp_river`。
+const LIT_PALETTE_K := 2.4
+
+
+func _draw_lamp_river(ci: CanvasItem) -> void:
+	if not lamp_river_on or not cleared or goal_prop.is_empty():
+		return
+	var gx := float(goal_prop["x"])
+	var gy := float(goal_prop["y"])
+	var st: Vector2 = level["start"]
+	# 上游 = 朝"这一关的出生点"那一侧（也就是你进来的方向）
+	var up := Vector2(st.x - gx, st.y - gy)
+	if up.length_squared() < 1.0:
+		return
+	up = up.normalized()
+	var dirs := [up, -up]
+	# 逆流那股偏冷青、顺流那股是暖黄的灯色 —— 一眼分得开是哪一股
+	var tints := [Color(0.66, 0.88, 1.0), Color(1.0, 0.84, 0.55)]
+	var lw := float(level["w"])
+	var lh := float(level["h"])
+	for di in 2:
+		var d: Vector2 = dirs[di]
+		var tint: Color = tints[di]
+		var nrm := Vector2(-d.y, d.x)
+		var spacing := LAMP_RIVER_LEN / float(LAMP_RIVER_N)
+		for i in LAMP_RIVER_N:
+			var s := fmod(time * LAMP_RIVER_SPEED + float(i) * spacing
+				+ float(di) * spacing * 0.5, LAMP_RIVER_LEN)
+			var wob := sin(time * 0.7 + float(i) * 1.7 + float(di) * 2.0) * LAMP_RIVER_AMP
+			var px := gx + d.x * s + nrm.x * wob
+			var py := gy + d.y * s + nrm.y * wob
+			if px < -90.0 or px > lw + 90.0 or py < -90.0 or py > lh + 90.0:
+				continue
+			var sx := Proj.sx(px, draw_cam.x)
+			var sy := Proj.sy(py, 0.0, draw_cam.y)
+			# 漂远了就淡下去：灯河是"流走"的，不是一圈静止的灯
+			var fade := 1.0 - s / LAMP_RIVER_LEN
+			var core := LAMP_RIVER_R * (0.62 + 0.50 * fade)
+			Art.glow(ci, Vector2(sx, sy), core * 2.6, tint, 0.09 + 0.13 * fade)
+			Art.glow(ci, Vector2(sx, sy), core, tint, 0.28 + 0.34 * fade)
 
