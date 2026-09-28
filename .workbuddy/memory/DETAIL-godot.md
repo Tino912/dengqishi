@@ -755,6 +755,94 @@ SubViewport，所以窗口怎么变都不影响前面的判定）。
   行序判据只比前 `n_reb` 行也照样成立 —— 留着它记住"**一条断言被别的断言平凡满足**"。
 - ⚠️ 旧的 `var edge_steps` / `sig64` / `d_shift_eq` 三个读数**已删**（它们是上面坑 1/3 的产物）。
 
+## 出生地图「灯堡前厅」（最近一轮，594/594 · 变异 83）
+用户原话：「添加一个初始出生地图，这个地图是一边明一边暗，暗的那边通往关卡，
+明的那边有守灯人，未来可能还会添加一些其他功能。」
+
+### 架构决定（照这个改，别自作主张塞进 LEVELS）
+- `const HUB := {...}` 单独一张表，**不进 `LEVELS`**。`Content.HUB_INDEX = -1` 占一个关卡号，
+  `Content.level_at(-1) -> HUB`、`Content.is_hub(i)` = **"是不是中枢"的唯一出处**
+  （世界 / 主循环 / 自检都问它，不各写 `i < 0`）。
+  → `level_count()` 仍然是 **3**（"本作三关""一关更比一关黑/狠""三图风格各异"都按三关两两比）。
+- `Content.NO_TARGET = -99`（"不动"哨兵）：`-1` 被中枢占了。⚠️ 现在**没人读** `stay` 的 target
+  （`Main._take_draft` 只对 down/up 走 `sail_to`），所以自检里那条量的是**行为**。
+- `HUB` 里**故意没有** `waves` / `boss` / `chests` / `braziers`。火盆那条尤其要记住：
+  它要"消耗 3 层连击"才点得着，而中枢**没有敌人可打** → 连击恒 0 → 摆上去点不着。
+  **中枢里所有交互都必须是"不需要战斗资源"的。**
+- 新道具 kind：`beacon`（主灯，`PROP_TABLE` r26/h132/solid）、`gate`（暗门，r40/h96/solid）；
+  美术在 `Art._beacon` / `Art._gate`；`Fog.KIND_SCALE["beacon"] = 1.0`。
+  ⚠️ **门必须真的进 `props`**：世界是按 `kind` 在 `props` 里认"哪一个是终点"的，
+  只写 `goal: {kind:"gate", pos:...}` 不够 —— `goal_prop` 会是空的，
+  **提示给不出来、按 E 没反应，而坐标看起来完全正确**（第一次跑就栽在这儿）。
+
+### "一边明一边暗"是怎么来的（不是调亮度）
+`ambient` 走全局 `CanvasModulate`，**画不出半边**。实际是：
+① 明侧一盏**常亮主灯** `beacon`（`HUB_BEACON_R = 980`、`HUB_BEACON_E = 1.35`、
+`shadows = true`）；② 分界墙两段立在 `lit_x_max = 880` 上，中间留 180 宽门洞。
+→ 分界线是**光自己划出来的**，暗侧是**真的收不到光**（实测主灯对暗侧窗的增量 = **0.000**）。
+
+实测（雾关掉；两个取样窗都在画面里、都离玩家灯火 ≥240；玩家灯火半径**冻在 150**）：
+
+| 量 | 值 |
+| --- | --- |
+| 明侧窗 0.368 / 暗侧窗 0.161（距主灯 172 / 529，后者在墙背后） | 同一帧 **2.29×** |
+| 主灯 `enabled=false` 之后两窗 | 0.170 / 0.161（同一块地板同一种夜色） |
+| 主灯对明侧的增量 / 对暗侧的增量 | **+0.197 / +0.000** |
+| **只关 `shadow_enabled`**：暗侧窗 / 墙前窗 | 0.161 → 0.264（**+0.103**）/ 漂移 **0.0002** |
+
+⚠️ **底色不能用"屏上找一处灯够不到的远处"**：`HUB_BEACON_R` 980 > 画面 1280×1161，
+屏上几乎没有那种地方 → 底色是**把主灯 `enabled=false`** 量出来的
+（灯层每帧只写 `position/texture_scale/energy`，**不碰 `enabled`**，所以拧得住；
+而 `energy` 每帧被写回，改它没用）。
+⚠️ 前提两条：**玩家灯火半径冻在 150**（显式清零升级与恩赐）、**两个窗灯关掉后一样亮**。
+
+### 世界 / 主循环的接线（都是"上下界 / 文案 / 早退"那一类）
+- `World.setup()`：`level_index = lv_index`（**去掉了"`-1` = 保持不变"那个含糊默认**）、
+  `is_hub = Content.is_hub(level_index)`；`_roll_anchors()` / `_roll_waves()` 对中枢早退。
+- `_update_waves()` 在**读 `level["boss"]` 之前**收住，判据是 **"数据在不在"**（不是 `is_hub`）——
+  一张没有 Boss 的图本来就该走这条路。
+- `up_target()`：中枢没有上游；**第一关的上游永远是出生地图**；再往上要求那一关已打通。
+  `down_target()`：中枢 → 第一关。
+- `ferry_options()`：**中枢不看 `cleared`**（它没有要清的场，门一直开着）。
+- `interact()` 对中枢的 goal 直接发 `ferry`；`_open_ferry()` 标题「暗 门」。
+- `Main.prog["level"]` 初值 / `show_title()` / `new_run()` 全指 `HUB_INDEX`；
+  `sail_to()` 夹子下界放松到 `HUB_INDEX`；hub 入场对白**一局只播一次**（`prog["hub_intro"]`）。
+
+### ⚠️ 本轮最大的坑：自检的基准关被一起改掉（症状完全不像根因）
+`Main._ready()` 里的 `show_title()` 会把 `prog["level"]` 设成 `HUB_INDEX`。
+自检原来在 `Main.new()` 之后就写 `main.prog["level"] = 0`，而 `add_child(main)` 在其**后**
+才触发 `_ready()` → **那一行被当场覆盖**。症状：`_check_boot()` 建出来是中枢，
+`_section_combat` 往一张没有 `enemy_scale` / `boss` 的图上刷敌人 → 一串 `SCRIPT ERROR`
+→ 每段在抛错处截断 → 报告 `512/528`，红的全是"机器人打不死敌人""撞墙位置不对"这类
+**看着毫无关联**的断言，真正的根因一个字都没提。
+- 修法两步：①那行**挪到 `add_child(main)` 之后**（并写清为什么必须是这个顺序）；
+  ②`World.spawn_enemy()` 的 `level["enemy_scale"]` 改 `level.get("enemy_scale", 1.0)`
+  （不是给中枢留刷怪的路 —— 那是 `_roll_waves()` 早退在管，只是别当场崩）。
+- **可推广**：节点在 `_ready()` 里改的状态，自检对它的初始化必须写在 `add_child()` 之后。
+
+### 顺带改掉的旧断言 / 旧注释
+- 「第一关**只有下游**」→ **第一关三个方向齐全**（顺流去第二关 / 逆流回前厅 / 留步），
+  新加辅助 `_panel_target_of(id)`（只断言"有 up 这一项"是不够的 —— 把 `up_target()` 改成
+  指向第三关照样绿）。
+- `_panel_index_of()` 上面那句注释"第一关没有「逆流」"已过期，改写了。
+
+### 其它
+- `CHECKS_MIN` 556 → **592**（= 实测 `checks_ran`）；`SECTIONS` 25 → **26**。
+- 自检新段 `_section_hub()` 排在 `_section_lamp_river` **之后**、`_section_fullscreen` 之前
+  （它要重建世界、还要把 `prog["level"]` 临时拨到 -1；退出时擦掉通关记录交回未打通的第一关）。
+- 新增 `LightRig.beacon_light()` 访问器（自检要就地切那盏灯的 `shadow_enabled`）。
+- 收尾实测 `report.json` md5 = **`b6b27e313f5d21188e9688368511cb5a`**（594 条 / errors 空 /
+  三次独立跑逐字节相同：1 次走变异脚本的基线、2 次走一键脚本）。
+  ⚠️ **中途抄的 `667fab4f…` 已过期** —— 那是加「留步」与「照亮场」两条断言**之前**的值。
+  **md5 一律在"最后一条断言加完之后"再取。**
+- 新截图：`43-hub-lit-half`、`44-hub-dark-half`、`45-hub-wall-shadow`（底色/真实/无遮挡三格）、
+  `46-hub-gate-panel`。
+- 变异 76 → **83**（7 条新的）。⚠️ 变异表的 `forbid` 第一次抄成
+  `"★ 明侧那半**就是这盏主灯**照出来的"`，真实断言名前还有 `"★ 【用户要的这条】"` ——
+  被 `unknown_targets()` **40 秒**拦下（不是等 45 秒跑完从"预期变红却没有"反推）。
+- ⚠️ `~/.cache/dq-mutate/src.bak` 与 src 不一致时会**拒绝开跑**：有意改过源码就把备份
+  **改名留档**（`src.bak.old-<ts>`），**不要删**。
+
 ## 仓库 / 版本控制
 - `origin` = **`git@github.com:Tino912/dengqishi.git`**（SSH，`/home/tino12/.ssh/id_rsa`）。
   沙箱 push/pull 要绕三层墙 → 见 skill **`git-remote-in-sandbox`**。

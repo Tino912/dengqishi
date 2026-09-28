@@ -173,13 +173,28 @@ var layout_info := {}
 ## 正常游戏恒为 false。自检默认 true，只在真正要验波次的两段临时放开。
 var waves_disabled := false
 
+## 这一张是不是**出生地图（中枢）**。由 `Content.is_hub(level_index)` 定，只此一处。
+##
+## 它没有波次 / Boss / 宝箱 / 火盆，目标文案与暗门交互也走另一套 ——
+## 但**"不刷怪"不是靠一个开关把语句挡住**（那是灯河那一轮明确否掉的做法），
+## 而是"这张图**没有波次数据**"：`setup()` 里那三套随机布局整段不跑，
+## 于是 `waves` 是空的、`boss_anchor` 是 0、Boss 链在读到 `level["boss"]` 之前就返回。
+var is_hub := false
+## 出生地图那盏常亮的主灯（`props` 里 kind = "beacon" 的那一项）。
+## 明暗分界靠它照亮的那一半，`LightRig` 与自检都读它。
+var hub_lamp_prop := {}
 
+
+## `lv_index`：`>= 0` 是第几关；**`Content.HUB_INDEX`（-1）= 出生地图**。
+## ⚠️ 这里**没有**"-1 = 保持不变"那种用法（第一版有过，但唯一的调用方
+## `Main.start_level()` 永远把 `prog["level"]` 原样传进来）—— 出生地图要占一个关卡号，
+## 那个含糊的默认值就必须让位。
 func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> void:
 	dev_spawn_all = dev
 	waves_disabled = waves_off
-	if lv_index >= 0:
-		level_index = lv_index
+	level_index = lv_index
 	level = Content.level_at(level_index)
+	is_hub = Content.is_hub(level_index)
 	# 这一关之前打通了吗（`prog["cleared"]` 由 Main 记账）。
 	#
 	# ⚠️ **必须在这一步、在任何东西被建出来之前定下来** —— 后面的 `girl`、
@@ -263,6 +278,13 @@ func setup(dev := false, lv_index := -1, seed_v := 0, waves_off := false) -> voi
 			"merchant":
 				merchant_prop = pr
 			"lighthouse":
+				goal_prop = pr
+			# ── 出生地图的两样（见 `Content.HUB`）──
+			# 主灯：明侧就是它照出来的。**不进 `goal_prop`** —— 它不是终点，
+			# 走过去也不会开花。暗侧那扇门才是"地图上的出口"。
+			"beacon":
+				hub_lamp_prop = pr
+			"gate":
 				goal_prop = pr
 	if not goal_prop.is_empty():
 		goal_prop["x"] = level["goal"]["pos"].x
@@ -749,7 +771,13 @@ func _roll_chest_spots(fallback: Array) -> Array:
 
 
 ## 敌人锚点：Boss 场地一个 + 每一波一个。
+##
+## 出生地图**返回空的那一份** —— 它没有 Boss 也没有波次，所以没什么可锚的。
+## 这样写（而不是在 `setup()` 里 `if not is_hub:` 包住一整段）是为了让"没有敌人"
+## 这件事**由数据决定**：`HUB` 里没有 `boss` 这个键，这里就不该去读它。
 func _roll_anchors() -> Dictionary:
+	if is_hub:
+		return {"waves": [], "boss": Vector2.ZERO, "fallbacks": 0}
 	var lw := float(level["w"])
 	var lh := float(level["h"])
 	var start: Vector2 = level["start"]
@@ -836,6 +864,8 @@ func _roll_anchors() -> Dictionary:
 
 
 func _roll_waves(anchors: Array) -> Array:
+	if is_hub:
+		return []          # 出生地图没有波次数据（理由见 `_roll_anchors`）
 	var rng := Proj.make_rng(int(level["seed"]) + 7331)
 	var out := []
 	for i in level["waves"].size():
@@ -1922,7 +1952,10 @@ func spawn_enemy(type_id: String, x: float, y: float, is_elite := false, affix :
 	if not Content.ENEMIES.has(type_id):
 		return null
 	var def: Dictionary = Content.ENEMIES[type_id]
-	var scale := float(level["enemy_scale"])
+	# `get` 而不是 `[]`：出生地图（`Content.HUB`）**故意没有 `enemy_scale` 这一项** ——
+	# 它不刷怪。这里只是"万一有人往中枢里塞了一只"时不要当场崩，
+	# 而不是给中枢留一条"其实也能量产敌人"的路（那是 `_roll_waves()` 的早退在管）。
+	var scale := float(level.get("enemy_scale", 1.0))
 	if is_elite:
 		def = Content.eliteify(def)
 		# 精英词缀：不指定就按种子从词缀表里抽一个（同一局确定，不同局不同）
@@ -3113,6 +3146,12 @@ func _update_waves(dt: float) -> void:
 
 	# Boss：其它波次全清后再进入区域才触发
 	# （`waves_disabled` 时整条链在本函数开头就 return 了，到不了这里）
+	#
+	# ⚠️ 出生地图**没有 `boss` 这个数据** —— 在这儿收住，不去读它。
+	#    判据刻意是"数据在不在"而**不是 `is_hub`**：一张没有 Boss 的图
+	#    本来就该走这条路，跟它是不是中枢无关。
+	if not level.has("boss"):
+		return
 	if not boss_spawned and not boss_dead:
 		var all_clear := true
 		for w in waves:
@@ -3306,7 +3345,11 @@ func _update_interaction(dt: float) -> void:
 		var d := Proj.dist(p.x, p.y, float(goal_prop["x"]), float(goal_prop["y"]))
 		if d < 110.0 and d < best_d:
 			best_d = d
-			if bool(goal_prop["lit"]):
+			if is_hub:
+				# 出生地图：这是**暗侧那扇门**，不是灯塔。它没有"要不要点灯"的问题 ——
+				# 门一直是开的（这儿没有要清的场）。
+				best = "暗门：按 E 出发（灯河顺流 · 去「%s」）" % str(Content.level_at(0)["name"])
+			elif bool(goal_prop["lit"]):
 				best = "灯河渡口：按 E 登船（顺流而下 / 逆流而上）"
 			elif braziers_required > 0 and braziers_lit < braziers_required:
 				best = "灯塔没反应 · 还差 %d 座火盆" % (braziers_required - braziers_lit)
@@ -3372,7 +3415,11 @@ func interact() -> void:
 		events.append({"type": "shop"})
 		return
 	if not goal_prop.is_empty() and Proj.dist(p.x, p.y, float(goal_prop["x"]), float(goal_prop["y"])) < 110.0:
-		if bool(goal_prop["lit"]):
+		if is_hub:
+			# 出生地图的暗门：**一直是开的**（这里没有要清的场，也没有要点亮的灯塔）。
+			# 换关照旧交给 main —— 世界不该知道别的关卡长什么样。
+			events.append({"type": "ferry"})
+		elif bool(goal_prop["lit"]):
 			# 灯河渡口：面板列"顺流 / 逆流（如果上一关已打通）/ 留步"，
 			# 换关由 main 做（世界不该知道别的关卡长什么样）。
 			events.append({"type": "ferry"})
@@ -3395,29 +3442,61 @@ func _level_cleared(i: int) -> bool:
 	return (m as Dictionary).has(i)
 
 
+## 上游是哪一张图（`Content.NO_TARGET` = 没有上游）。**只有这一个出处** ——
+## 面板显示什么、按下去真的去哪、自检断言什么，都从它走。
+##
+## 三种情形：
+##   · **出生地图**：没有上游（它自己就是最上面那张图）；
+##   · **第一关**：上游**永远是出生地图** —— 中枢不该"打不赢就回不去"
+##     （而且回前厅不推进任何进度，回去没有代价）；
+##   · 再往上：要求那一关已经打通（与第一版一致：灯河只朝**亮起来过**的地方流）。
+func up_target() -> int:
+	if is_hub:
+		return Content.NO_TARGET
+	if level_index == 0:
+		return Content.HUB_INDEX
+	if _level_cleared(level_index - 1):
+		return level_index - 1
+	return Content.NO_TARGET
+
+
+## 下游是哪一张图（`Content.NO_TARGET` = 没有下游）。出生地图的下游就是第一关。
+func down_target() -> int:
+	if level_index < Content.level_count() - 1:
+		return level_index + 1
+	return Content.NO_TARGET
+
+
 ## 灯河渡口能去的方向。**只有这一个出处** —— 面板显示什么、按下去去哪、
 ## 自检断言什么，都从这里走，免得出现"显示了三项、按第二项没反应"这种
 ## 只在真按下去那一刻才暴露的错位。
 ##
-## 每项：`id`（down / up / stay）、`target`（目标关号，-1 = 不动）、
+## 每项：`id`（down / up / stay）、`target`（目标关号，`NO_TARGET` = 不动）、
 ## 以及面板要的三行文案（`kind_label` 会印在卡片的角标上）。
 func ferry_options() -> Array:
 	var out := []
-	if not cleared:
-		return out                       # 灯河还没亮，没得选
-	var lv := level_index
-	var last := Content.level_count() - 1
-	if lv < last:
-		var nx: Dictionary = Content.level_at(lv + 1)
-		out.append({"id": "down", "target": lv + 1, "kind": "boon", "kind_label": "顺流",
+	# 出生地图**没有"灯河亮没亮"这回事**：它没有要清的场，门口那扇门一直是开的。
+	# 别的关卡照旧：这一关打通了（灯塔亮了）才谈得上登船。
+	if not is_hub and not cleared:
+		return out
+	var dn := down_target()
+	if dn != Content.NO_TARGET:
+		var nx: Dictionary = Content.level_at(dn)
+		out.append({"id": "down", "target": dn, "kind": "boon", "kind_label": "顺流",
 			"name": "顺流而下 · 前往「%s」" % str(nx["name"]),
 			"desc": "灯河朝下游去。那里还没点灯 —— %s" % str(nx["lore"])})
-	if lv > 0 and _level_cleared(lv - 1):
-		var pv: Dictionary = Content.level_at(lv - 1)
-		out.append({"id": "up", "target": lv - 1, "kind": "boon", "kind_label": "逆流",
+	var up := up_target()
+	if up != Content.NO_TARGET:
+		var pv: Dictionary = Content.level_at(up)
+		# 上游是出生地图时换一句文案：它不是"已经恢复光明的那一关"，
+		# 而是**你出发的地方**（明暗两半都是它本来的样子）。
+		var udesc := "灯河朝上游去。那一关已经恢复光明，灯还亮着。"
+		if up == Content.HUB_INDEX:
+			udesc = "灯河朝上游去 —— 回到「%s」，那是你出发的地方。" % str(pv["name"])
+		out.append({"id": "up", "target": up, "kind": "boon", "kind_label": "逆流",
 			"name": "逆流而上 · 回到「%s」" % str(pv["name"]),
-			"desc": "灯河朝上游去。那一关已经恢复光明，灯还亮着。"})
-	out.append({"id": "stay", "target": -1, "kind": "boon", "kind_label": "留步",
+			"desc": udesc})
+	out.append({"id": "stay", "target": Content.NO_TARGET, "kind": "boon", "kind_label": "留步",
 		"name": "留在此地",
 		"desc": "不上船。灯河就在这儿流着，什么时候走都行。"})
 	return out
@@ -3430,6 +3509,10 @@ func _update_objective() -> void:
 	var done := waves_cleared_count()
 	if player.dead:
 		objective = "你的灯灭了……"
+	elif is_hub:
+		# 出生地图没有"清多少波"这回事：它只有一件事要做 —— 从暗处那扇门走出去。
+		objective = "%s　·　明处是守灯人，暗处那扇门通向「%s」" \
+			% [str(level["name"]), str(Content.level_at(0)["name"])]
 	elif not cleared:
 		if braziers_required > 0 and braziers_lit < braziers_required:
 			objective = "点燃火盆 %d / %d　·　清影 %d / %d 波" % [braziers_lit, braziers_required, done, total]

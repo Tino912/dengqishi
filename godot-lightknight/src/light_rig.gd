@@ -46,6 +46,7 @@ var goal_light: PointLight2D
 
 var _occluders: Array[LightOccluder2D] = []
 var _brazier_lights := {}     # prop index -> PointLight2D
+var _beacon_lights := {}      # prop index -> PointLight2D（出生地图的主灯）
 var _enemy_lights := {}       # enemy id -> PointLight2D
 ## 「攻击类」的短命灯：挥击、飞行中的弹丸、留场的光球/光柱。
 ## key 是**稳定字符串**（`"swing"` / `"proj:<pid>"` / `"fx:<id>"`）——
@@ -345,7 +346,19 @@ func fx_light_keys() -> Array:
 	return _fx_lights.keys()
 
 
+## 出生地图那盏主灯的 `PointLight2D`（没有就返回 null）。
+##
+## 自检要**就地切它的 `shadow_enabled`** 来验"暗侧之所以暗是墙挡的" ——
+## 走这个访问器而不是自己去摸 `_beacon_lights`：灯层怎么存是这一层的私事
+## （现在按 prop 下标存，将来可能换成别的键），断言不该跟着变。
+func beacon_light() -> PointLight2D:
+	if _beacon_lights.is_empty():
+		return null
+	return _beacon_lights.values()[0]
 
+
+
+## 火盆：点着了才有灯。
 func _sync_prop_lights(world) -> void:
 	for i in world.props.size():
 		var pr: Dictionary = world.props[i]
@@ -363,6 +376,34 @@ func _sync_prop_lights(world) -> void:
 		if lit:
 			# 这盏灯抬了 22px（见上面 `l.position`），z 要一起交出去
 			_add_source(float(pr["x"]), float(pr["y"]), 210.0, "brazier", 22.0)
+	# 出生地图的主灯（灯堡前厅那盏不灭的灯）。
+	# **它是唯一一盏"没有开关"的灯**：灯层、照亮场（雾的 reveal）、自检里的
+	# "明暗分界"三处读的都是同一个半径 `Content.HUB_BEACON_R`。
+	_sync_beacon_light(world)
+
+
+## 出生地图的主灯。半张地图就是它照出来的（见 `Content.HUB` 那段注释）。
+##
+## 三件事与火盆刻意不同：
+##   · **带遮挡**（`shadows = true`）。这不是省事：明暗的分界线本来就是
+##     **分界墙**划出来的 —— 灯照不到的暗侧才是暗的，而不是"离得远所以淡"。
+##     关掉遮挡，光会从墙顶翻过去把暗侧也照亮，"一边明一边暗"当场消失。
+##   · **能量/半径从 `Content` 读**（不在这里写死）：判据要拿它当尺子。
+##   · 灯抬到灯头高度（`h * 0.72`），z 一起交给照亮场，两层才不会差开。
+func _sync_beacon_light(world) -> void:
+	for i in world.props.size():
+		var pr: Dictionary = world.props[i]
+		if str(pr["kind"]) != "beacon":
+			continue
+		if not _beacon_lights.has(i):
+			_beacon_lights[i] = _make_light(Content.HUB_BEACON_R, Content.HUB_BEACON_E,
+				Color(1.0, 0.90, 0.70), true)
+		var l: PointLight2D = _beacon_lights[i]
+		var z := float(pr["h"]) * 0.72
+		l.position = Vector2(float(pr["x"]), float(pr["y"]) * Proj.YSQUASH - z)
+		l.texture_scale = Content.HUB_BEACON_R / TEX_HALF
+		l.energy = Content.HUB_BEACON_E * (0.985 + 0.015 * sin(world.time * 2.3))
+		_add_source(float(pr["x"]), float(pr["y"]), Content.HUB_BEACON_R, "beacon", z)
 
 
 func _sync_enemy_lights(world) -> void:

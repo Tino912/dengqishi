@@ -79,6 +79,16 @@ func _ready() -> void:
 	# 只有 `_section_waves_boss()` 会临时放开（并重建世界拿干净进度）。
 	main.waves_off = true
 	sub.add_child(main)
+	# ⚠️ **必须在 `add_child()` 之后** —— `Main._ready()` 里那句 `show_title()`
+	# 会把 `prog["level"]` 设成 `Content.HUB_INDEX`（游戏里一开机就该站在前厅），
+	# 写在 `add_child()` 之前会被它当场覆盖掉。
+	#
+	# 自检的基准关是「灯堡外庭」（0），不是出生地图：不在这一行扳回来的话，
+	# `_check_boot()` 那一次 `start_level()` 建出来的是**出生地图**，
+	# 接着 `_section_combat` 往一张没有 `enemy_scale`、没有 `boss` 的图上刷敌人 ——
+	# 一连串 `SCRIPT ERROR`，二十来条断言整片塌掉（实测总数 558 → 526）。
+	# 出生地图本身由 `_section_hub()` 单独从头验（它自己改成 HUB_INDEX 再改回来）。
+	main.prog["level"] = 0
 
 	GameInput.aim_mode = "move"
 	# 玩家自己改过的键位存在 `user://keybindings.json`，GameInput 起来时会把它读回来。
@@ -131,6 +141,9 @@ func _run() -> void:
 	# 真的渡河换关（`prog["cleared"]` 会被写），所以只能放在"世界随便重建"的末尾几段；
 	# 它自己收尾时会 `forget_cleared()` 并重建第一关，退出时世界与别段看到的一致。
 	await _sec(_section_lamp_river)
+	# 出生地图（中枢）。**接在灯河之后**：它也要重建世界、还会把 `prog["level"]`
+	# 临时拨到 `HUB_INDEX`（-1），退出时擦掉通关记录并交回"未打通的第一关"。
+	await _sec(_section_hub)
 	# F11 全屏。**排在最末**：这一段会真去切真实窗口（全屏 ↔ 窗口），
 	# 全屏时窗口变成 2560×1600、软件渲染会慢一截 —— 放前面会拖慢后面每一段。
 	# 像素采样用的是固定尺寸 SubViewport，所以窗口怎么变都不影响前面的判定。
@@ -149,7 +162,7 @@ func _run() -> void:
 ##    原因见 `_sec()`：段内抛错时 `await f.call()` 照样返回、`_sections_done += 1`
 ##    照样执行 —— 于是"段数"这个量对"段内少跑了一半"完全无感。
 ##    留着它只当个信息量（`report["samples"]["sections_done"]`）。
-const SECTIONS := 25
+const SECTIONS := 26
 ## **各段跑完之后、`_finish()` 登记哨兵之前**，应该已经跑过的断言条数下限。
 ##
 ## 为什么不能用段数当哨兵（见 `SECTIONS` 上面那条实测），而必须**数断言本身**：
@@ -163,7 +176,7 @@ const SECTIONS := 25
 ##    `_finish()` 里加/减哨兵都不必回来改它 —— 实测踩过一次：
 ##    第一版抄的是 `checks_total`（含哨兵自己），哨兵里就得补个 `+ 1`，
 ##    那个 `+ 1` 极容易忘、忘了就恒红。
-const CHECKS_MIN := 556
+const CHECKS_MIN := 592
 ## 伤害光圈的判据（见 `_section_damage_glow`）：
 ## `GLOW_OLD_MUL` 是把旋钮拧回**旧尺寸**那一档要用的倍数。旋钮同时缩放半径与不透明度，
 ## 于是能量按 m³ 走，m 就取两个"旧/新能量比"开三次方的几何中点：
@@ -5905,9 +5918,14 @@ func _section_lamp_river() -> void:
 	_pump(1, {}, false)        # 面板开着时别让 _pump 替我们选（auto_draft = false）
 	_ok("② 按 E 打开灯河渡口面板", main.state == "draft" and main._panel_kind == "ferry",
 		"%s/%s" % [main.state, main._panel_kind])
-	_ok("② 第一关**只有下游**：顺流而下 + 留步（上游没有关，就不该给出「逆流」这一项）",
-		_panel_index_of("down") == 0 and _panel_index_of("up") < 0
-		and _panel_index_of("stay") > 0, _panel_ids())
+	_ok("★ ② 第一关的渡口**三个方向齐全**：顺流去第二关、逆流回出生地图、留步"
+		+ "（逆流这一股是新加的 —— 出生地图就是第一关的上游）",
+		_panel_index_of("down") == 0 and _panel_index_of("up") > 0
+		and _panel_index_of("stay") > 0
+		and _panel_target_of("up") == Content.HUB_INDEX
+		and _panel_target_of("down") == 1,
+		"ids=%s　up→%d　down→%d" % [_panel_ids(), _panel_target_of("up"),
+			_panel_target_of("down")])
 	_ferry_sail("down")
 	_ok("★ 顺流而下 → 真的到了第二关",
 		int(main.prog["level"]) == 1 and int(_w().level["index"]) == 1,
@@ -6178,8 +6196,357 @@ func _section_lamp_river() -> void:
 	}
 
 
+# ================================================================ 出生地图（中枢）
+#
+# 用户原话：「添加一个初始出生地图，这个地图是一边明一边暗，暗的那边通往关卡，
+# 明的那边有守灯人，未来可能还会添加一些其他功能。」
+#
+# ── 这一段验什么 ──────────────────────────────────────────────────────────
+#   ① 开局就在这张图上，而它**不是第 0 关**（`level_count()` 仍然是 3）；
+#   ② "一边明一边暗"是真的 —— 而且要说清它是**怎么**来的：
+#      明侧那半是主灯照的，暗侧那半是**分界墙挡下来的**（不是"离得远所以淡"）；
+#   ③ 暗侧那扇门走得到、按 E 开得出来、选下去真的进第一关；
+#   ④ 明侧的守灯人是个**能用的**商店，不是一尊摆设。
+#
+# ── 明暗那一组断言是怎么设计的（这里最容易写出没牙的烟测）──────────────
+# 只断言"西半比东半亮"是**不够**的：把主灯搬走、改小、或者把两半对调，
+# 那句话都还能成立（只要别的地方还有点光）。所以这里配了三条互相咬合的：
+#   · **底色档**（只把主灯 `enabled = false`）：给出"这块地板在这档夜色下本来的样子"；
+#   · **绝对增量**：明侧窗比底色亮 ≥ `HUB_LIT_MIN_GAIN`（明侧真的是这盏灯照的），
+#     而暗侧窗与底色的差 ≤ `HUB_DARK_MAX_LEAK`（灯一点都过不去）；
+#   · **单变量前后对照**（只把主灯的 `shadow_enabled` 关掉）：暗侧窗立刻被照亮
+#     （光其实够得着，是被墙挡了），而墙**前**那一窗纹丝不动。
+# 最后那条还顺手把"灯变亮了 / 全局变亮了"这两个替代解释排除掉了。
+#
+# ⚠️ 一条前提必须写死：**玩家灯火半径冻在 150**（下面显式把升级与恩赐清零）。
+#    不冻的话前面段落买过的升级会让半径在 150~400 之间浮动，两个取样窗
+#    迟早会被玩家自己那盏灯扫到 —— 那时亮度差里混进了灯火，"墙挡的"这句话就不成立了。
+const HUB_LIT_MIN_GAIN := 0.08
+## 暗侧与底色的允许差（灯**漏**过去的部分）。实测 ~0.000，给 0.02 是留抗锯齿/抖动的余地。
+const HUB_DARK_MAX_LEAK := 0.02
+## 同一帧里 明侧窗 / 暗侧窗 的亮度比下限（实测约 2.1×）。
+const HUB_CONTRAST_MIN := 1.6
+## 关掉主灯遮挡后，暗侧窗至少该涨这么多（实测约 0.086）。
+const HUB_SHADOW_GAIN := 0.05
+## 同一对帧里，墙**前**那一窗允许的漂移（它是反向对照：本该纹丝不动）。实测 0.0002。
+const HUB_LIT_EPS := 0.02
+
+## 这一段用的取样窗（**现场扫出来的**，不是想当然划的）：
+## 相机站在世界 `HUB_CAM`，也就是**明侧、分界墙（x=880）以西**。
+##   · 明侧窗 = `HUB_LIT_PT`：落在主灯的灯池里（距灯 172），墙前；
+##   · 暗侧窗 = `HUB_DARK_PT`：在主灯射程内（距灯 529 < `HUB_BEACON_R` 980）
+##     但在**分界墙背后** —— 这一句就是上面那条单变量断言的立论。
+## 两个窗离玩家各 330（> 冻住后的灯火半径 150 + 窗半宽 90），都完整落在画面里、
+## 也都不压界面（纵带 y 300~420，界面在 0~150 与 480 以下）。
+const HUB_CAM := Vector2(750.0, 600.0)
+const HUB_LIT_PT := Vector2(420.0, 600.0)
+const HUB_DARK_PT := Vector2(1080.0, 600.0)
+const HUB_WIN := Vector2i(180, 120)
+
+
+func _section_hub() -> void:
+	main.waves_off = true
+	main.forget_cleared()
+
+	# ── ① 开局就在出生地图 ──
+	# 「回到标题」是一趟的起点，就顺手把"起点 = 前厅"钉在这里。
+	main.show_title()
+	_ok("★ 一趟的起点（回到标题）落在**出生地图**上，而不是第一关",
+		int(main.prog["level"]) == Content.HUB_INDEX,
+		"level=%d　HUB_INDEX=%d" % [int(main.prog["level"]), Content.HUB_INDEX])
+	_ok("★ 出生地图**不是第 0 关**：它没混进 LEVELS —— 本作仍然是三关",
+		Content.level_count() == 3 and Content.is_hub(Content.HUB_INDEX)
+		and str(Content.level_at(Content.HUB_INDEX)["name"]) == "灯堡前厅",
+		"%d 关" % Content.level_count())
+	_ok("关卡号越界仍然照夹：`level_at(-1)` 取前厅、`level_at(9)` 取最后一关",
+		int(Content.level_at(-1)["index"]) == Content.HUB_INDEX
+		and int(Content.level_at(9)["index"]) == Content.level_count() - 1)
+	_ok("「不动」这个哨兵值不再是 -1（-1 被出生地图占了）",
+		Content.NO_TARGET != Content.HUB_INDEX, str(Content.NO_TARGET))
+
+	# 冻住玩家灯火：下面所有亮度都只量"主灯 + 分界墙"那一层。
+	main.prog["up"]["light"] = 0
+	main.prog["shop"]["brightoil"] = 0
+	main.prog["boons"] = {}
+
+	main.prog["level"] = Content.HUB_INDEX
+	main.start_level()
+	_pump(3)
+	var w := _w()
+	_ok("★ 前厅真的建出来了（世界认自己是中枢）",
+		w.is_hub and w.level_index == Content.HUB_INDEX,
+		"is_hub=%s　index=%d" % [w.is_hub, w.level_index])
+	_ok("★ 玩家灯火半径冻在 150（下面两个取样窗都在它够不到的地方）",
+		is_equal_approx(w.player_light_radius(), 150.0), "%.1f" % w.player_light_radius())
+
+	# ── 中枢里没有仗要打 ──
+	_ok("★ 中枢没有战斗资源：没有波次 / 没有 Boss / 没有宝箱 / 没有火盆",
+		w.waves.is_empty() and not w.level.has("boss") and w.chests.is_empty()
+		and w.braziers.is_empty(),
+		"波 %d　宝箱 %d　火盆 %d" % [w.waves.size(), w.chests.size(), w.braziers.size()])
+	# ⚠️ 验**状态**不验开关：把波次链放开、在暗侧空跑 1.5 秒，一个影子都不该出现。
+	#    只看 `waves_off` 的话，"数据里塞了波次但链没接上"这种照样绿。
+	main.waves_off = false
+	w.teleport(1200.0, 700.0)
+	_pump(90)
+	_ok("★ 中枢不刷怪：放开波次链、空跑 1.5 秒，场上一个影子都没有",
+		w.alive_enemy_count() == 0 and w.boss_enemy == null and w.waves.is_empty(),
+		"场上 %d 只" % w.alive_enemy_count())
+	_ok("★ 中枢也没有要清的场：目标栏写的是「出门」，不是「清 X 波」",
+		w.objective.find("清影") < 0 and w.objective.find("波") < 0, w.objective)
+	main.waves_off = true
+
+	# ── ② 明暗两半：主灯 + 分界墙 ──
+	var lit_x := float(w.level["lit_x_max"])
+	var div := []
+	for ww in w.walls:
+		if is_equal_approx(float(ww[0]), lit_x):
+			div.append(ww)
+	_ok("★ 分界墙立在 `lit_x_max` 这一行上，而且是**两段**（中间留一个门洞）",
+		div.size() == 2, "%d 段" % div.size())
+	_ok("★ 门洞真的是通的：站在门洞中线不被墙挡",
+		not w.blocked(lit_x + 30.0, 1090.0, 16.0))
+	_ok("★ 而门洞以外是堵死的：同一条线上、门洞南北两侧都拦得住人",
+		w.blocked(lit_x + 30.0, 500.0, 16.0) and w.blocked(lit_x + 30.0, 1290.0, 16.0))
+	# 位置三条**同源**：都问 `lit_x_max` 这一个数。
+	# 出生点与守灯人必须在明侧、暗门必须在暗侧 —— 把主灯挪到东边、或者把守灯人
+	# 放到暗侧，这三条里必有一条当场红。
+	_ok("★ 出生点在明侧", float(w.level["start"].x) < lit_x,
+		"start.x=%.0f　lit_x_max=%.0f" % [float(w.level["start"].x), lit_x])
+	_ok("★ 守灯人在明侧（用户要的「明的那边有守灯人」）",
+		not w.merchant_prop.is_empty() and float(w.merchant_prop["x"]) < lit_x,
+		"x=%.0f" % (float(w.merchant_prop["x"]) if not w.merchant_prop.is_empty() else -1.0))
+	_ok("★ 暗门在暗侧（用户要的「暗的那边通往关卡」）",
+		str(w.goal_prop["kind"]) == "gate" and float(w.goal_prop["x"]) > lit_x,
+		"kind=%s　x=%.0f" % [str(w.goal_prop.get("kind", "")), float(w.goal_prop["x"])])
+	_ok("★ 主灯在明侧、而且是一盏**带遮挡**的灯（不带遮挡，光会从墙顶翻过去）",
+		not w.hub_lamp_prop.is_empty() and float(w.hub_lamp_prop["x"]) < lit_x
+		and w.light_rig.beacon_light() != null and w.light_rig.beacon_light().shadow_enabled,
+		"x=%.0f" % (float(w.hub_lamp_prop["x"]) if not w.hub_lamp_prop.is_empty() else -1.0))
+	# 主灯必须**同时**交给雾的照亮场（`_add_source`）—— 灯层亮了、雾那一层不知道，
+	# 前厅在雾里就是"只有一小圈亮"，明暗两半那件事就漏掉了一半。
+	# 这一条单独钉，是因为下面的像素断言全都把雾**关掉**了（量的是灯层 + 墙那一层）。
+	_ok("★ 主灯也把自己交给了照亮场（雾那一层要知道它照到哪儿）",
+		w.light_rig.src_kind.has("beacon"), str(w.light_rig.source_count()))
+
+	# ── ② 画面层：三档状态一次量完（底色 / 真实 / 无遮挡）──
+	# 雾归雾：雾自己有照亮场，会把"灯照到哪儿"再画一遍（那是另一层的事，
+	# 在 `_section_fog_night` 里单独验）。这里要量的是**主灯 + 墙**，所以把雾关掉。
+	#
+	# ⚠️ **底色不能用"屏幕上找一个离灯够远的点"**：`HUB_BEACON_R` 是 980，
+	#    而画面只有 1280×1161 —— 屏幕上几乎没有"灯够不到"的地方。
+	#    所以底色是**把主灯关掉**（`PointLight2D.enabled = false`）量出来的：
+	#    这一手同时把"明侧那半就是这盏灯照出来的"直接钉住（见下面第一条）。
+	#    灯层每帧只写 `position / texture_scale / energy`，不碰 `enabled` ——
+	#    这个旋钮拧得住（这是它跟"把 energy 改小"的区别那个旋钮每帧被写回）。
+	w.set_fog_enabled(false)
+	w.teleport(HUB_CAM.x, HUB_CAM.y)
+	_pump(12)
+	var rl := _hub_window(HUB_LIT_PT.x, HUB_LIT_PT.y)
+	var rd := _hub_window(HUB_DARK_PT.x, HUB_DARK_PT.y)
+	_ok("前提：两个取样窗都完整落在画面里（硬编的窗跑到画面外会静默量到别的东西）",
+		_hub_window_inside(rl) and _hub_window_inside(rd),
+		"%s　%s" % [str(rl), str(rd)])
+	_ok("前提：两个取样窗里都没有玩家自己那盏灯",
+		_hub_window_far_from_player(rl) and _hub_window_far_from_player(rd),
+		"r=%.0f" % w.player_light_radius())
+
+	var bl := w.light_rig.beacon_light()
+	bl.enabled = false
+	_pump(2)
+	var img_dark0 := await _grab()
+	var lit_floor := _region_lum(img_dark0, rl)
+	var dark_floor := _region_lum(img_dark0, rd)
+	_num("中枢·主灯关掉后的明侧窗（底色）", lit_floor)
+	_num("中枢·主灯关掉后的暗侧窗（底色）", dark_floor)
+	_ok("前提：两个取样窗底下是**同一块地板同一种夜色**（灯关掉后两窗应当一样亮 —— "
+		+ "不然下面的差就不是灯照出来的，而是地板本来就不一样）",
+		absf(lit_floor - dark_floor) <= 0.02,
+		"%.3f vs %.3f" % [lit_floor, dark_floor])
+
+	bl.enabled = true
+	_pump(2)
+	var img_on := await _grab()
+	var lit_on := _region_lum(img_on, rl)
+	var dark_on := _region_lum(img_on, rd)
+	_num("中枢·明侧窗亮度", lit_on)
+	_num("中枢·暗侧窗亮度", dark_on)
+	_ok("★ 【用户要的这条】明侧那半**就是这盏主灯**照出来的（把它关掉，明侧窗相对"
+		+ "底色应当暗掉一大截）",
+		lit_on - lit_floor >= HUB_LIT_MIN_GAIN,
+		"%.3f → %.3f（+%.3f）" % [lit_floor, lit_on, lit_on - lit_floor])
+	_ok("★ 而暗侧那半**主灯一点都照不到**：开灯与关灯，暗侧窗的差 ≤ %.2f —— "
+		% HUB_DARK_MAX_LEAK + "墙把它挡在外面（不是「离得远所以淡」）",
+		dark_on - dark_floor <= HUB_DARK_MAX_LEAK,
+		"%.3f → %.3f（+%.3f）" % [dark_floor, dark_on, dark_on - dark_floor])
+	_ok("★ 【用户要的这条】一边明一边暗：同一帧里，明侧窗比暗侧窗亮 %.1f 倍以上"
+		% HUB_CONTRAST_MIN,
+		lit_on >= dark_on * HUB_CONTRAST_MIN,
+		"%.3f vs %.3f（%.2f×）" % [lit_on, dark_on, lit_on / maxf(dark_on, 0.0001)])
+
+	# 单变量：只把那盏主灯的 `shadow_enabled` 关掉，别的一个字都不动。
+	bl.shadow_enabled = false
+	_pump(2)
+	var img_off := await _grab()
+	var lit_off := _region_lum(img_off, rl)
+	var dark_off := _region_lum(img_off, rd)
+	_num("中枢·关掉主灯遮挡后的明侧窗", lit_off)
+	_num("中枢·关掉主灯遮挡后的暗侧窗", dark_off)
+	_ok("★ 暗侧之所以暗，是**墙挡住了光**（不是灯够不着）：只关掉主灯的遮挡，"
+		+ "暗侧窗立刻被照亮",
+		dark_off >= dark_on + HUB_SHADOW_GAIN,
+		"%.3f → %.3f（+%.3f）" % [dark_on, dark_off, dark_off - dark_on])
+	_ok("★ 反向对照（同一对帧）：墙**前**那一窗几乎没动 —— 变的确实是被墙挡住的那部分，"
+		+ "不是灯变亮了或者全局变亮了",
+		absf(lit_off - lit_on) <= HUB_LIT_EPS, "%.3f → %.3f" % [lit_on, lit_off])
+	bl.shadow_enabled = true
+	_pump(2)
+
+	await _shot("43-hub-lit-half")
+	w.teleport(1500.0, 700.0)
+	_pump(12)
+	await _shot("44-hub-dark-half")
+	w.teleport(HUB_CAM.x, HUB_CAM.y)
+	_pump(12)
+	_write_png(_grid([_hub_tile(img_dark0), _hub_tile(img_on), _hub_tile(img_off)], 3),
+		"45-hub-wall-shadow")
+	report["cases"]["hub"] = {
+		"lit_on": snappedf(lit_on, 0.0001), "dark_on": snappedf(dark_on, 0.0001),
+		"lit_off": snappedf(lit_off, 0.0001), "dark_off": snappedf(dark_off, 0.0001),
+		"lit_floor": snappedf(lit_floor, 0.0001), "dark_floor": snappedf(dark_floor, 0.0001),
+		"beacon_gain": snappedf(lit_on - lit_floor, 0.0001),
+		"wall_leak": snappedf(dark_on - dark_floor, 0.0001),
+		"contrast": snappedf(lit_on / maxf(dark_on, 0.0001), 0.01),
+		"shadow_gain": snappedf(dark_off - dark_on, 0.0001),
+		"lit_drift": snappedf(absf(lit_off - lit_on), 0.0001),
+		"lit_x_max": lit_x, "beacon_r": Content.HUB_BEACON_R,
+		"win_lit": [rl.position.x, rl.position.y, rl.size.x, rl.size.y],
+		"win_dark": [rd.position.x, rd.position.y, rd.size.x, rd.size.y],
+	}
+
+	# ── ③ 暗侧那扇门通向关卡（走玩家输入路径）──
+	w.teleport(float(w.goal_prop["x"]) - 40.0, float(w.goal_prop["y"]))
+	_pump(4)
+	_ok("★ 走到暗门前，提示是「出发」而不是「这里是庇护所」",
+		w.prompt.find("暗门") >= 0, w.prompt)
+	_tap("interact")
+	_pump(1, {}, false)
+	_ok("★ 按 E 打开的是「暗门」面板（不是灯塔的「灯河渡口」）",
+		main.state == "draft" and main._panel_kind == "ferry" and main._panel_title.find("暗") >= 0,
+		"%s/%s/%s" % [main.state, main._panel_kind, main._panel_title])
+	_ok("★ 暗门的面板**没有「逆流」**（前厅就是灯河的源头），只有顺流与留步：%s"
+		% _panel_ids(),
+		_panel_index_of("up") < 0 and _panel_index_of("down") == 0
+		and _panel_index_of("stay") == 1)
+	await _shot("46-hub-gate-panel")
+	# 「留步」= 不出门：**世界一个字节都不该重建**（人还站在门口）。
+	# 这条单列，是因为面板上"留步"那一项的 `target` **根本没人读**
+	# （`Main._take_draft` 只对 down / up 走 `sail_to`）—— 只断言那个数字
+	# 等于 `Content.NO_TARGET` 是**没有牙**的：两处一起改就一起绿。
+	var w_keep := w
+	_ferry_sail("stay")
+	_ok("★ 在暗门前选「留步」→ 世界没有重建（人还站在前厅门口）",
+		main.state == "play" and _w() == w_keep and _w().is_hub,
+		"%s　同一个世界=%s" % [main.state, _w() == w_keep])
+	# 重新走到门口，这次真的出门。
+	w.teleport(float(w.goal_prop["x"]) - 40.0, float(w.goal_prop["y"]))
+	_pump(4)
+	_tap("interact")
+	_pump(1, {}, false)
+	_ferry_sail("down")
+	_ok("★ 【用户要的这条】从暗门顺流而下 → 真的进了第一关",
+		int(main.prog["level"]) == 0 and int(_w().level["index"]) == 0 and not _w().is_hub,
+		"level=%d　index=%d" % [int(main.prog["level"]), int(_w().level["index"])])
+
+	# ── ④ 从第一关回得来 ──
+	# 灯河的规矩是"只在亮起来的地方流"：第一关**没打通时渡口是空的**
+	# （那条前提由 `_section_lamp_river` 的 ① 钉着）。这里用"已打通"的那一版，
+	# 逆流那一股应当指向**出生地图** —— 而且真的按下去能回去。
+	main._mark_cleared(0)
+	main.prog["level"] = 0
+	main.start_level()
+	_pump(3)
+	var wb := _w()
+	_ok("前提：这一版的第一关是「已打通」的（渡口会亮）",
+		wb.cleared and wb.revisiting, "cleared=%s　revisiting=%s" % [wb.cleared, wb.revisiting])
+	wb.teleport(float(wb.goal_prop["x"]), float(wb.goal_prop["y"]) + 40.0)
+	_pump(4)
+	_tap("interact")
+	_pump(1, {}, false)
+	_ok("★ 已打通的第一关，渡口多出一股**逆流**，而且指向出生地图（不是指向别处）：%s"
+		% _panel_ids(),
+		_panel_index_of("up") >= 0 and _panel_target_of("up") == Content.HUB_INDEX,
+		"up→%d" % _panel_target_of("up"))
+	_ferry_sail("up")
+	_ok("★ 逆流而上 → 真的回到了出生地图（暗侧那扇门是双向的）",
+		int(main.prog["level"]) == Content.HUB_INDEX and _w().is_hub,
+		"level=%d" % int(main.prog["level"]))
+
+	# ── ⑤ 明侧的守灯人是个能用的商店 ──
+	var wh := _w()
+	wh.teleport(float(wh.merchant_prop["x"]) + 40.0, float(wh.merchant_prop["y"]))
+	_pump(4)
+	_ok("★ 明侧的守灯人给出商店提示（不是一尊摆设）",
+		wh.prompt.find("守灯人") >= 0, wh.prompt)
+	_tap("interact")
+	_drain_dialogue()
+	_pump(2, {}, true, true, false)     # auto_shop = false：这一段自己接管
+	_ok("★ 按 E 真的开得出守灯人的商店（重铸 / 锤炼 / 买灯油那一个）",
+		main.state == "shop", main.state)
+	_tap("pause")
+	_pump(2)
+
+	# ── ⑥ 收尾：把世界交回给后面的段落（未打通的第一关、波次停链）──
+	main.forget_cleared()
+	main.prog["level"] = 0
+	main.waves_off = true
+	main.start_level()
+	_pump(3)
+	_ok("★ 收尾：这一段之后世界回到「未打通的第一关」（与别的段落看到的一致）",
+		not _w().revisiting and not _w().cleared and _w().fog.enabled and not _w().is_hub,
+		"ambient %.3f　雾 %s" % [_w().ambient, _w().fog.enabled])
+
+
+## 以某个**世界点**为中心的取样窗（**不夹到画面内** —— 我们想看见"它跑出去了"）。
+func _hub_window(x: float, y: float) -> Rect2i:
+	var s := _screen_of(_w(), x, y)
+	return Rect2i(int(s.x) - HUB_WIN.x / 2, int(s.y) - HUB_WIN.y / 2, HUB_WIN.x, HUB_WIN.y)
+
+
+## 取样窗必须完整落在画面里。这是**前提**不是判据：窗跑到画面外，
+## 后面的亮度断言会拿到半张黑边（或者干脆是别的东西），静默失效。
+func _hub_window_inside(r: Rect2i) -> bool:
+	return r.position.x >= 0 and r.position.y >= 0 \
+		and r.position.x + r.size.x <= Proj.VIEW_W \
+		and r.position.y + r.size.y <= Proj.VIEW_H
+
+
+## 取样窗与玩家灯火不相交（按**世界**距离算：屏幕 x 与世界 x 是 1:1，见 `Proj.sx`）。
+## 这条是上面那条"半径冻在 150"的配套 —— 半径冻住了，窗也真的要离得够远。
+func _hub_window_far_from_player(r: Rect2i) -> bool:
+	var p := _w().player
+	var rr := float(_w().player_light_radius())
+	# 窗的世界跨度：x 与屏幕 1:1；y 要除回 YSQUASH
+	var wx0 := float(r.position.x) - Proj.VIEW_W * 0.5 + _w().draw_cam.x
+	var wx1 := wx0 + float(r.size.x)
+	var wy0 := (float(r.position.y) - Proj.VIEW_H * 0.5) / Proj.YSQUASH + _w().draw_cam.y
+	var wy1 := wy0 + float(r.size.y) / Proj.YSQUASH
+	var cx := clampf(p.x, wx0, wx1)
+	var cy := clampf(p.y, wy0, wy1)
+	return Proj.dist(p.x, p.y, cx, cy) > rr
+
+
+## 把整帧缩成一小块（对照图用）
+func _hub_tile(img: Image) -> Image:
+	var t := Image.new()
+	t.copy_from(img)
+	t.resize(t.get_width() / 4, t.get_height() / 4, Image.INTERPOLATE_BILINEAR)
+	return t
+
+
 ## 面板上某一项的序号（-1 = 没有）。灯河渡口的项数是**随进度变**的
-## （第一关没有「逆流」、最后一关没有「顺流」），所以按 id 找，不按位置。
+## （出生地图只有「顺流 / 留步」、第一关是「顺流 / 逆流（回前厅）/ 留步」、
+##   最后一关没有「顺流」），所以按 id 找，不按位置。
 func _panel_index_of(id: String) -> int:
 	for i in main._draft_items.size():
 		if str((main._draft_items[i] as Dictionary).get("id", "")) == id:
@@ -6192,6 +6559,18 @@ func _panel_ids() -> String:
 	for it in main._draft_items:
 		s.append(str((it as Dictionary).get("id", "?")))
 	return ",".join(s)
+
+
+## 面板上某一项要去哪一关（= 它的 `target`；找不到那一项就返回一个**不可能撞上**的值）。
+##
+## 为什么需要它：灯河渡口的面板只给"水流名"是不够的 —— `up` 那一项在出生地图
+## 接进来之前是指向不存在的上游，现在指向 `HUB_INDEX`。只断言"有 up 这一项"
+## 的话，把 `up_target()` 改成指向第三关照样绿（"有个上游"是同一个故事）。
+func _panel_target_of(id: String) -> int:
+	for it in main._draft_items:
+		if str((it as Dictionary).get("id", "")) == id:
+			return int((it as Dictionary).get("target", Content.NO_TARGET))
+	return Content.NO_TARGET - 1
 
 
 ## 等面板过掉装填窗口（面板刚弹出时确认键故意不生效，见 `Main.DRAFT_ARM`）。

@@ -28,8 +28,9 @@ var prog := {
 	## 武器元素：{武器id: 元素id}。**一局摇一次**（看 new_run），过关带走。
 	"welem": {},
 	"kills": 0, "deaths": 0, "max_combo": 0,
-	## 当前关卡（0 = 灯堡外庭，1 = 灯堡深处·无芯之暗，2 = 灯河渡口）
-	"level": 0,
+	## 当前关卡。**`Content.HUB_INDEX`（-1）= 出生地图「灯堡前厅」**，
+	## 0 / 1 / 2 = 灯堡外庭 / 灯堡深处 / 灯河渡口。
+	"level": Content.HUB_INDEX,
 	## 局内恩赐（肉鸽）。死亡 / 重开清空，过关带走。
 	"boons": {},
 }
@@ -123,7 +124,9 @@ func show_title() -> void:
 	state = "title"
 	_menu_kind = "title"
 	_free_world()
-	prog["level"] = 0
+	# 回到标题 = 这一局结束。**从头开始指的就是出生地图**（用户要的"初始出生地图"）：
+	# 前厅的灯亮着，守灯人在明处，要出门就得往暗处那扇门走。
+	prog["level"] = Content.HUB_INDEX
 	prog["boons"] = {}
 	prog["cleared"] = {}
 	hud.hide_draft()
@@ -346,6 +349,10 @@ func new_run() -> void:
 	# 新的一局：通关记录也清空（`show_title()` 已经清过一次，这里再兜一次 ——
 	# 留下记录的话，第一关一开就是"已恢复光明、不刷怪"的样子）。
 	prog["cleared"] = {}
+	# 新的一局从**出生地图**开始（"初始出生地图"）。写在 `show_title()` 里是"回到标题时"，
+	# 写在这里是"开始游戏时" —— 两条入口各写一次，比只写一处更稳（`--dev-spawn` 之类
+	# 绕过标题的路径也能落到前厅）。
+	prog["level"] = Content.HUB_INDEX
 	start_level()
 
 
@@ -384,8 +391,15 @@ func start_level() -> void:
 	# 回访**已打通**的那一关时不播入场对白："你第一次走进这里"那句话已经过去了。
 	# 取而代之的是一句报站（下面 `sail_to` 里发）。
 	if not skip_dialogue and not world.revisiting:
-		# 三关各自的入场对白：l1_start / l2_start / l3_start
-		play_dialogue("l%d_start" % (int(prog["level"]) + 1))
+		if world.is_hub:
+			# 出生地图：入场对白**一局只播一次**。前厅是来往必经之地，
+			# 每次路过都播一遍会把"出发"变成"看广告"（第一次那两句话仍然说得上）。
+			if not bool(prog.get("hub_intro", false)):
+				prog["hub_intro"] = true
+				play_dialogue("hub_start")
+		else:
+			# 三关各自的入场对白：l1_start / l2_start / l3_start
+			play_dialogue("l%d_start" % (int(prog["level"]) + 1))
 
 
 ## 下一关
@@ -414,8 +428,9 @@ func _mark_cleared(i: int) -> void:
 
 ## 渡河：顺流 / 逆流都走这一条。
 ##
-## ⚠️ 目标**就地夹住**（`clampi`）：逆流从第一关出发、顺流从最后一关出发，
-## 面板本来就不会给出那种选项；但这一层夹子保证"任何调用路径都不会越界出第 4 关"。
+## ⚠️ 目标**就地夹住**（`clampi`）：逆流从出生地图出发、顺流从最后一关出发，
+## 面板本来就不会给出那种选项；但这一层夹子保证"任何调用路径都不会越界"——
+## 下界是**出生地图**（-1）、上界是最后一关，两头都出不去。
 func sail_to(target: int) -> void:
 	# ⚠️ **这里不记账**。"已打通"只在 `stay_here()` 一处写下（清关面板上按空格
 	# 回到地图那一刻）—— 两处都写的话，"第一关被记成已打通"这条断言就被两个
@@ -426,7 +441,7 @@ func sail_to(target: int) -> void:
 	# 语义上收成一处也更干净：玩家**看见清关面板、按下空格**那一刻，这一关才算打完；
 	# 在那之前（Boss 刚死、面板还挂着）不算。同理，面板上按 R 重打这一关时，
 	# 不该留下"已打通"的记录。
-	prog["level"] = clampi(target, 0, Content.level_count() - 1)
+	prog["level"] = clampi(target, Content.HUB_INDEX, Content.level_count() - 1)
 	start_level()
 	if world != null:
 		if world.revisiting:
@@ -843,8 +858,13 @@ func _open_ferry() -> void:
 	_draft_index = 0
 	_draft_t = 0.0
 	_panel_kind = "ferry"
-	_panel_title = "灯 河 渡 口"
-	_panel_sub = "灯河从灯塔脚下流过：顺流是还没点灯的地方，逆流是已经亮起来的地方。"
+	if world.is_hub:
+		# 出生地图上这不是"渡口"，是**暗侧那扇门**（灯塔还没有，灯河在下游）。
+		_panel_title = "暗 门"
+		_panel_sub = "门外就是下游 —— %s。" % str(Content.level_at(0)["lore"])
+	else:
+		_panel_title = "灯 河 渡 口"
+		_panel_sub = "灯河从灯塔脚下流过：顺流是还没点灯的地方，逆流是已经亮起来的地方。"
 	_panel_hint = "Q ◀　　▶ E　选一股水流　·　空格 / 回车 上船　·　Esc 再想想"
 	ferry_opens += 1
 	state = "draft"

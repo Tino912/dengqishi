@@ -1268,8 +1268,53 @@ static func prop(ci: CanvasItem, pr: Dictionary, pal: Dictionary, cam: Vector2, 
 				Vector2(px - 16.0, gy), Vector2(px - 8.0, gy - 12.0),
 				Vector2(px + 6.0, gy - 14.0), Vector2(px + 16.0, gy),
 			]), Color("#2d3346"))
+		"beacon":
+			_beacon(ci, px, gy, h, t)
+		"gate":
+			_gate(ci, px, gy, h, t)
 		_:
 			ci.draw_circle(Vector2(px, gy), float(pr["r"]), Color("#39415a"))
+
+
+## 出生地图的主灯（灯堡前厅那盏不灭的灯）。**它没有开关状态** ——
+## "永远亮着"是它的种类属性（见 `Content.HUB`），所以这里没有 `lit` 那一套，
+## 只有一点呼吸。与灯塔（`_lighthouse`）刻意画出区别：灯塔是终点、会随清关涨起来。
+static func _beacon(ci: CanvasItem, px: float, gy: float, h: float, t: float) -> void:
+	var breathe := 0.94 + 0.06 * sin(t * 2.3)
+	# 石座（上窄下宽）
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px - 26.0, gy), Vector2(px - 15.0, gy - h * 0.30),
+		Vector2(px + 15.0, gy - h * 0.30), Vector2(px + 26.0, gy),
+	]), Color("#3b4257"))
+	# 灯柱
+	ci.draw_rect(Rect2(px - 9.0, gy - h * 0.84, 18.0, h * 0.56), Color("#4a5270"))
+	# 石檐
+	ci.draw_colored_polygon(PackedVector2Array([
+		Vector2(px - 21.0, gy - h * 0.84), Vector2(px, gy - h),
+		Vector2(px + 21.0, gy - h * 0.84),
+	]), Color("#55617d"))
+	# 灯芯：一大团暖光 + 一个实心核（它照亮的半径在 LightRig 里，不在画面里）
+	var hy := gy - h * 0.68
+	tex_rot(ci, "light_01", Vector2(px, hy), 320.0, 320.0, 0.0,
+		Color(1.0, 0.86, 0.58, 0.32 * breathe))
+	ci.draw_circle(Vector2(px, hy), 12.0, Color(1.0, 0.88, 0.62, 0.95 * breathe))
+	ci.draw_circle(Vector2(px, hy), 5.0, Color(1.0, 0.97, 0.88, breathe))
+
+
+## 出生地图暗侧那扇门。**它自己不发光** —— 门后面是灯河，那是另一张地图的事。
+## 所以画法是"一个黑洞洞的拱门 + 门里一点湿冷的反光"：站在暗侧时，
+## 只有玩家自己那盏灯火照到它才看得见这道门（"你得带着灯走进黑暗"）。
+static func _gate(ci: CanvasItem, px: float, gy: float, h: float, t: float) -> void:
+	# 门里的黑（比石头还暗一档）
+	ci.draw_rect(Rect2(px - 28.0, gy - h, 56.0, h), Color("#171c2a"))
+	# 门内深处的一线冷光：灯河的方向
+	var gl := 0.5 + 0.5 * sin(t * 1.1)
+	ci.draw_rect(Rect2(px - 20.0, gy - h * 0.80, 40.0, h * 0.46),
+		Color(0.42, 0.58, 0.72, 0.09 + 0.04 * gl))
+	# 石框：两根立柱 + 门楣
+	ci.draw_rect(Rect2(px - 40.0, gy - h, 12.0, h), Color("#39415a"))
+	ci.draw_rect(Rect2(px + 28.0, gy - h, 12.0, h), Color("#39415a"))
+	ci.draw_rect(Rect2(px - 44.0, gy - h - 13.0, 88.0, 15.0), Color("#4a5470"))
 
 
 static func _lighthouse(ci: CanvasItem, px: float, gy: float, h: float,
